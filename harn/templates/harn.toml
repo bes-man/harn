@@ -1,0 +1,17 @@
+# harn configuration for this project.
+
+[harn]
+agent = "claude"          # claude | codex | cursor | antigravity
+
+[feedback]
+# Language-agnostic feedback signal. Set this to your project's test command.
+# Examples: "pytest -q"  |  "npm test"  |  "go test ./..."  |  "cargo test"
+test_cmd = ""
+
+[loop]
+max_iterations = 10
+
+[notify]
+idle_minutes = 30         # remind via Telegram/Slack if blocked this long
+# Secrets come from environment variables, not this file:
+#   HARN_TELEGRAM_BOT_TOKEN, HARN_TELEGRAM_CHAT_ID, HARN_SLACK_WEBHOOK_URL
