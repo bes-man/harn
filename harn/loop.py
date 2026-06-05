@@ -556,6 +556,7 @@ def _await_answer(
     return tg.await_answer(
         question,
         state_dir=state_dir,
+        task_id=task_id,
         timeout_s=cfg.wait_timeout_minutes * 60,
         remind_every_s=cfg.idle_minutes * 60,
         pre_grace_s=grace,

@@ -30,6 +30,17 @@ _AUTO_CALLBACK = "harn_auto"  # callback_data for the "Decide for me" button
 _warned: set[str] = set()
 
 
+def _format_card(task_id: str | None, emoji: str, status: str,
+                 question: str, footer: str = "") -> str:
+    """Render a question card: id + status header, the question, then a footer
+    (instructions while waiting, or the answer once resolved)."""
+    head = f"{emoji} {task_id}" if task_id else f"{emoji} harn needs your input"
+    parts = [head, f"Status: {status}", "", question]
+    if footer:
+        parts += ["", footer]
+    return "\n".join(parts)
+
+
 def _warn_once(key: str, message: str) -> None:
     """Print a warning once per process so a recurring failure isn't silent."""
     if key not in _warned:
@@ -130,12 +141,16 @@ class TelegramHIL:
         self._api("answerCallbackQuery",
                   {"callback_query_id": callback_id, "text": text})
 
-    def edit_message(self, message_id: int, text: str) -> bool:
-        """Edit a previously sent message (e.g. mark a card as answered)."""
-        body = self._api(
-            "editMessageText",
-            {"chat_id": self.chat_id, "message_id": message_id, "text": text},
-        )
+    def edit_message(self, message_id: int, text: str, *,
+                     remove_buttons: bool = False) -> bool:
+        """Edit a previously sent message (e.g. update a card's status/answer).
+
+        With `remove_buttons=True`, also strip the inline keyboard (an empty
+        keyboard removes it in the Bot API)."""
+        params = {"chat_id": self.chat_id, "message_id": message_id, "text": text}
+        if remove_buttons:
+            params["reply_markup"] = {"inline_keyboard": []}
+        body = self._api("editMessageText", params)
         return body is not None
 
     # --- offset persistence (don't reprocess old updates across runs) ---
@@ -218,6 +233,7 @@ class TelegramHIL:
         question: str,
         *,
         state_dir: Path,
+        task_id: str | None = None,
         timeout_s: int = 0,
         remind_every_s: int = 0,
         poll_timeout: int = 30,
@@ -251,24 +267,30 @@ class TelegramHIL:
         posted = False
         question_msg_id: int | None = None
 
+        def _resolve(emoji: str, status: str, footer: str) -> None:
+            """Edit the card in place: new status, drop the buttons, show outcome."""
+            if posted and question_msg_id is not None:
+                self.edit_message(
+                    question_msg_id,
+                    _format_card(task_id, emoji, status, question, footer),
+                    remove_buttons=True,
+                )
+
         while True:
             # 1) chat / CLI channel — answered locally?
             if local_check is not None and local_check():
-                if posted and question_msg_id is not None:
-                    self.edit_message(
-                        question_msg_id, "✅ Answered in chat — resuming."
-                    )
+                _resolve("✅", "answered in chat", "💬 Answered in chat.")
                 return (None, "chat")
 
             now = _now()
             # 2) escalate to Telegram once the chat grace has elapsed
             if not posted and now - start >= pre_grace_s:
-                tail = ("Reply to this message (or just send your answer) to "
-                        "unblock.")
+                footer = "Reply here to unblock."
                 if auto_button:
-                    tail += "\nOr tap 🤖 Decide for me to let the agent choose."
+                    footer += " Or tap 🤖 Decide for me to let the agent choose."
                 question_msg_id = self.send(
-                    "🟡 harn needs your input:\n\n" f"{question}\n\n" + tail,
+                    _format_card(task_id, "🟡", "awaiting your reply",
+                                 question, footer),
                     auto_button=auto_button,
                 )
                 posted = True
@@ -281,23 +303,23 @@ class TelegramHIL:
                 cb_id = self._auto_pressed(updates)
                 if cb_id:
                     self._answer_callback(cb_id, "Agent will decide.")
-                    if question_msg_id is not None:
-                        self.edit_message(
-                            question_msg_id,
-                            "🤖 You chose 'Decide for me' — the agent will pick "
-                            "the best option and proceed.")
+                    _resolve("🤖", "agent deciding",
+                             "🤖 You chose “Decide for me” — the agent will pick "
+                             "the best option and proceed.")
                     return (None, "auto")
                 reply = self._reply_from_updates(updates, question_msg_id)
                 if reply is not None:
-                    self.send("✅ Got it — resuming.")
+                    _resolve("✅", "answered", f"💬 {reply}")
                     return (reply, "telegram")
                 if remind_every_s and now - last_remind >= remind_every_s:
-                    self.send("⏳ harn is still waiting on your answer:\n\n" + question)
+                    self.send("⏳ Still waiting on your answer for "
+                              f"{task_id or 'a question'}…")
                     last_remind = now
             else:
                 _sleep(min(poll_timeout, _GRACE_POLL_SEC))
 
             if timeout_s and now - start >= timeout_s:
+                _resolve("⌛", "timed out", "No reply — falling back to the CLI.")
                 return (None, "")
 
     def wait_for_reply(

@@ -137,7 +137,7 @@ def test_wait_for_reply_times_out_and_reminds(monkeypatch, tmp_path):
     )
     assert reply is None
     # First send is the question; a reminder was sent before timeout.
-    assert any("still waiting" in s for s in sends)
+    assert any("still waiting" in s.lower() for s in sends)
 
 
 def test_wait_for_reply_noop_when_unconfigured(tmp_path):

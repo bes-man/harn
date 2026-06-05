@@ -31,7 +31,7 @@ def test_await_both_passes_chat_grace_and_local_check(monkeypatch, tmp_path):
     captured = {}
 
     class FakeHIL:
-        def await_answer(self, question, *, state_dir, timeout_s, remind_every_s,
+        def await_answer(self, question, *, state_dir, timeout_s, remind_every_s, task_id=None,
                          pre_grace_s, local_check):
             captured.update(question=question, timeout_s=timeout_s,
                             remind_every_s=remind_every_s, pre_grace_s=pre_grace_s,
@@ -54,7 +54,7 @@ def test_await_telegram_channel_has_no_grace(monkeypatch, tmp_path):
     captured = {}
 
     class FakeHIL:
-        def await_answer(self, question, *, state_dir, timeout_s, remind_every_s,
+        def await_answer(self, question, *, state_dir, timeout_s, remind_every_s, task_id=None,
                          pre_grace_s, local_check):
             captured["pre_grace_s"] = pre_grace_s
             return (None, "")
