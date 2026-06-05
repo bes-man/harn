@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",          # MCP server (FastMCP); only needed for the `harn mcp` command
     "tomli>=2.0 ; python_version < '3.11'",
+    "certifi>=2023.0",     # CA bundle for Telegram TLS (fixes macOS cert issues)
     "semble[mcp]>=0.3.0,<1.0",  # code search for agents; [mcp] ships the MCP server
 ]
 

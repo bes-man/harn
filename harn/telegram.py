@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -25,13 +27,38 @@ from pathlib import Path
 _OFFSET_FILE = ".telegram_offset"
 _GRACE_POLL_SEC = 2  # how often to check the local channel during chat grace
 _AUTO_CALLBACK = "harn_auto"  # callback_data for the "Decide for me" button
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Print a warning once per process so a recurring failure isn't silent."""
+    if key not in _warned:
+        _warned.add(key)
+        print(f"[harn] Telegram: {message}", file=sys.stderr)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Build an SSL context that works across machines.
+
+    Uses certifi's CA bundle when available (fixes the common macOS / corporate
+    'certificate verify failed' issue). Set HARN_TELEGRAM_SSL_VERIFY=0 to disable
+    verification entirely (last resort, e.g. behind a TLS-intercepting proxy).
+    """
+    if os.environ.get("HARN_TELEGRAM_SSL_VERIFY") == "0":
+        _warn_once("ssl_off", "TLS verification disabled (HARN_TELEGRAM_SSL_VERIFY=0)")
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def _http_post_json(url: str, params: dict, timeout: int) -> dict | None:
-    """POST form-encoded params; return parsed JSON, or None on any failure.
+    """POST form-encoded params; return parsed JSON, or None on failure.
 
     Isolated at module level so tests can stub the network without monkeypatching
-    urllib internals.
+    urllib internals. Logs once on network/TLS errors so failures aren't silent.
     """
     encoded: dict[str, str] = {}
     for key, val in params.items():
@@ -41,9 +68,14 @@ def _http_post_json(url: str, params: dict, timeout: int) -> dict | None:
     data = urllib.parse.urlencode(encoded).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except ssl.SSLError as e:
+        _warn_once("ssl", f"TLS error ({e}). If behind a proxy/AV, install certifi "
+                          "or set HARN_TELEGRAM_SSL_VERIFY=0.")
+        return None
+    except Exception as e:
+        _warn_once("net", f"request to {url.rsplit('/', 1)[-1]} failed: {e}")
         return None
     return body if isinstance(body, dict) else None
 

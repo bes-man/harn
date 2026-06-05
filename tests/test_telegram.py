@@ -143,3 +143,28 @@ def test_wait_for_reply_times_out_and_reminds(monkeypatch, tmp_path):
 def test_wait_for_reply_noop_when_unconfigured(tmp_path):
     hil = TelegramHIL(token="", chat_id="")
     assert hil.wait_for_reply("q", state_dir=tmp_path) is None
+
+
+def test_ssl_context_verify_off(monkeypatch):
+    monkeypatch.setenv("HARN_TELEGRAM_SSL_VERIFY", "0")
+    tg._warned.clear()
+    ctx = tg._ssl_context()
+    assert ctx.verify_mode == __import__("ssl").CERT_NONE
+
+
+def test_ssl_context_default_verifies(monkeypatch):
+    monkeypatch.delenv("HARN_TELEGRAM_SSL_VERIFY", raising=False)
+    ctx = tg._ssl_context()
+    assert ctx.verify_mode == __import__("ssl").CERT_REQUIRED
+
+
+def test_http_post_warns_once_on_failure(monkeypatch, capsys):
+    import urllib.request
+    tg._warned.clear()
+    def boom(*a, **k):
+        raise OSError("network down")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert tg._http_post_json("https://x/sendMessage", {}, 1) is None
+    assert tg._http_post_json("https://x/sendMessage", {}, 1) is None  # 2nd call
+    err = capsys.readouterr().err
+    assert err.count("Telegram") == 1  # warned only once
