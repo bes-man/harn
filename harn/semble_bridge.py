@@ -160,9 +160,13 @@ def prepare_socraticode(prefetch: bool = True, timeout: int = 300) -> tuple[bool
                 return False, "could not reach the socraticode npm package"
         except (OSError, subprocess.SubprocessError) as e:
             return False, f"npm view failed: {e}"
-    if not _docker_running():
-        notes.append("⚠️  Docker daemon not detected — start Docker so "
-                     "SocratiCode can run Qdrant (or set QDRANT_URL for cloud)")
+    if _docker_running():
+        notes.append("Docker running — SocratiCode auto-starts Qdrant+Ollama "
+                     "on first use (~5 min image pull, one time)")
+    else:
+        notes.append("⚠️  Docker not running — start Docker Desktop; SocratiCode "
+                     "auto-pulls & runs Qdrant+Ollama itself (or set QDRANT_URL/"
+                     "EMBEDDING_PROVIDER for cloud, no Docker needed)")
     return True, "; ".join(notes) or "SocratiCode prerequisites OK"
 
 

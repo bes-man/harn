@@ -87,7 +87,10 @@ semble = true
 
 # SocratiCode — static dependency graph + blast-radius analysis.
 # More precise than semble for "what breaks if X changes" questions.
-# Fetched by npx on first use (pinned ^1.8); REQUIRES Node.js + a running Docker
-# daemon (for Qdrant). `harn setup` warns if Docker isn't up.
-# Source: https://github.com/giancarloerra/SocratiCode
+# Fetched by npx on first use (pinned ^1.8). You only need Node.js + a running
+# Docker daemon — SocratiCode then auto-pulls and starts its OWN Qdrant + Ollama
+# containers on first use (~5 min, one time). You do NOT install Qdrant yourself.
+# (Or skip Docker entirely with cloud: set EMBEDDING_PROVIDER + QDRANT_URL.)
+# `harn setup` checks Docker and tells you. Source:
+# https://github.com/giancarloerra/SocratiCode
 socraticcode = true
