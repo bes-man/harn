@@ -73,6 +73,38 @@ _AUTO_DECIDE_NOTE = (
     "best practice, decide, state your assumption, and proceed — do not ask."
 )
 
+# Fed back when the human presses the Telegram "Decide for me" (Auto) button.
+_AUTO_BUTTON_NOTE = (
+    "The human chose 'Decide for me' on your question. Pick the best option "
+    "yourself using current best practices, state your assumption clearly, and "
+    "proceed. Record the choice with `record_decision` so it can be reviewed."
+)
+
+
+def _autonomy_note(level: float) -> str:
+    """Translate the 0.0–1.0 autonomy level into a behavioural directive."""
+    pct = int(round(level * 100))
+    if level <= 0.3:
+        stance = (
+            "Be METICULOUS. Surface every ambiguity, missing detail, or "
+            "assumption and call `ask_user` BEFORE acting. Prefer asking over "
+            "deciding — the human wants tight control over direction."
+        )
+    elif level <= 0.7:
+        stance = (
+            "Be BALANCED. Decide routine, low-risk, reversible matters yourself "
+            "using best practices and state your assumption. Reserve `ask_user` "
+            "for choices that are BOTH ambiguous AND significant or hard to undo."
+        )
+    else:
+        stance = (
+            "Be DECISIVE and creative. Resolve ambiguity yourself with current "
+            "best practices and proceed, stating your assumptions and recording "
+            "them via `record_decision`. Only `ask_user` when truly blocked or a "
+            "decision is high-stakes AND irreversible."
+        )
+    return f"## Autonomy: {pct}% self-directed\n{stance}"
+
 def _planning_instructions(cfg: Config) -> str:
     hint = semble_bridge.planning_hint(cfg)
     search_step = (
@@ -176,6 +208,7 @@ def _build_planning_prompt(env_dir: Path, cfg: Config, task: tasks.Task) -> str:
             )
         parts.append("## Referenced PRDs\n" + "\n\n---\n\n".join(prd_parts))
     parts.append(f"## Task to clarify — {task.id}\n" + task_body)
+    parts.append(_autonomy_note(cfg.autonomy))
     parts.append(_planning_instructions(cfg))
     return "\n\n".join(p for p in parts if p.strip())
 
@@ -390,11 +423,13 @@ def _build_prompt(
     cont = _continuity_block(task)
     if cont:
         parts.append(cont)
+    if not auto:
+        parts.append(_autonomy_note(cfg.autonomy))
     parts.append(
         "## Rules\n"
-        "- If anything is ambiguous, underspecified, risky, or you are unsure, "
-        "STOP and ask: call the harn `ask_user` tool, or write your question to "
-        "`harn_env/state/BLOCKED.md` and end your turn. Do NOT guess.\n"
+        "- When unsure, follow the autonomy level above: ask via the harn "
+        "`ask_user` tool (or write `harn_env/state/BLOCKED.md` and end your turn) "
+        "rather than guessing on anything you shouldn't decide alone.\n"
         "- " + _ASK_GUIDANCE + "\n"
         "- If this task is `changes_requested`, read its Review log and address "
         "the reviewer's comment.\n"
@@ -555,6 +590,12 @@ def _handle_block(
         return "resumed"
     if source == "chat":
         print(f"[harn] Answered in chat; resuming '{task.id}'.")
+        return "resumed"
+    if source == "auto":
+        # Human pressed "Decide for me" — record the delegation as the answer so
+        # the agent sees it and chooses the best option itself.
+        answer(env_dir, "You pressed 'Decide for me'. " + _AUTO_BUTTON_NOTE)
+        print(f"[harn] Decision delegated to the agent; resuming '{task.id}'.")
         return "resumed"
     channels = notify(f"[harn] Agent needs your input on '{task.id}':\n{question}")
     print(f"[harn] BLOCKED. Notified: {channels or 'none configured'}")

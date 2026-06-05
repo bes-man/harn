@@ -1,13 +1,17 @@
 # harn configuration for this project.
 
 [harn]
-# Project code for the task-naming scheme. Tasks are files named
-#   harn_env/tasks/<project>-prd<NNN>-task<NNN>-<slug>.md   e.g.
-#   prj001-prd001-task001-set-test-command.md
-# so every task name carries its project + PRD. PRDs live in harn_env/prd/ as
-# <project>-prd<NNN>-<slug>.md. Reference a task by full name, by its code
-# (prj001-prd001-task001), or by the bare task code (task001).
-project = "prj001"
+# Project code used to auto-number tasks without a tracker key. Tasks are JSON
+# files in harn_env/tasks/. With Jira/Linear, name a task by its key
+# (AUTH-42.json); otherwise harn generates PRJ-001, PRJ-002, … from this prefix.
+project = "prj"
+# How self-directed the agent is, 0.0–1.0 (env override: HARN_AUTONOMY):
+#   0.0–0.3  meticulous — clarifies almost everything via ask_user (tight control)
+#   0.4–0.7  balanced   — decides routine/reversible things, asks on the big ones
+#   0.8–1.0  creative   — decides for itself with best practices, rarely asks
+# Lower = more questions (and higher accuracy on fuzzy specs); higher = fewer
+# interruptions (and more agent initiative). Default 0.7.
+autonomy = 0.7
 # Single agent (shorthand):
 agent = "claude"           # claude | codex | cursor | antigravity | qwen
 # Or several, tried in order — the first one installed runs. Whichever agent

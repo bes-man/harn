@@ -69,6 +69,7 @@ harn review <task_id> --changes "rename the module to auth/"
 [harn]
 agent = "claude"                    # claude | codex | cursor | antigravity | qwen
 # agents = ["claude", "codex"]      # or several, tried in order (first installed runs)
+autonomy = 0.7                      # 0 ask-everything … 1 decide-everything
 
 [feedback]
 test_cmd = "pytest -q"              # your project's tests (any language)
@@ -77,13 +78,19 @@ test_cmd = "pytest -q"              # your project's tests (any language)
 max_iterations = 10
 loop_aware = true                   # agent sees the board + progress + lifecycle
 verify = true                       # extra turn: check work vs acceptance criteria
+oracle = true                       # independent verification turn (blast-radius)
+planning = true                     # first turn writes acceptance criteria
 auto = false                        # autonomous (also `harn run --auto`); see below
-auto_max_iterations = 30            # bigger budget for unattended runs
+
+[code_search]                       # search-before-reading; installed by `harn setup`
+semble = true                       # semantic chunk retrieval (no infra)
+socraticcode = true                 # dependency graph / blast-radius (Docker)
 
 [notify]
 idle_minutes = 30                   # reminder cadence while waiting on you
-wait_for_reply = true               # answer & review right in Telegram
+wait_for_reply = true               # answer & review right in Telegram (+ Auto button)
 wait_timeout_minutes = 0            # 0 = wait forever; else fall back to CLI
+channel = "both"                    # chat | telegram | both (chat-grace escalation)
 ```
 
 Secrets come from environment variables, never the file:
@@ -102,8 +109,8 @@ your-project/
 │  ├─ skills/<name>/SKILL.md   # on-demand "skills"; only the index is always in context
 │  │   ├─ project/  architecture/  standards/
 │  │   └─ constraints/  security/  ui/
-│  ├─ prd/<project>-prd<NNN>-<slug>.md      # product requirement docs
-│  ├─ tasks/<project>-prd<NNN>-task<NNN>-<slug>.md  # backlog — one file per task
+│  ├─ prd/<slug>.md            # product requirement docs (Markdown + frontmatter)
+│  ├─ tasks/<id>.json          # backlog — one JSON file per task (AUTH-42 / PRJ-001)
 │  ├─ state/                   # runtime state, written by the loop
 │  │   ├─ STATE.json          # loop phase, current task, iterations
 │  │   ├─ PROGRESS.md         # append-only history every agent reads on pickup
@@ -120,28 +127,39 @@ The bundled templates in `harn/templates/` are the **base project**. Fork harn,
 edit those, and every `harn setup` ships your defaults. Local edits inside a
 project's `harn_env/` are never clobbered on re-run.
 
-## Task & PRD naming (project + PRD prefix)
+## Tasks (JSON) & PRDs (Markdown)
 
-Every task belongs to a PRD, and every PRD to a project, so a task's filename
-carries that whole lineage:
+**Tasks are JSON files** in `harn_env/tasks/`, one per task. The filename is the
+task **id**:
+- with a tracker → use the key: `AUTH-42.json` (`epic`/`user_story` link upward);
+- without one → harn auto-numbers `PRJ-001.json`, `PRJ-002.json`… from
+  `[harn] project`.
 
+A task references one or more PRDs in a `prds` array (a task may span PRDs), and
+carries its own structured `review_log`, `decisions`, and `scratchpad`. You don't
+hand-write these — the agent calls the `create_task` / `update_task` MCP tools.
+
+```jsonc
+// harn_env/tasks/AUTH-42.json
+{
+  "id": "AUTH-42", "title": "Add JWT auth", "status": "todo", "priority": 1,
+  "prds": ["auth"], "epic": "Q2-SECURITY", "user_story": "AUTH-10",
+  "skills": ["security"],
+  "subtasks": [{ "id": "AUTH-42-1", "title": "POST /login", "status": "done" }],
+  "description": "## What\n…\n## Done when\n- POST /login returns a JWT",
+  "review_log": [ /* timestamped events: started, submitted, accepted… */ ]
+}
 ```
-harn_env/prd/prj001-prd001-checkout.md
-harn_env/tasks/prj001-prd001-task001-add-cart.md
-               └ project ┘└ prd  ┘└ task  ┘└── human slug ──┘
-```
 
-The leading `prj…-prd…-task…` is the stable **code**; the trailing slug is for
-humans. Set the project code once in `[harn] project`. Reference a task by its
-full name, its code (`prj001-prd001-task001`), or the bare `task001`. Plain
-names without the code still work (older backlogs keep running) — they just have
-no project/PRD grouping.
+**PRDs are Markdown** in `harn_env/prd/<slug>.md` — YAML frontmatter (`id`,
+`status`, `priority`) plus sections (`## Problem`, `## Goal`, `## Scope`,
+`## Acceptance criteria`). Headings may be in your language (Russian aliases are
+recognised). Product/analysts write them; the agent normalises them at loop start.
 
 ## The task track (transparent, per task)
 
-Each task is one Markdown file whose `status:` line walks a human-visible track.
-The review thread and acceptance notes are appended to the task's own file, so
-the full history travels with it to any future agent.
+Each task's `status` walks a human-visible track; the structured `review_log`
+inside the JSON records every step, so the full history travels with the task.
 
 ```
 todo → in_progress → review ⇄ changes_requested → done
@@ -152,9 +170,9 @@ todo → in_progress → review ⇄ changes_requested → done
 3. **review** — the agent finished; harn asks **you** to accept or comment.
 4. **changes_requested** — you left a comment; the agent reworks it.
 5. **done** — you accepted it; your **notes for future agents** are saved into
-   the task file.
+   the task.
 
-See [`harn_example/tasks/prj001-prd001-task002-jwt-auth.md`](./harn_example/tasks/prj001-prd001-task002-jwt-auth.md)
+See [`harn_example/tasks/AUTH-42.json`](./harn_example/tasks/AUTH-42.json)
 for a `done` task with its full review log and carried-forward notes.
 
 ## Multiple agents, one shared context
@@ -167,24 +185,55 @@ always knows **what's done and what's planned**. With `loop_aware = true`
 (default) that whole picture is injected into every prompt, so you can watch a
 task move through its track from inside the agent.
 
-## Human-in-the-loop (Telegram)
+## Human-in-the-loop (Telegram) — set this up, it's the point
 
-Set the Telegram env vars and harn brings you into the loop at two moments:
-when the agent **blocks on a question** (`ask_user`) and when a task is **ready
-for review**.
+**The single most valuable thing you can configure.** harn is built so you can
+**walk away from the computer** and still keep the agent on the rails. The agent
+does most of the work autonomously, but the moments where a human makes the
+difference — a clarifying question on a fuzzy requirement, an "is this what you
+meant?" before it goes too far — are exactly the moments that decide whether the
+output is right. Telegram puts those moments in your pocket.
+
+Set `HARN_TELEGRAM_BOT_TOKEN` + `HARN_TELEGRAM_CHAT_ID` and harn brings you into
+the loop at two points: when the agent **blocks on a question** (`ask_user`) and
+when a task is **ready for review**.
 
 - With `wait_for_reply = true` (default), harn posts to your chat and waits.
-  - Blocking question → reply with your answer.
-  - Review → reply **`approve`** (optionally with notes) to accept, or just
-    describe the changes you want.
+  - Blocking question → reply with your answer (improves accuracy on ambiguous specs).
+  - Review → reply **`approve`** (optionally with notes), or describe the changes.
+- **🤖 "Decide for me" button.** Every question comes with an inline button — if
+  you don't know or don't care, tap it and the agent picks the best option itself
+  (researches best practices, records the decision for review) and keeps going.
+  You're never the bottleneck.
 - This **survives the computer going to sleep**: Telegram retains the messages,
   so the offset-based long-poll picks up your reply on wake.
 - `idle_minutes` re-sends a reminder while waiting; `wait_timeout_minutes`
   (0 = forever) bounds the wait before falling back to the CLI path
   (`harn answer "…"` / `harn review …`).
 
-Without Telegram, harn just notifies (Telegram/Slack one-way) and waits for the
-CLI commands.
+Without Telegram you're tied to the terminal: harn notifies one-way and you must
+answer with CLI commands. With it, a multi-hour backlog can run while you're away,
+pinging you only for the few decisions that actually need you.
+
+## Autonomy level — how much to ask vs. decide
+
+```toml
+[harn]
+autonomy = 0.7   # 0.0 meticulous … 1.0 creative   (env: HARN_AUTONOMY)
+```
+
+One dial for the agent's temperament, injected into every planning and execution
+turn:
+
+| Level | Behaviour | Use when |
+|------:|-----------|----------|
+| **0.0–0.3** | Meticulous — clarifies almost everything via `ask_user` | specs are fuzzy / high-stakes / you want control |
+| **0.4–0.7** | Balanced — decides routine, reversible things; asks on the big ones | most work (**default 0.7**) |
+| **0.8–1.0** | Creative — decides for itself with best practices, rarely asks | you trust the agent / want speed over checkpoints |
+
+Lower autonomy + Telegram = highest accuracy on under-specified work (it asks,
+you answer from your phone). Higher autonomy = fewer interruptions. The
+`--auto` flag is the extreme: full autonomy, no human at all.
 
 ## How the MCP server works
 
@@ -195,15 +244,17 @@ it as a subprocess (via the generated config) — fully local, no open ports:
 agent (claude/codex/cursor/…) ⇄ stdio ⇄ harn mcp (subprocess)
 ```
 
-Tools: `list_skills`, `read_skill`, `get_next_task`, `board`, `ask_user`,
-`run_tests`, `submit_for_review`, `loop_status`. Run `harn mcp --http --port 8765` to
+Tools: `list_skills`, `read_skill`, `get_next_task`, `create_task`,
+`update_task`, `board`, `ask_user`, `record_decision`, `set_scratchpad`,
+`run_tests`, `submit_for_review`, `loop_status` (+ `search` / `find_related` /
+`codebase_*` from the code-search servers). Run `harn mcp --http --port 8765` to
 serve over `127.0.0.1` instead (same tools; can later sit behind auth/TLS).
 
 ## Phases vs. task statuses
 
 - **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING →
   VERIFYING → BLOCKED → REVIEW → DONE` — the overall run.
-- **Task status** (each `tasks/*.md`): `todo → in_progress → review →
+- **Task status** (each `tasks/*.json`): `todo → in_progress → review →
   changes_requested → done` — one task's journey.
 
 ## Verify step & token usage
@@ -218,6 +269,37 @@ When an agent CLI reports token usage (e.g. Claude via `--output-format json`),
 harn records the per-task total and cost in the task's Review log and in
 `PROGRESS.md`, so you can see what each task cost. Agents that don't expose usage
 simply show nothing.
+
+## Code intelligence — semble + SocratiCode (recommended)
+
+harn integrates two code-search engines so the agent **searches before reading**
+— pulling the exact relevant chunks instead of loading whole files. This is the
+biggest lever on quality-per-token: published benchmarks show **84% fewer tool
+calls and ~60–98% less context** versus grep-and-read. Both are **on by default**
+(`[code_search]`), and `harn setup` installs them in one command. Try the full
+setup — it's what makes the loop both cheaper and sharper.
+
+| Engine | Responsibility | Why it helps | Needs |
+|---|---|---|---|
+| **[semble](https://github.com/MinishLab/semble)** | **Semantic chunk retrieval** — "find code that does X" by meaning (vector + BM25, AST chunks) | Finds the right code even when you don't know the name; tiny, in-process, ~ms queries; no infra | bundled with harn (Python) — **zero setup** |
+| **[SocratiCode](https://github.com/giancarloerra/SocratiCode)** | **Static dependency graph** — "what breaks if I change X" (blast-radius, call-flow, symbols, 18+ langs) | Precise impact analysis the oracle uses to catch ripple-effects a diff alone hides; lets smaller models handle architectural reasoning | Node.js + **a running Docker** (it auto-pulls & starts its own Qdrant + Ollama — you don't install them) |
+
+**How harn uses them, per phase:**
+- **Planning** → `search` for existing patterns, so acceptance criteria match the
+  codebase instead of fighting it.
+- **Execution** → the agent retrieves chunks instead of reading files (AGENTS.md
+  tells it to search first).
+- **Oracle** → SocratiCode's `codebase_impact` (precise) or semble's
+  `find_related` (semantic), scoped to the diff, to verify the real blast radius.
+
+They have **different jobs and don't overlap** (semantics vs. dependency graph),
+so running both is complementary, not redundant. Each does its work **locally**
+and sends the model only the relevant slice. Disable either in `harn.toml` if you
+want; harn degrades gracefully when one isn't installed.
+
+> `harn setup` installs semble (pip) and checks SocratiCode's prerequisites
+> (npx + Docker), warning you if Docker isn't running. Skip with
+> `harn setup --no-install`.
 
 ## Autonomous mode (`--auto` / `-a`)
 
@@ -304,7 +386,7 @@ cd /path/to/your-project
 harn setup                # создаёт harn_env/ + AGENTS.md + конфиг MCP
 
 # в harn_env/harn.toml укажите [feedback] test_cmd (команду тестов проекта),
-# добавьте задачи в harn_env/tasks/*.md
+# задачи создаёт агент через create_task (JSON), PRD — в harn_env/prd/*.md
 
 harn run                  # запустить петлю
 harn board                # все задачи на их треке
@@ -335,21 +417,21 @@ harn разделяет **мозг** (переносимый) и **руки** (�
 `ANSWERS.md`, `BLOCKED.md`) и `mcp_snippets.md`. В корне проекта: `AGENTS.md`,
 `.mcp.json`, `.cursor/mcp.json`.
 
-### Имена задач и PRD (префикс проекта + PRD)
+### Задачи (JSON) и PRD (Markdown)
 
-Каждая задача принадлежит PRD, а PRD — проекту, поэтому имя файла несёт всю
-цепочку:
+**Задачи — JSON-файлы** в `harn_env/tasks/`, имя файла = id задачи:
+- с трекером → ключ: `AUTH-42.json` (поля `epic`/`user_story` ведут вверх);
+- без трекера → harn авто-нумерует `PRJ-001.json`, `PRJ-002.json`… из `[harn] project`.
 
-```
-harn_env/prd/prj001-prd001-checkout.md
-harn_env/tasks/prj001-prd001-task001-add-cart.md
-```
+Задача ссылается на один или несколько PRD массивом `prds` (может охватывать
+несколько), и несёт свой структурированный `review_log`, `decisions`,
+`scratchpad`. Вручную JSON не пишут — агент вызывает MCP-инструменты
+`create_task` / `update_task`.
 
-Префикс `prj…-prd…-task…` — устойчивый **код**, хвост-слаг — для людей. Код
-проекта задаётся раз в `[harn] project`. Ссылаться на задачу можно полным
-именем, кодом (`prj001-prd001-task001`) или коротким `task001`. Простые имена
-без кода тоже работают (старые бэклоги продолжают жить) — просто без группировки
-по проекту/PRD.
+**PRD — Markdown** в `harn_env/prd/<slug>.md`: YAML-frontmatter (`id`, `status`,
+`priority`) + секции (`## Проблема`/`## Problem`, `## Цель`, `## Содержание`,
+`## Критерии приёмки` — русские заголовки распознаются). Пишут продакт/аналитик,
+агент нормализует в начале цикла.
 
 ### Трек задачи
 
@@ -371,13 +453,49 @@ todo → in_progress → review ⇄ changes_requested → done
 запланировано. При `loop_aware = true` (по умолчанию) всё это подставляется в
 каждый промпт — ход выполнения виден прямо изнутри агента.
 
-### Human-in-the-loop в Telegram
+### Human-in-the-loop в Telegram — обязательно настройте
+
+**Самое ценное, что стоит включить.** Смысл harn — **отойти от компьютера**, но
+не пропустить те несколько решений, которые определяют правильность результата.
+Агент делает основную работу сам, а уточнения по размытым требованиям прилетают
+вам в карман. Настройте `HARN_TELEGRAM_BOT_TOKEN` + `HARN_TELEGRAM_CHAT_ID`.
 
 При `wait_for_reply = true` (по умолчанию) harn пишет вам в Telegram и ждёт —
 и на блокирующий вопрос (`ask_user`), и на ревью (`approve <заметки>` или
 описание правок). Это **переживает засыпание компьютера**: long-poll по offset
 подхватывает ответ после пробуждения. `idle_minutes` — частота напоминаний,
 `wait_timeout_minutes` (0 = бесконечно) — таймаут до отката на CLI.
+
+- **🤖 Кнопка «Decide for me».** К каждому вопросу прикреплена inline-кнопка: если
+  не знаете или не важно — жмёте, и агент сам выбирает лучший вариант (по best
+  practices, фиксируя решение для ревью) и продолжает. Вы никогда не узкое место.
+
+### Уровень самостоятельности (`[harn] autonomy`)
+
+Один регулятор характера агента, `0.0`–`1.0` (env `HARN_AUTONOMY`), по умолчанию
+**0.7**. Подставляется в каждый ход:
+- **0.0–0.3** — дотошный: уточняет почти всё через `ask_user` (жёсткий контроль).
+- **0.4–0.7** — сбалансированный: решает рутинное/обратимое сам, спрашивает по
+  важному.
+- **0.8–1.0** — творческий: решает сам по best practices, спрашивает редко.
+
+Низкая самостоятельность + Telegram = максимум точности на размытых задачах
+(агент спросит — вы ответите с телефона). Высокая = меньше отвлечений.
+
+### Code intelligence — semble + SocratiCode (рекомендуется)
+
+Два движка поиска по коду: агент **ищет, а не читает целиком** — берёт только
+нужные фрагменты. Это главный рычаг качества-на-токен (бенчмарки: на 84% меньше
+вызовов инструментов, на 60–98% меньше контекста). Оба включены по умолчанию,
+`harn setup` ставит их одной командой.
+- **semble** — *семантический поиск* («найди код, который делает X»). В процессе,
+  без инфраструктуры, идёт с harn. Отвечает за «что похоже».
+- **SocratiCode** — *граф зависимостей* («что сломается, если поменять X»).
+  Точный blast-radius для оракула. Нужен Node.js + запущенный Docker (Qdrant +
+  Ollama он поднимает сам, ставить не надо).
+
+Разные задачи, не дублируют друг друга. Каждый работает **локально** и шлёт в
+модель только релевантный срез.
 
 **Куда идёт вопрос — `[notify] channel`:**
 - **`both`** (по умолчанию): сначала ждём ответа **в чате**; если за

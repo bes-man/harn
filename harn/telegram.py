@@ -24,6 +24,7 @@ from pathlib import Path
 
 _OFFSET_FILE = ".telegram_offset"
 _GRACE_POLL_SEC = 2  # how often to check the local channel during chat grace
+_AUTO_CALLBACK = "harn_auto"  # callback_data for the "Decide for me" button
 
 
 def _http_post_json(url: str, params: dict, timeout: int) -> dict | None:
@@ -72,15 +73,30 @@ class TelegramHIL:
             return None
         return body
 
-    def send(self, text: str) -> int | None:
-        """Send a message to the configured chat. Returns its message_id."""
-        body = self._api("sendMessage", {"chat_id": self.chat_id, "text": text})
+    def send(self, text: str, *, auto_button: bool = False) -> int | None:
+        """Send a message to the configured chat. Returns its message_id.
+
+        With `auto_button=True`, attach a "🤖 Decide for me" inline button so the
+        human can delegate the decision back to the agent.
+        """
+        params = {"chat_id": self.chat_id, "text": text}
+        if auto_button:
+            params["reply_markup"] = {
+                "inline_keyboard": [
+                    [{"text": "🤖 Decide for me", "callback_data": _AUTO_CALLBACK}]
+                ]
+            }
+        body = self._api("sendMessage", params)
         if not body:
             return None
         try:
             return int(body["result"]["message_id"])
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _answer_callback(self, callback_id: str, text: str = "") -> None:
+        self._api("answerCallbackQuery",
+                  {"callback_query_id": callback_id, "text": text})
 
     def edit_message(self, message_id: int, text: str) -> bool:
         """Edit a previously sent message (e.g. mark a card as answered)."""
@@ -115,7 +131,7 @@ class TelegramHIL:
             {
                 "offset": offset,
                 "timeout": poll_timeout,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             },
             timeout=poll_timeout + 10,
         )
@@ -132,6 +148,16 @@ class TelegramHIL:
         answer. Uses timeout=0 (returns immediately)."""
         offset, _ = self._get_updates(offset, poll_timeout=0)
         return offset
+
+    def _auto_pressed(self, updates: list[dict]) -> str | None:
+        """Return the callback_query id if the human pressed 'Decide for me'."""
+        for upd in updates:
+            cq = upd.get("callback_query") or {}
+            if cq.get("data") == _AUTO_CALLBACK:
+                msg = cq.get("message") or {}
+                if str(msg.get("chat", {}).get("id")) == str(self.chat_id):
+                    return str(cq.get("id", ""))
+        return None
 
     def _reply_from_updates(
         self, updates: list[dict], question_msg_id: int | None
@@ -165,6 +191,7 @@ class TelegramHIL:
         poll_timeout: int = 30,
         pre_grace_s: int = 0,
         local_check=None,
+        auto_button: bool = True,
         _now=time.time,
         _sleep=time.sleep,
     ) -> tuple[str | None, str]:
@@ -173,6 +200,7 @@ class TelegramHIL:
           'telegram' — the human replied in Telegram (reply is the text);
           'chat'     — the question was answered locally (chat/CLI) while waiting,
                        so it's already recorded elsewhere (reply is None);
+          'auto'     — the human pressed 'Decide for me'; the agent should choose;
           ''         — timeout, or Telegram not configured.
 
         `pre_grace_s` holds off posting to Telegram that long, polling
@@ -203,10 +231,13 @@ class TelegramHIL:
             now = _now()
             # 2) escalate to Telegram once the chat grace has elapsed
             if not posted and now - start >= pre_grace_s:
+                tail = ("Reply to this message (or just send your answer) to "
+                        "unblock.")
+                if auto_button:
+                    tail += "\nOr tap 🤖 Decide for me to let the agent choose."
                 question_msg_id = self.send(
-                    "🟡 harn needs your input:\n\n"
-                    f"{question}\n\n"
-                    "Reply to this message (or just send your answer) to unblock."
+                    "🟡 harn needs your input:\n\n" f"{question}\n\n" + tail,
+                    auto_button=auto_button,
                 )
                 posted = True
                 last_remind = now
@@ -215,6 +246,15 @@ class TelegramHIL:
             if posted:
                 offset, updates = self._get_updates(offset, poll_timeout)
                 self._save_offset(state_dir, offset)
+                cb_id = self._auto_pressed(updates)
+                if cb_id:
+                    self._answer_callback(cb_id, "Agent will decide.")
+                    if question_msg_id is not None:
+                        self.edit_message(
+                            question_msg_id,
+                            "🤖 You chose 'Decide for me' — the agent will pick "
+                            "the best option and proceed.")
+                    return (None, "auto")
                 reply = self._reply_from_updates(updates, question_msg_id)
                 if reply is not None:
                     self.send("✅ Got it — resuming.")

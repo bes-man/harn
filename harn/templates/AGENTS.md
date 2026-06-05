@@ -80,34 +80,23 @@ dependency graph and are language-independent.
 - Make small, reviewable changes. Explain what you changed and why.
 
 ## Creating a task
-When the human describes work in words (or points at a PRD like `prd001`), YOU
-author the task file — don't make them format it:
+When the human describes work in words (or points at a PRD like `auth`), YOU
+author the task — don't make them format it. **Use the `create_task` MCP tool**;
+don't hand-write JSON.
 1. **Clarify first.** If the goal, scope, or acceptance criteria are fuzzy, ask
-   (expanded `ask_user`) before writing the file. A vague task is a bad task.
-2. **Name it by lineage.** `harn_env/tasks/<project>-prd<NNN>-task<NNN>-<slug>.md`,
-   where `<project>` is `[harn] project` from `harn.toml` (e.g. `prj001`), the
-   PRD matches the one it belongs to, and `<NNN>` is the next free task number
-   under that PRD. So the filename alone tells you which PRD to read.
-3. **Structure the body** with these fields and sections:
-   ```
-   # <clear imperative title>
-
-   prd: prj001-prd001      # the parent PRD — read it for the why/scope
-   external_id:            # optional: a JIRA/Linear key, for integrations
-   status: todo
-   priority: <int, lower = sooner>
-
-   ## What
-   One or two sentences: the change and its intent.
-
-   ## Done when
-   - concrete, checkable acceptance criteria (this is what verify checks).
-
-   ## Skills
-   - list the harn skills that will be needed (so the executor loads the right
-     ones on demand), e.g. `security`, `standards`.
-   ```
-4. Keep it small and reviewable; split big asks into several tasks under the PRD.
+   (expanded `ask_user`) before creating it. A vague task is a bad task.
+2. **Call `create_task`** with:
+   - `title` — clear imperative ("Add JWT auth").
+   - `description` — Markdown with `## What`, `## Done when` (concrete, checkable
+     acceptance criteria — this is what verify/oracle check), and notes.
+   - `prds` — the parent PRD slug(s), e.g. `["auth"]`. A task may span several.
+   - `skills` — harn skills the executor will need, e.g. `["security"]`.
+   - `task_id` — leave empty to auto-number (`PRJ-001`…); pass a tracker key
+     (e.g. `AUTH-42`) when it already exists in Jira/Linear.
+   - optional `epic` / `user_story` for tracker lineage.
+   This writes `harn_env/tasks/<id>.json`. harn manages `status` and the
+   `review_log`; you don't set those.
+3. Keep it small and reviewable; split big asks into several tasks under the PRD.
 
 ## Project-specific notes
 <!-- Fill in: domain, key commands, anything an agent must always know. -->

@@ -37,7 +37,7 @@ sequenceDiagram
     User->>CLI: harn setup
     CLI-->>User: harn_env/, AGENTS.md, .mcp.json
 
-    User->>CLI: edit harn.toml · add tasks/*.md
+    User->>CLI: edit harn.toml · add tasks (create_task → JSON)
     User->>CLI: harn run
     CLI->>Loop: run(project_root, env_dir)
 
@@ -87,5 +87,5 @@ sequenceDiagram
 
 - **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING → BLOCKED →
   REVIEW → DONE` — the overall run.
-- **Task status** (each `tasks/*.md`): `todo → in_progress → review →
+- **Task status** (each `tasks/*.json`): `todo → in_progress → review →
   changes_requested → done` — one task's journey.
