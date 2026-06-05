@@ -25,13 +25,18 @@ def _post(url: str, payload: dict, timeout: int = 10) -> bool:
         return False
 
 
-def notify(text: str) -> list[str]:
-    """Send `text` to every configured channel. Returns channels reached."""
+def notify(text: str, *, skip_telegram: bool = False) -> list[str]:
+    """Send `text` to every configured channel. Returns channels reached.
+
+    `skip_telegram` lets the caller suppress the plain Telegram push when an
+    interactive Telegram card (telegram.TelegramHIL) is being sent instead, to
+    avoid a duplicate message.
+    """
     reached: list[str] = []
 
     token = os.environ.get("HARN_TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("HARN_TELEGRAM_CHAT_ID")
-    if token and chat_id:
+    if token and chat_id and not skip_telegram:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         if _post(url, {"chat_id": chat_id, "text": text}):
             reached.append("telegram")

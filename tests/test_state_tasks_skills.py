@@ -35,19 +35,20 @@ def test_state_roundtrip(tmp_path: Path):
 def test_next_task_priority(tmp_path: Path):
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
-    (env / "tasks" / "low.md").write_text("# Low\nstatus: todo\npriority: 90\n")
-    (env / "tasks" / "high.md").write_text("# High\nstatus: todo\npriority: 5\n")
+    from .conftest import make_task
+    make_task(env, "PRJ-low", title="Low", priority=90)
+    make_task(env, "PRJ-high", title="High", priority=5)
     nxt = tasks.next_task(env)
-    assert nxt is not None and nxt.id == "high"
+    assert nxt is not None and nxt.id == "PRJ-high"
 
 
 def test_mark_done_skips_completed(tmp_path: Path):
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
-    t = tasks.next_task(env)
-    assert t is not None
+    from .conftest import make_task
+    t = make_task(env, "PRJ-001", title="Something")
     tasks.mark_done(t)
-    reparsed = [x for x in tasks.load_tasks(env) if x.id == t.id][0]
+    reparsed = tasks.find(env, "PRJ-001")
     assert reparsed.done is True
 
 

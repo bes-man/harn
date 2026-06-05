@@ -1,0 +1,8 @@
+{
+  "phase": "READY",
+  "current_task": "0002-jwt-auth",
+  "question": null,
+  "blocked_since": null,
+  "last_answer": "make the access token 15m and add a refresh endpoint",
+  "iterations": 3
+}

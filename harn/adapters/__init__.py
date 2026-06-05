@@ -10,12 +10,14 @@ from .claude import ClaudeAdapter
 from .codex import CodexAdapter
 from .cursor import CursorAdapter
 from .antigravity import AntigravityAdapter
+from .qwen import QwenAdapter
 
 _REGISTRY: dict[str, type[Adapter]] = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
     "cursor": CursorAdapter,
     "antigravity": AntigravityAdapter,
+    "qwen": QwenAdapter,
 }
 
 

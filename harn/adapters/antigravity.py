@@ -1,28 +1,26 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from .base import Adapter, AgentResult
 
 
 class AntigravityAdapter(Adapter):
-    """Stub adapter for antigravity. Wire up headless invocation here.
+    """Drives Antigravity in headless mode via its CLI (`antigravity exec`).
 
-    Intended entrypoint: antigravity CLI / google.antigravity SDK.
-    The shared logic (tasks, skills, ask_user, feedback, notifications) already
-    works via the MCP server; only this run_turn needs implementing.
+    Only shells out to the CLI the user already has installed; the shared
+    logic (tasks, skills, ask_user, feedback, notifications) reaches the agent
+    through the MCP server, so only this headless entrypoint is agent-specific.
+
+    Note: Antigravity also ships a `google.antigravity` Python SDK. The CLI is
+    used here to stay consistent with the other adapters (no hard SDK
+    dependency, agent-agnostic core); swap `run_turn` to call the SDK if you
+    prefer in-process invocation.
     """
 
     name = "antigravity"
     binary = "antigravity"
 
-    def available(self) -> bool:
-        return shutil.which(self.binary) is not None
-
-    def run_turn(self, prompt: str, cwd: Path) -> AgentResult:
-        return AgentResult(
-            ok=False,
-            text="antigravity adapter not implemented yet (stub). "
-                 "Implement run_turn() to invoke: antigravity CLI / google.antigravity SDK",
-        )
+    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800) -> AgentResult:
+        # `antigravity exec` runs a single non-interactive turn and prints output.
+        return self._run_cli([self.binary, "exec", prompt], cwd, timeout)

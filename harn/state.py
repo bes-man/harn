@@ -9,10 +9,12 @@ from pathlib import Path
 PLANNING = "PLANNING"
 READY = "READY"
 EXECUTING = "EXECUTING"
+VERIFYING = "VERIFYING"   # checking the work against the task's acceptance criteria
 BLOCKED = "BLOCKED"
+REVIEW = "REVIEW"   # an agent finished a task; waiting on the human to accept/comment
 DONE = "DONE"
 
-PHASES = {PLANNING, READY, EXECUTING, BLOCKED, DONE}
+PHASES = {PLANNING, READY, EXECUTING, VERIFYING, BLOCKED, REVIEW, DONE}
 
 
 @dataclass

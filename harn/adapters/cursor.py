@@ -1,28 +1,21 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from .base import Adapter, AgentResult
 
 
 class CursorAdapter(Adapter):
-    """Stub adapter for cursor. Wire up headless invocation here.
+    """Drives Cursor in headless mode via `cursor-agent -p`.
 
-    Intended entrypoint: cursor-agent headless run.
-    The shared logic (tasks, skills, ask_user, feedback, notifications) already
-    works via the MCP server; only this run_turn needs implementing.
+    Only shells out to the CLI the user already has installed; the shared
+    logic (tasks, skills, ask_user, feedback, notifications) reaches the agent
+    through the MCP server, so only this headless entrypoint is agent-specific.
     """
 
     name = "cursor"
     binary = "cursor-agent"
 
-    def available(self) -> bool:
-        return shutil.which(self.binary) is not None
-
-    def run_turn(self, prompt: str, cwd: Path) -> AgentResult:
-        return AgentResult(
-            ok=False,
-            text="cursor adapter not implemented yet (stub). "
-                 "Implement run_turn() to invoke: cursor-agent headless run",
-        )
+    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800) -> AgentResult:
+        # `-p/--print` makes cursor-agent run non-interactively and print output.
+        return self._run_cli([self.binary, "-p", prompt], cwd, timeout)

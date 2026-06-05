@@ -50,19 +50,34 @@ def _mcp_command() -> dict:
 
 def _write_agent_configs(project_root: Path) -> list[str]:
     written = []
+    from .config import Config, DEFAULTS
+    from . import semble_bridge
+
     cmd = _mcp_command()
+    # Load config from env_dir if already set up, otherwise use defaults
+    env_dir = project_root / "harn_env"
+    try:
+        cfg = Config.load(env_dir)
+    except Exception:
+        from dataclasses import fields as _fields
+        cfg = Config()  # defaults
+
+    servers: dict = {"harn": cmd}
+    servers.update(semble_bridge.mcp_servers(cfg))
+
+    mcp_payload = json.dumps({"mcpServers": servers}, indent=2)
 
     # Claude Code: .mcp.json
     claude_cfg = project_root / ".mcp.json"
     if not claude_cfg.exists():
-        claude_cfg.write_text(json.dumps({"mcpServers": {"harn": cmd}}, indent=2))
+        claude_cfg.write_text(mcp_payload)
         written.append(".mcp.json (Claude)")
 
     # Cursor: .cursor/mcp.json
     cursor_cfg = project_root / ".cursor" / "mcp.json"
     if not cursor_cfg.exists():
         cursor_cfg.parent.mkdir(parents=True, exist_ok=True)
-        cursor_cfg.write_text(json.dumps({"mcpServers": {"harn": cmd}}, indent=2))
+        cursor_cfg.write_text(mcp_payload)
         written.append(".cursor/mcp.json (Cursor)")
 
     # Codex (config.toml) and Antigravity (mcp_config.json) live in the user's
@@ -78,9 +93,12 @@ def _write_agent_configs(project_root: Path) -> list[str]:
         "```\n\n"
         "## Antigravity  (~/.gemini/config/mcp_config.json)\n```json\n"
         + json.dumps({"mcpServers": {"harn": cmd}}, indent=2)
+        + "\n```\n\n"
+        "## Qwen Code  (~/.qwen/settings.json)\n```json\n"
+        + json.dumps({"mcpServers": {"harn": cmd}}, indent=2)
         + "\n```\n"
     )
-    written.append("harn_env/mcp_snippets.md (Codex + Antigravity)")
+    written.append("harn_env/mcp_snippets.md (Codex + Antigravity + Qwen)")
     return written
 
 

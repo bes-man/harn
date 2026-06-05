@@ -1,0 +1,24 @@
+{
+  "id": "AUTH-42",
+  "title": "Add JWT auth",
+  "status": "done",
+  "priority": 1,
+  "prds": ["auth"],
+  "epic": "Q2-SECURITY",
+  "user_story": "AUTH-10",
+  "skills": ["security", "standards"],
+  "subtasks": [
+    {"id": "AUTH-42-1", "title": "POST /login returns signed JWT", "status": "done"},
+    {"id": "AUTH-42-2", "title": "Middleware rejects expired tokens with 401", "status": "done"},
+    {"id": "AUTH-42-3", "title": "POST /refresh rotates refresh token", "status": "done"}
+  ],
+  "description": "## What\nIssue a short-lived JWT on login and verify it on protected routes.\n\n## Done when\n- POST /login returns a signed JWT for valid credentials.\n- Protected routes reject missing/expired tokens with 401.\n- Refresh token is rotated on every use.\n\n## Notes for future agents\nAccess tokens are 15m; refresh tokens live in the `sessions` table and are rotated on use. Signing secret comes from `JWT_SECRET` (never hardcode it). If you touch auth, update `tests/test_auth.py` — it locks in the 15m expiry.",
+  "review_log": [
+    {"ts": "2026-06-01T09:14Z", "event": "started", "agent": "claude"},
+    {"ts": "2026-06-01T09:31Z", "event": "submitted_for_review", "agent": "claude", "summary": "implemented /login + middleware"},
+    {"ts": "2026-06-01T10:02Z", "event": "changes_requested", "by": "user", "comment": "expiry is 24h, make it 15m and add a refresh endpoint"},
+    {"ts": "2026-06-01T10:05Z", "event": "started", "agent": "codex"},
+    {"ts": "2026-06-01T10:40Z", "event": "submitted_for_review", "agent": "codex", "summary": "15m access token + /refresh"},
+    {"ts": "2026-06-01T11:12Z", "event": "accepted", "by": "user", "notes": "Access tokens 15m, refresh tokens rotate on use"}
+  ]
+}
