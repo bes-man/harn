@@ -75,17 +75,19 @@ chat_grace_minutes = 5
 #   HARN_TELEGRAM_BOT_TOKEN, HARN_TELEGRAM_CHAT_ID, HARN_SLACK_WEBHOOK_URL
 
 [code_search]
-# Both backends default to on — harn detects which are installed/available
-# and injects the appropriate guidance into planning and oracle prompts.
-# Disable either here if you don't want it.
+# Both backends default to on. `harn setup` auto-installs whichever is enabled
+# here (semble via pip; SocratiCode prerequisites checked + npx cache warmed),
+# wires them into the agent MCP configs, and injects guidance into the planning
+# and oracle prompts. Disable either to skip it. Re-run `harn setup` after
+# toggling. Use `harn setup --no-install` to skip the install step.
 
-# semble — semantic chunk retrieval (Python, installed with harn automatically).
-# Gives agents precise code snippets instead of reading whole files.
+# semble — semantic chunk retrieval (Python `semble[mcp]`, installed by setup).
+# Gives agents precise code snippets instead of reading whole files. No Docker.
 semble = true
 
 # SocratiCode — static dependency graph + blast-radius analysis.
 # More precise than semble for "what breaks if X changes" questions.
-# Requires Docker + Qdrant + npm/npx. Pinned to ^1.8 for safety.
-# Setup: docker compose up -d  (Qdrant) then npx -y socraticode@^1.8 mcp
+# Fetched by npx on first use (pinned ^1.8); REQUIRES Node.js + a running Docker
+# daemon (for Qdrant). `harn setup` warns if Docker isn't up.
 # Source: https://github.com/giancarloerra/SocratiCode
 socraticcode = true

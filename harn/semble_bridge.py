@@ -102,6 +102,85 @@ def socraticcode_server_entry() -> dict | None:
     }
 
 
+def _docker_running() -> bool:
+    """True if a Docker daemon is reachable (SocratiCode needs Qdrant)."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        r = subprocess.run(["docker", "info"], capture_output=True,
+                           text=True, timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Installation — driven by `harn setup` for enabled backends
+# ---------------------------------------------------------------------------
+
+def install_semble(timeout: int = 900) -> tuple[bool, str]:
+    """Ensure `semble[mcp]` is installed in the current environment."""
+    if semble_installed():
+        return True, f"semble already installed ({semble_version() or '?'})"
+    spec = f"{SEMBLE_PYPI}{SEMBLE_VERSION_CONSTRAINT}"
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", spec],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"pip install {spec} failed to start: {e}"
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+        return False, f"pip install {spec} failed: {tail[0][:200]}"
+    return True, f"installed {spec}"
+
+
+def prepare_socraticode(prefetch: bool = True, timeout: int = 300) -> tuple[bool, str]:
+    """Check prerequisites for SocratiCode and warm the npx cache.
+
+    SocratiCode itself is fetched by npx on first use; harn can't install Docker
+    or start Qdrant for the user, so this verifies and warns instead.
+    """
+    if not socraticcode_npx_available():
+        return False, "npx not found — install Node.js to use SocratiCode"
+    notes: list[str] = []
+    if prefetch:
+        # Download the package into the npx cache without starting the server.
+        try:
+            # `npm view <pkg> version` returns the single latest version.
+            r = subprocess.run(
+                ["npm", "view", SOCRATICODE_NPM, "version"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            ver = (r.stdout or "").strip().splitlines()[-1:] or [""]
+            if r.returncode == 0 and ver[0]:
+                notes.append(f"SocratiCode reachable via npx (latest {ver[0]})")
+            else:
+                return False, "could not reach the socraticode npm package"
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"npm view failed: {e}"
+    if not _docker_running():
+        notes.append("⚠️  Docker daemon not detected — start Docker so "
+                     "SocratiCode can run Qdrant (or set QDRANT_URL for cloud)")
+    return True, "; ".join(notes) or "SocratiCode prerequisites OK"
+
+
+def ensure_backends(cfg, *, prefetch: bool = True) -> list[str]:
+    """Install/verify the code-search backends enabled in config.
+
+    Returns human-readable status lines for `harn setup` to print.
+    """
+    lines: list[str] = []
+    if getattr(cfg, "code_search_semble", False):
+        ok, msg = install_semble()
+        lines.append(("✓ " if ok else "✗ ") + msg)
+    if getattr(cfg, "code_search_socraticcode", False):
+        ok, msg = prepare_socraticode(prefetch=prefetch)
+        lines.append(("✓ " if ok else "✗ ") + msg)
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Git diff parsing — extract (file, first_changed_line) for blast-radius calls
 # ---------------------------------------------------------------------------

@@ -13,8 +13,22 @@ def _env_dir(project_root: Path) -> Path:
 
 
 def cmd_setup(args) -> int:
-    from . import scaffold
+    from . import scaffold, semble_bridge
+    from .config import Config
     root = Path(args.path).resolve()
+    env_dir = _env_dir(root)
+
+    # Install enabled code-search backends BEFORE writing MCP configs, so an
+    # installed semble lands in the generated config. Use the existing config if
+    # the project was set up before, otherwise the defaults (both backends on).
+    if not args.no_install:
+        cfg = Config.load(env_dir) if (env_dir / "harn.toml").exists() else Config()
+        statuses = semble_bridge.ensure_backends(cfg)
+        if statuses:
+            print("[harn] code search backends:")
+            for line in statuses:
+                print(f"   {line}")
+
     result = scaffold.setup(root)
     print(f"[harn] harn_env created at {result['env_dir']}")
     for f in result["created"]:
@@ -141,6 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("setup", help="scaffold harn_env into a project")
     sp.add_argument("path", nargs="?", default=".", help="project root (default: .)")
+    sp.add_argument("--no-install", action="store_true",
+                    help="don't auto-install enabled code-search backends "
+                         "(semble / SocratiCode prerequisites)")
     sp.set_defaults(func=cmd_setup)
 
     rp = sub.add_parser("run", help="run the ralph loop")

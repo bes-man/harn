@@ -41,9 +41,11 @@ pipx install .            # or: pip install -e .   (Python 3.10+)
 ```bash
 cd /path/to/your-project
 harn setup                # scaffolds harn_env/ + AGENTS.md + per-agent MCP config
+                          # also installs enabled code-search backends (semble;
+                          # SocratiCode prereqs). Skip with: harn setup --no-install
 
 # edit harn_env/harn.toml -> [feedback] test_cmd = "pytest -q"   (your tests)
-# add tasks in harn_env/tasks/*.md, PRDs in harn_env/prd/*.md
+# add tasks in harn_env/tasks/*.json, PRDs in harn_env/prd/*.md
 
 harn run                  # run the loop with the configured agent(s)
 harn board                # see every task on its track
