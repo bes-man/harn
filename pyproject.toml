@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",          # MCP server (FastMCP); only needed for the `harn mcp` command
     "tomli>=2.0 ; python_version < '3.11'",
-    "semble>=0.3.0,<1.0",  # code-search for agents: chunk retrieval + find_related
+    "semble[mcp]>=0.3.0,<1.0",  # code search for agents; [mcp] ships the MCP server
 ]
 
 [project.scripts]

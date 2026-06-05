@@ -27,9 +27,11 @@ from pathlib import Path
 # semble
 # ---------------------------------------------------------------------------
 
-#: npm package pinned to the 0.x series (matches harn pyproject.toml constraint).
-SEMBLE_PYPI = "semble"
-SEMBLE_VERSION_CONSTRAINT = ">=0.1.0,<1.0"
+#: PyPI package; the MCP server lives in the `[mcp]` extra (verified on 0.3.2).
+SEMBLE_PYPI = "semble[mcp]"
+SEMBLE_VERSION_CONSTRAINT = ">=0.3.0,<1.0"
+#: semble's actual MCP tool names — NO `semble_` prefix (verified via tools/list).
+SEMBLE_TOOLS = ("search", "find_related")
 
 
 def semble_installed() -> bool:
@@ -46,12 +48,17 @@ def semble_version() -> str:
 
 
 def semble_server_cmd() -> list[str] | None:
-    """Command that launches the semble MCP server, or None."""
+    """Command that launches the semble MCP server, or None.
+
+    The bare `semble` executable (installed via the `semble[mcp]` extra) IS the
+    stdio MCP server — there is NO `semble mcp` subcommand. Falls back to `uvx`
+    when the binary isn't on PATH but uv is available.
+    """
     bin_ = shutil.which("semble")
     if bin_:
-        return [bin_, "mcp"]
-    if semble_installed():
-        return [sys.executable, "-m", "semble", "mcp"]
+        return [bin_]
+    if shutil.which("uvx"):
+        return ["uvx", "--from", "semble[mcp]", "semble"]
     return None
 
 
@@ -136,9 +143,11 @@ def changed_files(diff: str) -> list[tuple[str, int]]:
 
 def _semble_search_note() -> str:
     return (
-        "> **semble** is available — call `semble_search(\"<topic>\")` to retrieve "
-        "only the relevant code chunks (instead of reading whole files). "
-        "Call `semble_find_related(\"<file>\", <line>)` to map semantic neighbours."
+        "> **semble** is available — use its MCP tools (your client may prefix "
+        "them, e.g. `mcp__semble__search`):\n"
+        "> - `search(\"<topic>\")` — retrieve only the relevant code chunks "
+        "instead of reading whole files\n"
+        "> - `find_related(\"<file>\", <line>)` — semantic neighbours of a line"
     )
 
 
@@ -164,7 +173,7 @@ def planning_hint(cfg) -> str:
     elif cfg.code_search_semble and semble_installed():
         parts.append(_semble_search_note())
         parts.append(
-            "Before writing acceptance criteria, call `semble_search(\"<task "
+            "Before writing acceptance criteria, call semble's `search(\"<task "
             "topic>\")` to understand existing patterns in the codebase."
         )
     return "\n".join(parts)
@@ -195,11 +204,12 @@ def oracle_hint(cfg, diff: str) -> str:
         parts.append(_semble_search_note())
         if changed:
             calls = "\n".join(
-                f"  - `semble_find_related(\"{p}\", {l})`"
+                f"  - `find_related(\"{p}\", {l})`"
                 for p, l in changed
             )
             parts.append(
-                "**Semantic blast-radius (diff-scoped):**\n" + calls + "\n"
+                "**Semantic blast-radius (diff-scoped) — call semble's "
+                "`find_related`:**\n" + calls + "\n"
                 "Examine the returned chunks for unintended dependencies."
             )
 
@@ -216,7 +226,8 @@ def mcp_servers(cfg) -> dict:
     if cfg.code_search_semble:
         cmd = semble_server_cmd()
         if cmd:
-            servers["semble"] = {"command": cmd[0], "args": cmd[1:] + ["--repo", "."]}
+            # bare `semble` takes no --repo flag; the search path is a tool arg.
+            servers["semble"] = {"command": cmd[0], "args": cmd[1:]}
     if cfg.code_search_socraticcode:
         entry = socraticcode_server_entry()
         if entry:

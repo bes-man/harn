@@ -31,10 +31,12 @@ in your tool list — harn's prompts will tell you which tools to call.
 - `codebase_symbol("symbol")` — definition + all callers + all callees
 - `codebase_search("query")` — hybrid semantic+BM25 search over the whole repo
 
-**semble** (semantic chunk retrieval — lightweight, no Docker needed):
-- `semble_search("topic")` → only the relevant chunks (~98% fewer tokens than
-  reading files). Call this before opening any file.
-- `semble_find_related("file.py", 42)` → semantic neighbours of a changed line.
+**semble** (semantic chunk retrieval — lightweight, no Docker needed). Tools are
+named `search` / `find_related` (your client may prefix them, e.g.
+`mcp__semble__search`):
+- `search("topic")` → only the relevant chunks (~98% fewer tokens than reading
+  files). Call this before opening any file.
+- `find_related("file.py", 42)` → semantic neighbours of a changed line.
 
 **Protocol** (regardless of which backend is available):
 1. Search first — never open a whole file when a search can narrow it down.
