@@ -64,3 +64,35 @@ def read_skill(env_dir: Path, name: str) -> str | None:
         if s.name == name:
             return s.body()
     return None
+
+
+_LEARNED_HEADING = "## Learned (captured from the team)"
+
+
+def append_learning(env_dir: Path, name: str, content: str,
+                    description: str = "") -> Path:
+    """Append a learned fact to a skill, creating the skill if it doesn't exist.
+
+    This is how harn accumulates project knowledge: an answer or a discovered
+    convention is saved into the matching skill so future agents read it instead
+    of asking again. Returns the SKILL.md path.
+    """
+    name = name.strip().lower().replace(" ", "-")
+    content = content.strip()
+    skill_dir = env_dir / "skills" / name
+    md = skill_dir / "SKILL.md"
+    if not md.exists():
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        desc = description.strip() or f"{name} standards and conventions for this project."
+        md.write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n",
+            encoding="utf-8",
+        )
+    text = md.read_text(encoding="utf-8", errors="replace").rstrip()
+    entry = f"- {content}"
+    if _LEARNED_HEADING in text:
+        text += "\n" + entry + "\n"
+    else:
+        text += f"\n\n{_LEARNED_HEADING}\n{entry}\n"
+    md.write_text(text, encoding="utf-8")
+    return md

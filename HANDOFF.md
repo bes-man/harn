@@ -272,10 +272,25 @@ project root.
   oracle verdict in review_log and relay it, keep `harn watch` running.
 - Tests: `tests/test_watch.py` (140 total).
 
-### Phase 2 — NEXT (structured planning + knowledge capture)
-`propose_skill_update(skill, content)` MCP tool + confirm via HIL; agent saves
-what it learns (from answers / discovered conventions) into skills. Make planning
-a one-question-at-a-time dialog rather than a wall of text. (#3, #5, #6)
+### Phase 2 — DONE (knowledge capture + structured planning)
+- `skills.append_learning(env_dir, name, content)` — saves a learned fact into a
+  skill, creating it if missing (`## Learned (captured from the team)` section).
+- MCP `save_to_skill(skill, content, description)` — agent captures durable
+  knowledge (confirmed answers, discovered conventions) into skills, so future
+  work asks less. Logs to PROGRESS.
+- AGENTS.md: knowledge-capture rule ("an answer you don't capture is a question
+  you'll ask twice"); planning is now a one-question-at-a-time DIALOG (write
+  criteria first, ask singly, capture, repeat — no wall of text); new
+  "Onboarding a new/under-specified project" section (fill PRD, ask standards →
+  save_to_skill, set test_cmd). (#3, #5, #6)
+- Tests: `tests/test_knowledge.py` (145 total).
+
+### Remaining from the feedback
+- #5 planning in chat now relies on the protocol; verify live that the agent
+  actually does one-question-at-a-time (prompt is there; behaviour needs a real
+  run to confirm).
+- Later: N parallel agents (git worktrees); remote skill hub (explicitly NOT
+  wanted now — capture-into-skills is the chosen model).
 
 ## Earlier note
 - in CLI (non-Telegram) review mode the

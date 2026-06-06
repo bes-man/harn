@@ -52,6 +52,25 @@ def build_server():
         return body if body is not None else f"(no skill named '{name}')"
 
     @mcp.tool()
+    def save_to_skill(skill: str, content: str, description: str = "") -> str:
+        """Save a learned fact/convention/standard into a skill — this is how harn
+        BUILDS UP project knowledge so future work needs fewer questions.
+
+        Call this whenever you learn something durable: the user answered a
+        question about a standard, you discovered a convention in the codebase, or
+        a decision should apply project-wide. Ask the user to confirm first (in
+        the chat / via ask_user), THEN save. Creates the skill if it doesn't
+        exist (e.g. `security`, `standards`, `frontend`, `testing`, `api`).
+
+        Examples:
+          save_to_skill("security", "All endpoints require auth except /health.")
+          save_to_skill("frontend", "Use TanStack Query; no manual fetch in components.")
+        """
+        path = skills_mod.append_learning(_env_dir(), skill, content, description)
+        _log(f"skill '{skill}' updated: {content[:80]}")
+        return f"saved to {path.relative_to(_env_dir())}"
+
+    @mcp.tool()
     def get_next_task() -> str:
         """Return the highest-priority task that needs agent work, or a note if
         none. Resumes an in-progress task before starting a new one."""

@@ -67,14 +67,25 @@ dependency graph and are language-independent.
 - **Skills are loaded on demand.** Do not read every skill. Use the harn
   `list_skills` tool to see what exists, then `read_skill` only the ones the
   current task needs. This keeps the context window small.
-- **Plan before you build.** In planning, restate the task, list assumptions, and
-  surface open questions. Only start coding once the plan is confirmed.
+- **Plan before you build — as a dialog, not a wall of text.** First write the
+  acceptance criteria into the task (`update_task`). Then resolve open questions
+  **one at a time**: ask a single focused question (context + options +
+  recommendation), wait for the answer, capture it (into the task or a skill),
+  then ask the next. Never dump a list of questions in one message. Only start
+  coding once the criteria are confirmed.
 - **When unsure, stop and ask.** If anything is ambiguous, risky, or
   underspecified, call the harn `ask_user` tool (or write your question to
   `harn_env/state/BLOCKED.md` and end your turn). Never guess on ambiguous work.
   **Ask expanded, not terse:** state (1) the context and *why* the question came
   up, (2) the concrete options with each one's trade-off, and (3) your
   recommended option with a one-line reason — so the human can decide quickly.
+- **Build up the knowledge base.** harn gets smarter as it learns the project.
+  Whenever you learn something durable — the user answers a question about a
+  standard, you discover a convention in the code, or a decision should apply
+  project-wide — **confirm it with the user, then call `save_to_skill(skill,
+  content)`** (e.g. `security`, `standards`, `frontend`, `testing`, `api`). It
+  creates the skill if missing. Next time, you read it instead of asking again.
+  An answer you don't capture is a question you'll ask twice.
 - **Feedback loop.** After changes, run the project's tests via the harn
   `run_tests` tool. Do not mark a task complete while tests fail.
 - **Carry context between iterations (cheaply).** You run as a fresh process each
@@ -88,6 +99,18 @@ dependency graph and are language-independent.
   **not** acceptance criteria. The independent oracle review will VERIFY your
   decisions against the requirements, so don't use them to justify shortcuts.
 - Make small, reviewable changes. Explain what you changed and why.
+
+## Onboarding a new / under-specified project
+If `harn_env/` is sparse — no PRD, empty skills (`security`/`standards`/`ui`/…),
+no `[feedback] test_cmd` — help the user fill it in BEFORE building, as a calm
+one-question-at-a-time dialog (never a questionnaire dump):
+1. **What are we building?** Capture it into a PRD (`harn_env/prd/<slug>.md`:
+   Problem / Goal / Scope / Acceptance criteria). Get the user's confirmation.
+2. **What standards apply?** Ask about the ones that shape decisions —
+   security, testing, frontend conventions, API style, code standards — and
+   **save each answer with `save_to_skill`**. These drive every later decision.
+3. **How do we verify?** Get the test command → set `[feedback] test_cmd`.
+A few minutes here means the agent decides correctly for the whole project after.
 
 ## Creating a task
 When the human describes work in words (or points at a PRD like `auth`), YOU
