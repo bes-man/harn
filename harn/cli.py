@@ -39,10 +39,11 @@ def cmd_setup(args) -> int:
 
     _print_mcp_health(env_dir, _agent_chain_names(env_dir))
 
-    print("\nNext: edit harn_env/skills/*, add tasks (the agent can via "
-          "create_task), set [feedback] test_cmd in harn_env/harn.toml.")
-    print("Then run `harn watch` in a terminal (live status + Telegram), and "
-          "work with your agent or `harn run`.")
+    print("\nNext:")
+    print("  1. `harn onboard`  — analyse this project, seed skills, brief the agent")
+    print("  2. set [feedback] test_cmd in harn_env/harn.toml")
+    print("  3. `harn watch` in a terminal (live status + Telegram), then work")
+    print("     with your agent (\"onboard this project\") or `harn run`.")
     return 0
 
 
@@ -54,24 +55,119 @@ def _agent_chain_names(env_dir: Path) -> list[str]:
         return ["claude"]
 
 
-def _print_mcp_health(env_dir: Path, chain: list[str]) -> bool:
-    """Verify the MCP server starts and tools respond; print enable steps."""
-    from . import mcp_server
-    print("\n[harn] checking the MCP server…")
-    ok, tools, err = mcp_server.healthcheck(env_dir)
-    if ok:
-        print(f"   ✓ MCP server starts; {len(tools)} tools respond "
-              f"({', '.join(tools[:6])}…)")
+def _set_require_mcp_false(env_dir: Path) -> None:
+    toml = env_dir / "harn.toml"
+    try:
+        text = toml.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if "require_mcp" in text:
+        import re
+        text = re.sub(r"require_mcp\s*=\s*\w+", "require_mcp = false", text)
     else:
-        print(f"   ✗ MCP server problem: {err}")
-        print("     Fix this first — agents can't use harn without it.")
-    if "cursor" in chain:
-        print("   ⚠ Cursor: open Settings → MCP and TOGGLE the 'harn' server ON "
-              "(Cursor disables new MCP servers by default; the config file alone "
-              "is not enough).")
-    if "claude" in chain:
-        print("   ℹ Claude Code: run `/mcp` to confirm 'harn' is connected.")
-    return ok
+        text = text.replace("[harn]", "[harn]\nrequire_mcp = false", 1)
+    toml.write_text(text, encoding="utf-8")
+
+
+def _print_mcp_health(env_dir: Path, chain: list[str]) -> bool:
+    """Verify the MCP server starts and tools respond; insist it's enabled.
+
+    The server-side check is real. The agent-side toggle (Cursor) can't be
+    inspected, so when `[harn] require_mcp` is on and we're interactive, we loop:
+    show the enable steps and re-check until the user confirms or opts out — harn
+    is useless to the agent until MCP is on.
+    """
+    from . import mcp_server
+    from .config import Config
+    try:
+        require = Config.load(env_dir).require_mcp
+    except Exception:
+        require = True
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    needs_toggle = "cursor" in chain  # Cursor disables new MCP servers by default
+
+    while True:
+        print("\n[harn] checking the MCP server…")
+        ok, tools, err = mcp_server.healthcheck(env_dir)
+        if ok:
+            print(f"   ✓ MCP server starts; {len(tools)} tools respond "
+                  f"({', '.join(tools[:6])}…)")
+        else:
+            print(f"   ✗ MCP server problem: {err}")
+        if needs_toggle:
+            print("   ⚠ Cursor: Settings → MCP → toggle 'harn' ON. The config "
+                  "file alone is NOT enough — Cursor disables new servers by default.")
+        if "claude" in chain:
+            print("   ℹ Claude Code: run `/mcp`; 'harn' must show as connected.")
+
+        # Server OK and no manual toggle needed → done.
+        if ok and not needs_toggle:
+            return True
+        if not require:
+            return ok
+        if not interactive:
+            print("   ⚠ harn is useless until MCP is enabled. Enable it, then run "
+                  "`harn doctor`. (Set [harn] require_mcp=false to silence.)")
+            return ok
+        ans = input("   → Enabled it in your agent? "
+                    "[Enter = re-check · s = skip for now · n = don't ask again]: "
+                    ).strip().lower()
+        if ans == "s":
+            print("   (skipped — run `harn doctor` once it's on)")
+            return ok
+        if ans == "n":
+            _set_require_mcp_false(env_dir)
+            print("   (disabled: [harn] require_mcp = false)")
+            return ok
+        # otherwise: loop and re-check
+
+
+def cmd_onboard(args) -> int:
+    from . import onboard, semble_bridge
+    from .config import Config
+    root = Path(args.path).resolve()
+    env_dir = _env_dir(root)
+    if not env_dir.exists():
+        print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
+        return 1
+
+    print("[harn] onboarding — analysing the project…")
+    stack = onboard.detect_stack(root)
+    print(f"   detected: {onboard.stack_summary(stack)}")
+
+    notes = onboard.seed_skills(env_dir, stack)
+    if notes:
+        print("   seeded skills with obvious facts:")
+        for n in notes:
+            print(f"     • {n}")
+
+    # Warm the code-search index so RAG is ready (forced, if enabled).
+    cfg = Config.load(env_dir)
+    if cfg.code_search_semble and semble_bridge.semble_installed():
+        print("   warming semble index (first run may take a bit)…")
+        import subprocess
+        cmd = semble_bridge.semble_server_cmd()
+        if cmd and cmd[0].endswith("semble"):
+            try:
+                subprocess.run([cmd[0], "search", "project overview", str(root),
+                                "-k", "1"], capture_output=True, timeout=300)
+                print("     ✓ semble indexed")
+            except Exception:
+                print("     (semble warm-up skipped)")
+    if cfg.code_search_socraticcode and semble_bridge.socraticcode_npx_available():
+        print("   ℹ SocratiCode: ask the agent to run `codebase_index` to build "
+              "the dependency graph (needs Docker running).")
+
+    brief = onboard.onboard_brief(stack)
+    (env_dir / "state").mkdir(exist_ok=True)
+    (env_dir / "state" / "ONBOARD.md").write_text(
+        f"# Auto-detected stack\n{onboard.stack_summary(stack)}\n\n{brief}",
+        encoding="utf-8")
+    print("\n[harn] Next: tell your agent \"onboard this project\" — it will read "
+          "harn_env/state/ONBOARD.md, map the code, ask you to fill the PRD and "
+          "standards (saved into skills), and confirm before any work.")
+    print("       Keep `harn watch` running so questions reach you.")
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -280,6 +376,14 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("update", help="update harn from GitHub (keeps harn_env)")
     up.add_argument("--ref", default="", help="branch/tag to install (default: main)")
     up.set_defaults(func=cmd_update)
+
+    op = sub.add_parser(
+        "onboard",
+        help="analyse an existing project: detect stack, seed skills, warm the "
+             "code index, brief the agent to fill PRD/standards",
+    )
+    op.add_argument("path", nargs="?", default=".")
+    op.set_defaults(func=cmd_onboard)
 
     dp = sub.add_parser("doctor", help="verify the MCP server + tools work")
     dp.add_argument("path", nargs="?", default=".")

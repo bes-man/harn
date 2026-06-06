@@ -159,7 +159,11 @@ def setup(project_root: Path) -> dict:
     elif bundled_agents.exists():
         bundled_agents.unlink()
 
-    (env_dir / "state").mkdir(exist_ok=True)
+    # A new project starts with EMPTY tasks/ and prd/ — no demo content. The
+    # agent fills them during onboarding; samples live in harn_example/.
+    for sub in ("state", "tasks", "prd"):
+        (env_dir / sub).mkdir(exist_ok=True)
+
     agent_cfgs, root_paths = _write_agent_configs(project_root)
     _gitignore_add(project_root, root_paths)
 

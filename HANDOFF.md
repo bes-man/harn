@@ -312,6 +312,27 @@ project root.
 
 Tests: 149 passing.
 
+## Added since (brownfield onboarding + MCP enforcement + clean templates)
+- **No demo content in a new harn_env.** Removed `tasks/PRJ-001.json`,
+  `prd/auth.md`, `prd/example.md` from templates (kept in `harn_example/` as
+  reference). `setup` now creates empty `tasks/` + `prd/`; skills stay as stubs.
+- **MCP enforcement** (`[harn] require_mcp`, default true): `harn setup` /
+  `harn doctor` run a real server health-check AND, when interactive, loop —
+  showing the enable steps (Cursor toggle / Claude `/mcp`) and re-checking until
+  the user confirms, skips, or opts out (`n` → writes `require_mcp = false`).
+  No more silently-ignored print.
+- **`harn onboard`** (`harn/onboard.py`): for existing projects —
+  `detect_stack()` (marker files: pyproject/package.json/go.mod/…, frameworks,
+  test/lint tools), `seed_skills()` writes the obvious facts into project/
+  standards skills (B2), force-warms the semble index, and writes
+  `state/ONBOARD.md` (stack + a dialog brief). AGENTS.md "Onboarding" tells the
+  agent to read ONBOARD.md, map the code, and fill PRD + standards
+  (`ask_user(skill=)`) before building. Tests: `tests/test_onboard.py`.
+- Tests: 154 total.
+- STILL OPEN (design agreed, not yet built): SocratiCode index warm-up is left to
+  the agent (`codebase_index` needs Docker); fuller onboarding could run a
+  headless agent turn to draft the PRD from code rather than only briefing.
+
 ## Earlier note
 - in CLI (non-Telegram) review mode the
   loop stops at REVIEW for the human; with Telegram it blocks inline per task.

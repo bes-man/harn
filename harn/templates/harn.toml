@@ -12,6 +12,11 @@ project = "prj"
 # Lower = more questions (and higher accuracy on fuzzy specs); higher = fewer
 # interruptions (and more agent initiative). Default 0.7.
 autonomy = 0.7
+# require_mcp (default true): `harn setup` / `harn doctor` insist the MCP server
+# is actually enabled in your agent (Cursor needs a manual toggle) and re-check
+# until you confirm — harn is useless to the agent until MCP is on. Set false to
+# silence the check.
+require_mcp = true
 # Single agent (shorthand):
 agent = "claude"           # claude | codex | cursor | antigravity | qwen
 # Or several, tried in order — the first one installed runs. Whichever agent

@@ -104,16 +104,24 @@ dependency graph and are language-independent.
 - Make small, reviewable changes. Explain what you changed and why.
 
 ## Onboarding a new / under-specified project
-If `harn_env/` is sparse — no PRD, empty skills (`security`/`standards`/`ui`/…),
-no `[feedback] test_cmd` — help the user fill it in BEFORE building, as a calm
-one-question-at-a-time dialog (never a questionnaire dump):
+harn is useless until it knows the project. If `harn_env/` is sparse — empty
+`prd/`, skills are still stubs, no `[feedback] test_cmd` — **onboard first**, and
+do it as a calm one-question-at-a-time dialog (never a questionnaire dump):
+
+0. **Read `harn_env/state/ONBOARD.md`** if present (`harn onboard` writes it):
+   the auto-detected stack and a brief. Also read the repo's README/docs and use
+   code search (`search` / `codebase_search`) to map the code. The user may point
+   you at md files with project info — read those instead of asking from scratch.
 1. **What are we building?** Capture it into a PRD (`harn_env/prd/<slug>.md`:
-   Problem / Goal / Scope / Acceptance criteria). Get the user's confirmation.
-2. **What standards apply?** Ask about the ones that shape decisions —
-   security, testing, frontend conventions, API style, code standards — and
-   **save each answer with `save_to_skill`**. These drive every later decision.
+   Problem / Goal / Scope / Acceptance criteria). Confirm with the user.
+2. **What standards apply?** Ask about the ones that shape decisions — security,
+   testing, frontend conventions, API style, code standards. Ask each as
+   `ask_user(question, skill="<that skill>")` so the answer is saved into the
+   skill AUTOMATICALLY (or call `save_to_skill` when you discover a convention in
+   the code). These drive every later decision.
 3. **How do we verify?** Get the test command → set `[feedback] test_cmd`.
-A few minutes here means the agent decides correctly for the whole project after.
+Don't start building until the PRD + key skills are filled and confirmed. A few
+minutes here means the agent decides correctly for the whole project after.
 
 ## Creating a task
 When the human describes work in words (or points at a PRD like `auth`), YOU

@@ -35,7 +35,7 @@ DEFAULTS: dict = {
     # all context (AGENTS.md, the task board, PROGRESS.md, ANSWERS.md, MCP), so
     # whichever one runs next understands what's done and what's planned.
     "harn": {"agent": "claude", "agents": [], "project": "prj001",
-             "autonomy": 0.7},
+             "autonomy": 0.7, "require_mcp": True},
     "feedback": {"test_cmd": ""},
     "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
              "auto": False, "auto_max_iterations": 30,
@@ -54,6 +54,7 @@ class Config:
     # How self-directed the agent is, 0.0–1.0. 0 = meticulous (clarify
     # everything), 1 = creative (decide for itself). Default 0.7.
     autonomy: float = 0.7
+    require_mcp: bool = True   # setup/doctor insist the MCP server is enabled
     test_cmd: str = ""
     max_iterations: int = 10
     loop_aware: bool = True
@@ -108,6 +109,7 @@ class Config:
             autonomy=_clamp01(
                 os.environ.get("HARN_AUTONOMY") or data["harn"].get("autonomy", 0.7)
             ),
+            require_mcp=bool(data["harn"].get("require_mcp", True)),
             test_cmd=data["feedback"].get("test_cmd", ""),
             max_iterations=int(data["loop"].get("max_iterations", 10)),
             loop_aware=bool(data["loop"].get("loop_aware", True)),
