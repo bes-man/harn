@@ -39,11 +39,17 @@ def cmd_setup(args) -> int:
 
     _print_mcp_health(env_dir, _agent_chain_names(env_dir))
 
-    print("\nNext:")
-    print("  1. `harn onboard`  — analyse this project, seed skills, brief the agent")
-    print("  2. set [feedback] test_cmd in harn_env/harn.toml")
-    print("  3. `harn watch` in a terminal (live status + Telegram), then work")
-    print("     with your agent (\"onboard this project\") or `harn run`.")
+    # setup → onboard automatically (unless suppressed), then point at watch.
+    if not getattr(args, "no_onboard", False):
+        print()
+        _run_onboard(root, env_dir)
+
+    print("\n[harn] Setup complete. To start working:")
+    print("  • run `harn watch` (live status + Telegram routing) — keep it open;")
+    print("  • then tell your agent: \"onboard this project\" — it reads "
+          "harn_env/state/ONBOARD.md, maps the code, and fills the PRD + "
+          "standards with you before building.")
+    print("  • set [feedback] test_cmd in harn_env/harn.toml when you have tests.")
     return 0
 
 
@@ -122,14 +128,11 @@ def _print_mcp_health(env_dir: Path, chain: list[str]) -> bool:
         # otherwise: loop and re-check
 
 
-def cmd_onboard(args) -> int:
+def _run_onboard(root: Path, env_dir: Path) -> None:
+    """Analyse the project, seed skills, warm the index, write ONBOARD.md.
+    Shared by `harn onboard` and `harn setup`."""
     from . import onboard, semble_bridge
     from .config import Config
-    root = Path(args.path).resolve()
-    env_dir = _env_dir(root)
-    if not env_dir.exists():
-        print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
-        return 1
 
     print("[harn] onboarding — analysing the project…")
     stack = onboard.detect_stack(root)
@@ -141,7 +144,6 @@ def cmd_onboard(args) -> int:
         for n in notes:
             print(f"     • {n}")
 
-    # Warm the code-search index so RAG is ready (forced, if enabled).
     cfg = Config.load(env_dir)
     if cfg.code_search_semble and semble_bridge.semble_installed():
         print("   warming semble index (first run may take a bit)…")
@@ -155,18 +157,25 @@ def cmd_onboard(args) -> int:
             except Exception:
                 print("     (semble warm-up skipped)")
     if cfg.code_search_socraticcode and semble_bridge.socraticcode_npx_available():
-        print("   ℹ SocratiCode: ask the agent to run `codebase_index` to build "
-              "the dependency graph (needs Docker running).")
+        print("   ℹ SocratiCode: ask the agent to run `codebase_index` "
+              "(needs Docker running).")
 
     brief = onboard.onboard_brief(stack)
     (env_dir / "state").mkdir(exist_ok=True)
     (env_dir / "state" / "ONBOARD.md").write_text(
         f"# Auto-detected stack\n{onboard.stack_summary(stack)}\n\n{brief}",
         encoding="utf-8")
-    print("\n[harn] Next: tell your agent \"onboard this project\" — it will read "
-          "harn_env/state/ONBOARD.md, map the code, ask you to fill the PRD and "
-          "standards (saved into skills), and confirm before any work.")
-    print("       Keep `harn watch` running so questions reach you.")
+
+
+def cmd_onboard(args) -> int:
+    root = Path(args.path).resolve()
+    env_dir = _env_dir(root)
+    if not env_dir.exists():
+        print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
+        return 1
+    _run_onboard(root, env_dir)
+    print("\n[harn] Next: tell your agent \"onboard this project\" — it reads "
+          "harn_env/state/ONBOARD.md, maps the code, and fills PRD + standards.")
     return 0
 
 
@@ -356,6 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-install", action="store_true",
                     help="don't auto-install enabled code-search backends "
                          "(semble / SocratiCode prerequisites)")
+    sp.add_argument("--no-onboard", action="store_true",
+                    help="don't run project analysis/onboarding after setup")
     sp.set_defaults(func=cmd_setup)
 
     rp = sub.add_parser("run", help="run the ralph loop")

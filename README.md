@@ -36,20 +36,35 @@ pipx install .            # or: pip install -e .   (Python 3.10+)
 
 `harn mcp` additionally needs the `mcp` package (declared as a dependency).
 
-## Quickstart
+## Quickstart — let your agent set it up (recommended)
+
+harn is meant to be installed *by the agent you already work with* (Cursor,
+Claude Code, Codex). Paste this to your agent in the project:
+
+> **Set up harn in this project.** Run `pip install
+> git+https://github.com/bes-man/harn` then `harn setup`. If it tells you to
+> enable an MCP server, tell me the exact steps and wait until I confirm it's on.
+> Then "onboard this project": read `harn_env/state/ONBOARD.md`, map the code,
+> and interview me (one question at a time) to fill the PRD and the standards
+> (use `ask_user` with `skill=`). Start `harn watch` in the background. From then
+> on, use harn's MCP tools for all work.
+
+`harn setup` is non-interactive when launched this way: it scaffolds `harn_env/`,
+writes the MCP connector for your agent (git-ignored), installs the code-search
+backends, checks the MCP server, **then runs onboarding** (detects the stack,
+seeds skills, warms the index, writes the onboarding brief). The agent drives the
+rest of the dialog in chat.
+
+### Or by hand
 
 ```bash
 cd /path/to/your-project
-harn setup                # scaffolds harn_env/ + AGENTS.md + per-agent MCP config
-                          # also installs enabled code-search backends (semble;
-                          # SocratiCode prereqs). Skip with: harn setup --no-install
-
-# edit harn_env/harn.toml -> [feedback] test_cmd = "pytest -q"   (your tests)
-# add tasks in harn_env/tasks/*.json, PRDs in harn_env/prd/*.md
-
-harn run                  # run the loop with the configured agent(s)
-harn board                # see every task on its track
-harn status               # current phase; what's awaiting your review
+harn setup                # scaffold + MCP connector + health-check + onboard
+                          #   --no-install (skip backends) · --no-onboard
+harn watch                # live status + Telegram routing — keep this open
+# then in your agent: "onboard this project"  → fills PRD + standards with you
+harn run                  # or run the headless loop
+harn board / harn status  # the task track / current phase
 ```
 
 When a task is ready for you:
