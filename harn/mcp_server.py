@@ -228,7 +228,7 @@ def build_server():
         return tasks_mod.board(_env_dir())
 
     @mcp.tool()
-    def ask_user(question: str) -> str:
+    def ask_user(question: str, skill: str = "") -> str:
         """Ask the human a clarifying question when something is ambiguous,
         risky, or you're unsure. This pauses the loop, notifies the user
         (Telegram/Slack), and waits for `harn answer`. STOP after calling.
@@ -241,14 +241,21 @@ def build_server():
         Example: "Building the login endpoint, the PRD doesn't say how long
         access tokens live. Options: (a) 15m + refresh token — most secure, more
         work; (b) 24h — simplest, weaker; (c) match an existing service.
-        I recommend (a) for security; OK to proceed?\""""
+        I recommend (a) for security; OK to proceed?"
+
+        **`skill`**: if the question is about a durable standard/convention
+        (security, frontend, testing, architecture, …), pass the skill name. The
+        answer is then AUTOMATICALLY saved into that skill, so harn never has to
+        ask it again. Use this for anything that should outlive the current task."""
         state_dir = _env_dir() / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         state_mod.blocked_marker(state_dir).write_text(question, encoding="utf-8")
+        state_mod.set_block_skill(state_dir, skill)
         st = state_mod.State.load(state_dir)
         st.block(question)
         st.save(state_dir)
-        _log(f"asked the user: {question.splitlines()[0][:120]}")
+        _log(f"asked the user: {question.splitlines()[0][:120]}"
+             + (f" [→ skill: {skill}]" if skill else ""))
         # `harn watch` (or the run loop) turns this into an interactive Telegram
         # card with escalation — we don't send a one-way push here.
         return (

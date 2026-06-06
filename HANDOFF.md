@@ -292,6 +292,26 @@ project root.
 - Later: N parallel agents (git worktrees); remote skill hub (explicitly NOT
   wanted now — capture-into-skills is the chosen model).
 
+## Added since (auto skill-promotion + harn update)
+- **Auto-promotion of answers into skills** (root cause: `save_to_skill` was
+  optional → agent didn't call it → skills stayed empty). Now:
+  `ask_user(question, skill="security")` tags the question; `loop.answer()`
+  AUTOMATICALLY calls `skills.append_learning(skill, "Q→A")` and clears the hint.
+  state helpers: `set_block_skill` / `read_block_skill` / `clear_block_skill`
+  (`state/.block_skill`). AGENTS.md tells the agent to pass `skill=` for any
+  durable standard. Tests: `tests/test_promotion.py`.
+  - NOT YET: a watch-side headless LLM classifier (B) that promotes answers that
+    weren't tagged. Decided A (tag + onboarding/planning that systematically
+    tags standard-questions) is the reliable path; B is an optional add-on if A
+    proves insufficient (risk: dupes vs A, token cost).
+- **`harn update`** (`cli.cmd_update`): updates the package from
+  github.com/bes-man/harn — `git pull` for an editable checkout, else
+  `pip install --upgrade git+…`. `--ref` for branch/tag. Never touches any
+  `harn_env/` (different location). Reminds to re-run `harn setup` for new
+  bundled templates (copy-tree never overwrites local files).
+
+Tests: 149 passing.
+
 ## Earlier note
 - in CLI (non-Telegram) review mode the
   loop stops at REVIEW for the human; with Telegram it blocks inline per task.

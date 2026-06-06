@@ -79,6 +79,9 @@ dependency graph and are language-independent.
   **Ask expanded, not terse:** state (1) the context and *why* the question came
   up, (2) the concrete options with each one's trade-off, and (3) your
   recommended option with a one-line reason — so the human can decide quickly.
+  **If the question is about a durable standard/convention, pass the `skill=`
+  argument** (e.g. `ask_user(question, skill="security")`) — harn then saves the
+  answer into that skill AUTOMATICALLY, so it's never asked again.
 - **Build up the knowledge base.** harn gets smarter as it learns the project.
   Whenever you learn something durable — the user answers a question about a
   standard, you discover a convention in the code, or a decision should apply

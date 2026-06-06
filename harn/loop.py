@@ -1019,16 +1019,27 @@ def rollback(project_root: Path, env_dir: Path, task_id: str, *, apply: bool = F
 
 
 def answer(env_dir: Path, text: str) -> None:
-    """Record a human answer, clear the block, and resume on next `harn run`."""
+    """Record a human answer, clear the block, and resume on next `harn run`.
+
+    If the question was tagged with a skill (knowledge capture), the answer is
+    AUTOMATICALLY promoted into that skill so harn accumulates the standard and
+    never re-asks it.
+    """
     state_dir = env_dir / "state"
     st = state.State.load(state_dir)
     question = st.question or "(prior question)"
+    skill = state.read_block_skill(state_dir)
     st.answer(text)
     state.clear_block_marker(state_dir)
+    state.clear_block_skill(state_dir)
     with (state_dir / "ANSWERS.md").open("a", encoding="utf-8") as fh:
         fh.write(f"\n## Q: {question}\n{text}\n")
     st.save(state_dir)
     progress.log(env_dir, f"human answered: {text[:120]}")
+    if skill:
+        q1 = question.splitlines()[0][:160]
+        skills.append_learning(env_dir, skill, f"{q1} → {text.strip()}")
+        progress.log(env_dir, f"promoted answer into skill '{skill}'")
 
 
 def _progress_tail_lines(env_dir: Path) -> list[str]:

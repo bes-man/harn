@@ -74,3 +74,28 @@ def clear_block_marker(state_dir: Path) -> None:
     p = blocked_marker(state_dir)
     if p.exists():
         p.unlink()
+
+
+def _block_skill_path(state_dir: Path) -> Path:
+    return state_dir / ".block_skill"
+
+
+def set_block_skill(state_dir: Path, skill: str) -> None:
+    """Record which skill a pending question's answer should be promoted into,
+    so the answer is auto-saved to that skill (knowledge capture)."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if skill.strip():
+        _block_skill_path(state_dir).write_text(skill.strip(), encoding="utf-8")
+
+
+def read_block_skill(state_dir: Path) -> str | None:
+    p = _block_skill_path(state_dir)
+    if p.exists() and p.read_text().strip():
+        return p.read_text().strip()
+    return None
+
+
+def clear_block_skill(state_dir: Path) -> None:
+    p = _block_skill_path(state_dir)
+    if p.exists():
+        p.unlink()

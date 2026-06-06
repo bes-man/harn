@@ -99,6 +99,50 @@ def cmd_teardown(args) -> int:
     return 0
 
 
+_REPO_URL = "https://github.com/bes-man/harn.git"
+
+
+def cmd_update(args) -> int:
+    """Update the harn package from GitHub. Never touches any harn_env/.
+
+    harn_env/ lives inside your projects; the harn package lives in
+    site-packages / pipx / a git checkout. Updating the code can't remove your
+    project knowledge — they're in different places.
+    """
+    import subprocess
+    import harn
+    ref = args.ref
+    pkg_dir = Path(harn.__file__).resolve().parent      # …/harn/harn
+    repo = pkg_dir.parent                                # …/harn
+    git_checkout = (repo / ".git").exists()
+
+    print(f"[harn] updating harn (current {getattr(harn, '__version__', '?')})…")
+    if git_checkout:
+        print(f"[harn] editable/git checkout at {repo} → git pull")
+        cmd = ["git", "-C", str(repo), "pull", "--ff-only"]
+        if ref:
+            cmd = ["git", "-C", str(repo), "fetch", "origin", ref, "&&",
+                   "git", "-C", str(repo), "checkout", ref]
+            r = subprocess.run(["git", "-C", str(repo), "fetch", "origin", ref])
+            if r.returncode == 0:
+                subprocess.run(["git", "-C", str(repo), "checkout", ref])
+            r = subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"])
+        else:
+            r = subprocess.run(cmd)
+    else:
+        url = _REPO_URL if not ref else f"{_REPO_URL}@{ref}"
+        print(f"[harn] installed package → pip install --upgrade git+{url}")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade",
+                            f"git+{url}"])
+    if r.returncode != 0:
+        print("[harn] update failed (see output above).", file=sys.stderr)
+        return 1
+    print("[harn] updated. Your harn_env/ folders are untouched.")
+    print("[harn] tip: run `harn setup` in a project to pull any NEW bundled "
+          "templates/skills (existing files are never overwritten).")
+    return 0
+
+
 def cmd_run(args) -> int:
     from . import loop
     root = Path(args.path).resolve()
@@ -232,6 +276,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("text", help="your answer")
     ap.add_argument("path", nargs="?", default=".")
     ap.set_defaults(func=cmd_answer)
+
+    up = sub.add_parser("update", help="update harn from GitHub (keeps harn_env)")
+    up.add_argument("--ref", default="", help="branch/tag to install (default: main)")
+    up.set_defaults(func=cmd_update)
 
     dp = sub.add_parser("doctor", help="verify the MCP server + tools work")
     dp.add_argument("path", nargs="?", default=".")
