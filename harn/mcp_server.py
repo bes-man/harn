@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import progress as progress_mod
 from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
@@ -22,6 +23,15 @@ from .notify import notify
 
 def _env_dir() -> Path:
     return Path(os.environ.get("HARN_ENV_DIR", "harn_env")).resolve()
+
+
+def _log(msg: str) -> None:
+    """Append to the shared PROGRESS feed so `harn watch` and any agent can see
+    what's happening, regardless of where the work runs (chat or `harn run`)."""
+    try:
+        progress_mod.log(_env_dir(), msg, agent="agent")
+    except Exception:
+        pass
 
 
 def build_server():
@@ -48,6 +58,7 @@ def build_server():
         t = tasks_mod.next_task(_env_dir())
         if t is None:
             return "(no pending tasks)"
+        _log(f"{t.id}: picked up by agent ({t.title})")
         return t.path.read_text(encoding="utf-8")
 
     @mcp.tool()
@@ -218,10 +229,12 @@ def build_server():
         st = state_mod.State.load(state_dir)
         st.block(question)
         st.save(state_dir)
-        channels = notify(f"[harn] Agent asks:\n{question}")
+        _log(f"asked the user: {question.splitlines()[0][:120]}")
+        # `harn watch` (or the run loop) turns this into an interactive Telegram
+        # card with escalation — we don't send a one-way push here.
         return (
-            "Question recorded; loop paused and user notified via "
-            f"{channels or 'no configured channel'}. Stop now and wait."
+            "Question recorded (BLOCKED). `harn watch` / the loop will route it to "
+            "the user (chat → Telegram). STOP now; resume when it's answered."
         )
 
     @mcp.tool()
@@ -240,7 +253,10 @@ def build_server():
         for t in tasks_mod.load_tasks(_env_dir()):
             if t.id == task_id:
                 tasks_mod.submit_for_review(t, agent="agent", summary=summary)
-                return f"task '{task_id}' submitted for review"
+                _log(f"{task_id}: submitted for review — oracle will check it")
+                return (f"task '{task_id}' submitted for review. The oracle (run "
+                        "by `harn watch`) will verify it; read its verdict in the "
+                        "task's review_log and relay it to the user.")
         return f"(no task '{task_id}')"
 
     @mcp.tool()

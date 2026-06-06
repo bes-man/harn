@@ -255,11 +255,27 @@ project root.
 - New CLI: `harn doctor` (re-check), `harn teardown`.
 - Tests: test_scaffold cursor/teardown/gitignore (135 total).
 
-### Phase 1 — NEXT (watch dispatcher + continuity)
-Make `harn watch` the always-on dispatcher: live status feed, Telegram cards
-from chat-raised BLOCKED, oracle headless with status the agent streams to chat,
-loop never stalls after review (single agent, continuous). Then Phase 2:
-structured planning + knowledge capture (`propose_skill_update`).
+### Phase 1 — DONE (watch dispatcher + visibility + oracle headless)
+- `loop.oracle_review(env_dir, cfg, task, project_root)` — oracle extracted into
+  a reusable headless function (used by BOTH `harn run` and `harn watch`); writes
+  status to PROGRESS, verdict to the task (oracle_pass/fail/debt), and on FAIL
+  moves the task to `changes_requested`. `_run_oracle` is now a thin wrapper.
+- `loop.watch(env_dir, project_root, _once=…)` rewritten as the dispatcher:
+  (1) live status feed (echoes new PROGRESS lines + phase), (2) BLOCKED → Telegram
+  card + escalation + cross-channel (+auto button), (3) tasks in `review` without
+  an oracle verdict → run oracle headless. Lightweight loop, not a daemon.
+- MCP tools log to PROGRESS (`mcp_server._log`) so the dispatcher and the chat
+  agent can SEE activity regardless of where work runs (chat or `harn run`).
+- `ask_user` no longer sends a one-way push — it records BLOCKED and lets the
+  dispatcher/loop turn it into the interactive card.
+- AGENTS.md chat protocol: report every step, don't stall after submit, poll the
+  oracle verdict in review_log and relay it, keep `harn watch` running.
+- Tests: `tests/test_watch.py` (140 total).
+
+### Phase 2 — NEXT (structured planning + knowledge capture)
+`propose_skill_update(skill, content)` MCP tool + confirm via HIL; agent saves
+what it learns (from answers / discovered conventions) into skills. Make planning
+a one-question-at-a-time dialog rather than a wall of text. (#3, #5, #6)
 
 ## Earlier note
 - in CLI (non-Telegram) review mode the

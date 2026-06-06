@@ -148,7 +148,7 @@ def cmd_watch(args) -> int:
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
     try:
-        loop.watch(env_dir, poll_s=args.poll)
+        loop.watch(env_dir, root, poll_s=args.poll)
     except KeyboardInterrupt:
         print("\n[harn] watch stopped.")
     return 0

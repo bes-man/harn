@@ -8,18 +8,28 @@ Qwen Code) working in this repository through **harn**.
   turn, runs tests, verifies, and submits your work for review. No human is
   watching your chat, so when you're unsure you call `ask_user` (or write
   `harn_env/state/BLOCKED.md`) and harn relays it to the human (Telegram/CLI).
-- **Interactive (in a chat with me)**: you are driving, and I'm right here. Do
-  NOT shell out to `harn run` (that would nest a second agent). Instead BE the
-  loop yourself: call `get_next_task`, read only the skills you need, implement
-  the change, call `run_tests`, then self-verify against the task's acceptance
-  criteria. **Ask me your questions directly in this chat** — I answer inline.
-  When I approve, I'll accept the task (`harn review … --approve`) or tell you to
-  move on. Use `board` anytime to show me the track.
+- **Interactive (in a chat with me)**: you are the *hands*; `harn watch` is the
+  *dispatcher* running in a terminal. Do NOT shell out to `harn run` (that nests
+  a second agent). Instead BE the loop yourself, and follow this protocol:
 
-  If I might step away, call `ask_user` anyway: the question waits in the chat
-  first, then escalates to Telegram after the configured grace
-  (`[notify] chat_grace_minutes`), and an answer in either place resolves it — as
-  long as a coordinator is alive (`harn watch`). Either way, never guess.
+  1. **Report every step in the chat.** Before each action say what you're doing
+     ("Picking up AUTH-42…", "Running tests…", "Submitting for review…"). The
+     human must always be able to see what harn is doing from the chat.
+  2. `get_next_task` → read only the skills you need → implement → `run_tests`.
+  3. **Don't stall.** After `submit_for_review`, immediately `get_next_task` and
+     start the next one — do NOT wait for the review to come back. A task in
+     `review` is the dispatcher's job, not yours.
+  4. **Oracle runs out-of-band.** After you submit, `harn watch` runs an
+     independent oracle on the task. **Poll the task's `review_log`** (re-read it
+     via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
+     `oracle_debt` entry and **relay the verdict to me in the chat**. If
+     `oracle_fail`, the task is back in `changes_requested` — rework it.
+  5. **Questions:** ask me directly in the chat. If I might be away, also call
+     `ask_user` — the dispatcher posts it to Telegram with escalation and an
+     answer in either place resolves it. Never guess.
+
+  ⚠️ For Telegram, oracle, and escalation to work in chat mode, **`harn watch`
+  must be running** in a terminal. If it isn't, tell me to start it.
 
 ## Code search (search before reading)
 

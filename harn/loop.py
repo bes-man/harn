@@ -702,58 +702,73 @@ def _run_verify(adapter, env_dir, cfg, task, project_root, st, state_dir, auto,
     return "ok"
 
 
-def _run_oracle(
-    oracle_adapter, env_dir: Path, cfg: Config, task: tasks.Task,
-    project_root: Path, st: "state.State", state_dir: Path,
-    tok_totals: dict, tok_costs: dict,
-) -> str:
-    """Run an independent oracle agent with fresh context.
-
-    Returns 'ok', 'loop' (fail → rework), or 'debt' (pass + debt note).
-    The oracle never blocks the loop — on unexpected errors it passes through.
-    """
-    diff = _git_diff(project_root)
-    prompt = _build_oracle_prompt(env_dir, cfg, task, diff)
-    print(f"[harn] Oracle reviewing '{task.id}' ({oracle_adapter.name})…")
-    ores = oracle_adapter.run_turn(prompt, project_root)
-    print(ores.text[-2000:] if ores.text else "(oracle: no output)")
-    _accumulate(tok_totals, tok_costs, task.id, ores)
-    if ores.usage_str():
-        progress.log(env_dir, f"{task.id}: oracle used {ores.usage_str()}",
-                     agent=oracle_adapter.name)
-
-    verdict, detail = _oracle_verdict(ores.text)
-    if verdict == "FAIL":
-        msg = f"oracle found issues: {detail}" if detail else "oracle found issues"
-        progress.log(env_dir, f"{task.id}: {msg}", agent=oracle_adapter.name)
-        print(f"[harn] Oracle: FAIL — {detail or '(see output)'}. Looping to fix.")
-        task.review_log.append(tasks.ReviewEntry(
-            ts=tasks._now_iso(), event="oracle_fail",
-            agent=oracle_adapter.name, comment=detail or None,
-        ))
-        tasks._save(task)
-        return "loop"
-    if verdict == "DEBT":
-        msg = f"technical debt: {detail}" if detail else "technical debt noted"
-        progress.log(env_dir, f"{task.id}: oracle flagged {msg}",
-                     agent=oracle_adapter.name)
-        print(f"[harn] Oracle: DEBT — {detail}. Flagged; continuing to review.")
-        task.review_log.append(tasks.ReviewEntry(
-            ts=tasks._now_iso(), event="oracle_debt",
-            agent=oracle_adapter.name, comment=detail or None,
-        ))
-        tasks._save(task)
-        return "debt"
-    # PASS
-    progress.log(env_dir, f"{task.id}: oracle passed", agent=oracle_adapter.name)
-    return "ok"
-
-
 def _pick_oracle_adapter(cfg: Config) -> "Adapter":
     """Return the oracle adapter (separate agent, or same as main)."""
     name = cfg.oracle_agent or cfg.agent_chain[0]
     ad = get_adapter(name)
     return ad if ad.available() else get_adapter(cfg.agent_chain[0])
+
+
+def oracle_review(
+    env_dir: Path, cfg: Config, task: tasks.Task, project_root: Path,
+    adapter=None,
+) -> tuple[str, str, "AgentResult | None"]:
+    """Independent oracle review with fresh context — used by BOTH `harn run`
+    and `harn watch` (headless). Writes status to PROGRESS (so a watcher / the
+    chat agent can stream it) and the verdict to the task. On FAIL it moves the
+    task back to `changes_requested`.
+
+    Returns (verdict, detail, result) where verdict is PASS / FAIL / DEBT.
+    """
+    adapter = adapter or _pick_oracle_adapter(cfg)
+    progress.log(env_dir, f"{task.id}: oracle reviewing…", agent=adapter.name)
+    diff = _git_diff(project_root)
+    prompt = _build_oracle_prompt(env_dir, cfg, task, diff)
+    try:
+        ores = adapter.run_turn(prompt, project_root)
+    except Exception as e:  # never let the oracle crash the dispatcher
+        progress.log(env_dir, f"{task.id}: oracle error: {e}", agent=adapter.name)
+        return ("PASS", "", None)
+
+    verdict, detail = _oracle_verdict(ores.text)
+    if verdict == "FAIL":
+        progress.log(env_dir,
+                     f"{task.id}: oracle FAIL — {detail or '(see output)'}",
+                     agent=adapter.name)
+        task.review_log.append(tasks.ReviewEntry(
+            ts=tasks._now_iso(), event="oracle_fail",
+            agent=adapter.name, comment=detail or None))
+        tasks.request_changes(task, f"[oracle] {detail or 'issues found'}",
+                              by=adapter.name)
+    elif verdict == "DEBT":
+        progress.log(env_dir, f"{task.id}: oracle DEBT — {detail}",
+                     agent=adapter.name)
+        task.review_log.append(tasks.ReviewEntry(
+            ts=tasks._now_iso(), event="oracle_debt",
+            agent=adapter.name, comment=detail or None))
+        tasks._save(task)
+    else:
+        progress.log(env_dir, f"{task.id}: oracle PASS", agent=adapter.name)
+        task.review_log.append(tasks.ReviewEntry(
+            ts=tasks._now_iso(), event="oracle_pass", agent=adapter.name))
+        tasks._save(task)
+    return (verdict, detail, ores)
+
+
+def _run_oracle(
+    oracle_adapter, env_dir: Path, cfg: Config, task: tasks.Task,
+    project_root: Path, st: "state.State", state_dir: Path,
+    tok_totals: dict, tok_costs: dict,
+) -> str:
+    """In-loop oracle wrapper for `harn run`. Returns 'ok' | 'loop' | 'debt'."""
+    print(f"[harn] Oracle reviewing '{task.id}' ({oracle_adapter.name})…")
+    verdict, detail, ores = oracle_review(env_dir, cfg, task, project_root,
+                                          adapter=oracle_adapter)
+    if ores is not None:
+        _accumulate(tok_totals, tok_costs, task.id, ores)
+    if verdict == "FAIL":
+        return "loop"   # oracle_review set changes_requested; loop reworks it
+    return "debt" if verdict == "DEBT" else "ok"
 
 
 def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
@@ -1016,39 +1031,84 @@ def answer(env_dir: Path, text: str) -> None:
     progress.log(env_dir, f"human answered: {text[:120]}")
 
 
-def watch(env_dir: Path, *, poll_s: int = 3, _sleep=time.sleep) -> None:
-    """HIL coordinator for chat-driven runs (no `harn run`).
+def _progress_tail_lines(env_dir: Path) -> list[str]:
+    p = env_dir / "state" / "PROGRESS.md"
+    if not p.exists():
+        return []
+    return p.read_text(encoding="utf-8", errors="replace").splitlines()
 
-    When an in-chat agent raises a question (writes `BLOCKED.md` via the
-    `ask_user` tool), this watches it: it waits the chat grace for you to answer
-    in the chat, then escalates to Telegram, and resolves from whichever channel
-    answers first — so escalation works regardless of where the agent runs.
-    Run it alongside your chat session: `harn watch`.
+
+def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
+          _sleep=time.sleep, _once: bool = False) -> None:
+    """The dispatcher (companion to chat-mode work; not a daemon/Docker).
+
+    A lightweight loop that runs alongside your agent (Cursor/Claude/Codex) and
+    does everything that does NOT require writing code:
+      • streams a LIVE status feed (new PROGRESS lines + current phase);
+      • when the agent raises a question (BLOCKED.md), posts the interactive
+        Telegram card with escalation, and resolves it across channels;
+      • when a task hits `review`, runs the independent ORACLE headless and writes
+        its verdict (the chat agent reads it and streams it to you);
+      • keeps things moving without touching code.
+
+    `_once` runs a single tick (for tests).
     """
     cfg = Config.load(env_dir)
+    project_root = project_root or env_dir.parent
     state_dir = env_dir / "state"
-    print(f"[harn] watch: channel={cfg.hil_channel}, "
-          f"chat grace={cfg.chat_grace_minutes}m. Ctrl-C to stop.")
-    handled: str | None = None
+    print(f"[harn] watch: channel={cfg.hil_channel}, grace={cfg.chat_grace_minutes}m, "
+          f"oracle={'on' if cfg.oracle else 'off'}. Ctrl-C to stop.")
+
+    handled_q: str | None = None
+    oracled: set[str] = set()
+    seen_lines = len(_progress_tail_lines(env_dir))
+
     while True:
+        # 1) Live status feed — echo new PROGRESS lines as they appear.
+        lines = _progress_tail_lines(env_dir)
+        for ln in lines[seen_lines:]:
+            print(f"  │ {ln}")
+        seen_lines = len(lines)
+
+        # 2) Blocking question → interactive Telegram card + escalation.
         question = state.read_block_question(state_dir)
-        if question and question != handled:
-            print(f"[harn] watch: question raised:\n{question}")
+        if question and question != handled_q:
+            print(f"[harn] watch: question raised → routing to {cfg.hil_channel}")
             st = state.State.load(state_dir)
             st.block(question)
             st.save(state_dir)
-            reply, source = _await_answer(env_dir, cfg, "(chat)", question)
+            reply, source = _await_answer(env_dir, cfg, st.current_task or "(chat)",
+                                          question)
             if source == "telegram" and reply is not None:
                 answer(env_dir, reply)
-                print("[harn] watch: answered via Telegram; the agent can resume.")
+                print("[harn] watch: answered via Telegram.")
             elif source == "chat":
                 print("[harn] watch: answered in chat.")
+            elif source == "auto":
+                answer(env_dir, "You pressed 'Decide for me'. " + _AUTO_BUTTON_NOTE)
+                print("[harn] watch: delegated to the agent.")
             else:
-                channels = notify(f"[harn] Agent needs your input:\n{question}")
-                print(f"[harn] watch: notified {channels or 'none'}; still waiting.")
-            handled = question
+                notify(f"[harn] Agent needs your input:\n{question}")
+            handled_q = question
         elif not question:
-            handled = None
+            handled_q = None
+
+        # 3) Tasks in review without an oracle verdict → run oracle headless.
+        if cfg.oracle:
+            for t in tasks.tasks_in_review(env_dir):
+                if t.id in oracled:
+                    continue
+                if any(e.event.startswith("oracle_") for e in t.review_log):
+                    oracled.add(t.id)
+                    continue
+                print(f"[harn] watch: running oracle on '{t.id}' (headless)…")
+                verdict, detail, _ = oracle_review(env_dir, cfg, t, project_root)
+                print(f"[harn] watch: oracle {verdict}"
+                      + (f" — {detail}" if detail else ""))
+                oracled.add(t.id)
+
+        if _once:
+            return
         _sleep(poll_s)
 
 
