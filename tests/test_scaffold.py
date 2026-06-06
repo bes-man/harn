@@ -16,11 +16,33 @@ def test_setup_creates_env(tmp_path: Path):
     # all six default skills present
     for name in ["project", "standards", "architecture", "security", "ui", "constraints"]:
         assert (env / "skills" / name / "SKILL.md").exists()
-    # per-agent glue
+    # default agent is claude → only .mcp.json in root, NOT .cursor/mcp.json
     assert (tmp_path / ".mcp.json").exists()
-    assert (tmp_path / ".cursor" / "mcp.json").exists()
-    assert (env / "mcp_snippets.md").exists()
+    assert not (tmp_path / ".cursor" / "mcp.json").exists()
+    # root connectors are git-ignored (clean project history)
+    gi = (tmp_path / ".gitignore").read_text()
+    assert ".mcp.json" in gi and "AGENTS.md" in gi
     assert result["env_dir"] == str(env)
+
+
+def test_setup_cursor_agent_writes_cursor_config(tmp_path: Path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    (env / "harn.toml").write_text('[harn]\nagent = "cursor"\n')
+    scaffold.setup(tmp_path)
+    assert (tmp_path / ".cursor" / "mcp.json").exists()
+    assert not (tmp_path / ".mcp.json").exists()   # claude not in chain
+
+
+def test_teardown_removes_root_connectors(tmp_path: Path):
+    scaffold.setup(tmp_path)
+    assert (tmp_path / ".mcp.json").exists()
+    removed = scaffold.teardown(tmp_path)
+    assert ".mcp.json" in removed and "AGENTS.md" in removed
+    assert not (tmp_path / ".mcp.json").exists()
+    assert not (tmp_path / "AGENTS.md").exists()
+    # harn_env stays
+    assert (tmp_path / ENV_DIRNAME / "harn.toml").exists()
 
 
 def test_setup_does_not_clobber(tmp_path: Path):

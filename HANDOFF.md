@@ -233,6 +233,34 @@ Tests: `tests/test_planning.py`, `tests/test_oracle.py` (99 total).
   and clears scratchpad/decisions/baseline). **Excludes `harn_env/`** so harn's
   own bookkeeping is never clobbered. Tests: `tests/test_rollback.py` (117 total).
 
+## Chat-mode rework (design agreed; in progress)
+
+Real-test feedback exposed that harn only worked headless (`harn run`); in a chat
+(Cursor/Claude/Codex) Telegram, status, planning, oracle, and the loop did
+nothing. Full design + decisions: `docs/DESIGN_chat_mode.md`. Model:
+**agent = hands, `harn watch` = lightweight dispatcher** (Telegram, oracle
+headless, live status, loop advance); agent reports every step to the chat;
+knowledge capture = agent saves what it learns into skills (no hub); clean
+project root.
+
+### Phase 0 — DONE (setup health-check + clean root)
+- `scaffold.py`: MCP connector written ONLY for agent(s) in the chain (claude →
+  `.mcp.json`, cursor → `.cursor/mcp.json`, codex/antigravity/qwen → snippet in
+  harn_env). No more writing both by default.
+- Root connectors (`AGENTS.md` + the one MCP config) are auto-added to
+  `.gitignore` (`_gitignore_add`). `scaffold.teardown()` removes them.
+- `mcp_server.healthcheck(env_dir)` launches `harn mcp` in a subprocess and
+  confirms tools respond. `harn setup` prints the result + exact enable steps
+  (Cursor needs a manual toggle; Claude `/mcp`).
+- New CLI: `harn doctor` (re-check), `harn teardown`.
+- Tests: test_scaffold cursor/teardown/gitignore (135 total).
+
+### Phase 1 — NEXT (watch dispatcher + continuity)
+Make `harn watch` the always-on dispatcher: live status feed, Telegram cards
+from chat-raised BLOCKED, oracle headless with status the agent streams to chat,
+loop never stalls after review (single agent, continuous). Then Phase 2:
+structured planning + knowledge capture (`propose_skill_update`).
+
 ## Earlier note
 - in CLI (non-Telegram) review mode the
   loop stops at REVIEW for the human; with Telegram it blocks inline per task.

@@ -261,3 +261,48 @@ def serve(http: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None
         mcp.run(transport="streamable-http")
     else:
         mcp.run()  # stdio
+
+
+def healthcheck(env_dir, timeout: int = 40) -> tuple[bool, list[str], str]:
+    """Launch the stdio MCP server in a subprocess and confirm it answers.
+
+    Returns (ok, tool_names, error). Used by `harn setup` / `harn doctor` to
+    verify the server actually starts and exposes its tools, before the user
+    discovers it's broken from inside an agent.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "harn-doctor", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    ]
+    stdin = "\n".join(json.dumps(m) for m in msgs) + "\n"
+    env = {**os.environ, "HARN_ENV_DIR": str(env_dir)}
+    try:
+        p = subprocess.run([sys.executable, "-m", "harn", "mcp"],
+                           input=stdin, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        out = p.stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout) or ""
+    except Exception as e:
+        return False, [], f"could not launch `harn mcp`: {e}"
+
+    tools: list[str] = []
+    for line in out.splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("id") == 2 and "result" in m:
+            tools = [t["name"] for t in m["result"].get("tools", [])]
+    if not tools:
+        return False, [], "MCP server started but returned no tools"
+    return True, tools, ""

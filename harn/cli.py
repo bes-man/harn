@@ -33,11 +33,69 @@ def cmd_setup(args) -> int:
     print(f"[harn] harn_env created at {result['env_dir']}")
     for f in result["created"]:
         print(f"   + {f}")
-    print("[harn] agent configs:")
+    print("[harn] agent connectors (root, git-ignored):")
     for c in result["agent_configs"]:
         print(f"   + {c}")
-    print("\nNext: edit harn_env/skills/*, add tasks in harn_env/tasks/, "
-          "set [feedback] test_cmd in harn_env/harn.toml, then `harn run`.")
+
+    _print_mcp_health(env_dir, _agent_chain_names(env_dir))
+
+    print("\nNext: edit harn_env/skills/*, add tasks (the agent can via "
+          "create_task), set [feedback] test_cmd in harn_env/harn.toml.")
+    print("Then run `harn watch` in a terminal (live status + Telegram), and "
+          "work with your agent or `harn run`.")
+    return 0
+
+
+def _agent_chain_names(env_dir: Path) -> list[str]:
+    from .config import Config
+    try:
+        return Config.load(env_dir).agent_chain
+    except Exception:
+        return ["claude"]
+
+
+def _print_mcp_health(env_dir: Path, chain: list[str]) -> bool:
+    """Verify the MCP server starts and tools respond; print enable steps."""
+    from . import mcp_server
+    print("\n[harn] checking the MCP server…")
+    ok, tools, err = mcp_server.healthcheck(env_dir)
+    if ok:
+        print(f"   ✓ MCP server starts; {len(tools)} tools respond "
+              f"({', '.join(tools[:6])}…)")
+    else:
+        print(f"   ✗ MCP server problem: {err}")
+        print("     Fix this first — agents can't use harn without it.")
+    if "cursor" in chain:
+        print("   ⚠ Cursor: open Settings → MCP and TOGGLE the 'harn' server ON "
+              "(Cursor disables new MCP servers by default; the config file alone "
+              "is not enough).")
+    if "claude" in chain:
+        print("   ℹ Claude Code: run `/mcp` to confirm 'harn' is connected.")
+    return ok
+
+
+def cmd_doctor(args) -> int:
+    from . import mcp_server
+    root = Path(args.path).resolve()
+    env_dir = _env_dir(root)
+    if not env_dir.exists():
+        print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
+        return 1
+    ok = _print_mcp_health(env_dir, _agent_chain_names(env_dir))
+    return 0 if ok else 1
+
+
+def cmd_teardown(args) -> int:
+    from . import scaffold
+    root = Path(args.path).resolve()
+    removed = scaffold.teardown(root)
+    if removed:
+        print("[harn] removed root connectors:")
+        for r in removed:
+            print(f"   - {r}")
+        print("harn_env/ left intact. Re-create with `harn setup`.")
+    else:
+        print("[harn] nothing to remove in the project root.")
     return 0
 
 
@@ -174,6 +232,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("text", help="your answer")
     ap.add_argument("path", nargs="?", default=".")
     ap.set_defaults(func=cmd_answer)
+
+    dp = sub.add_parser("doctor", help="verify the MCP server + tools work")
+    dp.add_argument("path", nargs="?", default=".")
+    dp.set_defaults(func=cmd_doctor)
+
+    tp = sub.add_parser(
+        "teardown",
+        help="remove harn's root connectors (.mcp.json/.cursor/AGENTS.md); "
+             "keeps harn_env/",
+    )
+    tp.add_argument("path", nargs="?", default=".")
+    tp.set_defaults(func=cmd_teardown)
 
     rb = sub.add_parser(
         "rollback",
