@@ -28,6 +28,14 @@ def _env_dir() -> Path:
     return Path(os.environ.get("HARN_ENV_DIR", "harn_env")).resolve()
 
 
+def _default_worker() -> str:
+    """Identify this MCP server instance as a worker for task claiming. Each
+    agent connection spawns its own server subprocess, so the PID is a stable
+    per-worker id for the life of that agent's session. Override with
+    HARN_WORKER for deterministic multi-process runs."""
+    return os.environ.get("HARN_WORKER", "").strip() or f"pid-{os.getpid()}"
+
+
 def _log(msg: str) -> None:
     """Append to the shared PROGRESS feed so `harn watch` and any agent can see
     what's happening, regardless of where the work runs (chat or `harn run`)."""
@@ -133,19 +141,26 @@ def build_server():
                 f"project's specifics via save_to_skill/ask_user.\n\n{body}")
 
     @mcp.tool()
-    def get_next_task() -> str:
-        """Return the highest-priority task that needs agent work, or a note if
+    def get_next_task(worker: str = "") -> str:
+        """Return the highest-priority runnable task and CLAIM it, or a note if
         none. Resumes an in-progress task before starting a new one.
+
+        Dependency-aware: a task whose `depends_on` ids aren't all `done` is
+        skipped, so independent tasks surface in parallel while chains stay
+        ordered. The claim is atomic — pass a stable `worker` id (one per agent
+        / window / process; defaults to a generic shared id) so two parallel
+        agents never get the same task, and so YOU can resume your own task.
 
         If the task touches a domain with no matching skill, the response ends
         with a 'Skill gaps' note — call `ensure_skill(domain)` to bootstrap a
         best-practice baseline before implementing."""
         from . import skill_library
         env = _env_dir()
-        t = tasks_mod.next_task(env)
+        wid = worker.strip() or _default_worker()
+        t = tasks_mod.next_task(env, claim=True, worker=wid)
         if t is None:
-            return "(no pending tasks)"
-        _log(f"{t.id}: picked up by agent ({t.title})")
+            return "(no runnable tasks — all done, blocked by deps, or claimed)"
+        _log(f"{t.id}: claimed by {wid} ({t.title})")
         out = t.path.read_text(encoding="utf-8")
         note = skill_library.gap_note(env, t)
         if note:
@@ -162,6 +177,7 @@ def build_server():
         epic: str = "",
         user_story: str = "",
         task_id: str = "",
+        depends_on: list[str] | None = None,
     ) -> str:
         """Create (or convert) a task and write it as a JSON file in ``harn_env/tasks/``.
 
@@ -192,6 +208,11 @@ def build_server():
         task_id       Leave empty → auto-generate (PRJ-NNN using ``[harn]
                       project``). Pass a tracker key (e.g. "AUTH-42") when the
                       task already exists in Jira/Linear.
+        depends_on    Ids this task waits on — it only becomes runnable once
+                      ALL of them are `done`. Leave empty for independent tasks
+                      so they can run in PARALLEL with others. Use this only for
+                      a real ordering constraint (e.g. "build API" before "wire
+                      UI to API"), not for soft preference (use `priority`).
         """
         from .config import Config
         cfg = Config.load(_env_dir())
@@ -206,8 +227,10 @@ def build_server():
             user_story=user_story or None,
             task_id=task_id or None,
             id_prefix=cfg.project.upper(),
+            depends_on=depends_on or None,
         )
-        return f"Created task {t.id}: {t.path.name}"
+        dep = f" (after {', '.join(t.depends_on)})" if t.depends_on else ""
+        return f"Created task {t.id}: {t.path.name}{dep}"
 
     @mcp.tool()
     def update_task(

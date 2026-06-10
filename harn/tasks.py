@@ -137,6 +137,11 @@ class Task:
     # working tree to this point to redo the task from scratch.
     baseline_ref: str = ""
     review_log:  list[ReviewEntry] = field(default_factory=list)
+    # Parallelism: ids this task waits on (only runnable once all are `done`),
+    # and the worker that currently owns it (set on atomic claim).
+    depends_on:  list[str] = field(default_factory=list)
+    claimed_by:  str | None = None
+    claimed_at:  str = ""
 
     @property
     def done(self) -> bool:
@@ -202,6 +207,9 @@ def _from_dict(path: Path, d: dict) -> Task:
         decisions=decisions,
         baseline_ref=d.get("baseline_ref") or "",
         review_log=review_log,
+        depends_on=list(d.get("depends_on") or []),
+        claimed_by=d.get("claimed_by"),
+        claimed_at=d.get("claimed_at") or "",
     )
 
 
@@ -222,6 +230,9 @@ def _to_dict(task: Task) -> dict:
         "decisions":   [x.to_dict() for x in task.decisions],
         "baseline_ref": task.baseline_ref,
         "review_log":  [e.to_dict() for e in task.review_log],
+        "depends_on":  task.depends_on,
+        "claimed_by":  task.claimed_by,
+        "claimed_at":  task.claimed_at,
     }
 
 
@@ -230,6 +241,35 @@ def _save(task: Task) -> None:
         json.dumps(_to_dict(task), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+import contextlib
+import os as _os
+
+
+@contextlib.contextmanager
+def _claim_lock(env_dir: Path):
+    """Cross-process advisory lock guarding atomic task claims. Uses fcntl where
+    available (macOS/Linux); degrades to a no-op lock elsewhere so single-process
+    use still works."""
+    lock_dir = env_dir / "tasks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".claim.lock"
+    fh = open(lock_path, "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass  # no fcntl (e.g. Windows) → best-effort, single-process safe
+        yield
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        fh.close()
 
 
 def _load(path: Path) -> Task:
@@ -258,13 +298,84 @@ def find(env_dir: Path, task_id: str) -> Task | None:
     return None
 
 
-def next_task(env_dir: Path, exclude: set[str] | None = None) -> Task | None:
+def _deps_met(task: Task, by_id: dict[str, Task]) -> bool:
+    """True when every id in task.depends_on exists and is done. Unknown ids are
+    treated as unmet (a typo shouldn't silently unblock the task)."""
+    for dep in task.depends_on:
+        d = by_id.get(dep)
+        if d is None or not d.done:
+            return False
+    return True
+
+
+def _eligible(task: Task, by_id: dict[str, Task], worker: str | None) -> bool:
+    """A task an agent may pick up right now: needs work, deps satisfied, and
+    either unclaimed or already owned by THIS worker (resuming its own task)."""
+    if not task.needs_agent or not _deps_met(task, by_id):
+        return False
+    if task.claimed_by and task.claimed_by != worker:
+        # In-progress tasks owned by another worker are off-limits; todo tasks
+        # with a stale claim are claimable again only via re-claim (below).
+        return task.status != IN_PROGRESS
+    return True
+
+
+def next_task(
+    env_dir: Path,
+    exclude: set[str] | None = None,
+    *,
+    claim: bool = False,
+    worker: str | None = None,
+) -> Task | None:
+    """Return the highest-priority runnable task.
+
+    Dependency-aware: a task is skipped until every id in its `depends_on` is
+    `done`, so independent tasks surface in parallel while chains stay ordered.
+
+    When `claim=True`, the pick is ATOMIC under a per-project lock: the task is
+    flipped to `in_progress` and stamped `claimed_by=worker` before the lock is
+    released, so two concurrent workers never get the same task. Pass a stable
+    `worker` id (one per agent/process) so a worker can resume its own task.
+    """
     skip = exclude or set()
-    pending = [t for t in load_tasks(env_dir) if t.needs_agent and t.id not in skip]
-    if not pending:
-        return None
-    pending.sort(key=lambda t: (_PICK_RANK.get(t.status, 9), t.priority, t.id))
-    return pending[0]
+
+    def _pick(tasks: list[Task]) -> Task | None:
+        by_id = {t.id: t for t in tasks}
+        pending = [t for t in tasks
+                   if t.id not in skip and _eligible(t, by_id, worker)]
+        if not pending:
+            return None
+        # Prefer this worker's own in-progress task, then priority order.
+        pending.sort(key=lambda t: (_PICK_RANK.get(t.status, 9), t.priority, t.id))
+        return pending[0]
+
+    if not claim:
+        return _pick(load_tasks(env_dir))
+
+    with _claim_lock(env_dir):
+        tasks = load_tasks(env_dir)        # re-read inside the lock
+        chosen = _pick(tasks)
+        if chosen is None:
+            return None
+        if chosen.status == TODO:
+            chosen.status = IN_PROGRESS
+        chosen.claimed_by = worker
+        chosen.claimed_at = _now_iso()
+        _save(chosen)
+        return chosen
+
+
+def release_task(env_dir: Path, task_id: str, worker: str | None = None) -> bool:
+    """Drop a worker's claim on a task (e.g. it's giving up / handing off).
+    Only the owning worker may release. Returns True if released."""
+    with _claim_lock(env_dir):
+        t = find(env_dir, task_id)
+        if t is None or (worker is not None and t.claimed_by != worker):
+            return False
+        t.claimed_by = None
+        t.claimed_at = ""
+        _save(t)
+        return True
 
 
 def tasks_in_review(env_dir: Path) -> list[Task]:
@@ -318,6 +429,7 @@ def create_task(
     user_story: str | None = None,
     task_id: str | None = None,
     id_prefix: str = "PRJ",
+    depends_on: list[str] | None = None,
 ) -> Task:
     """Create a new task JSON file and return the Task object."""
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -335,6 +447,7 @@ def create_task(
         user_story=user_story,
         skills=list(skills or []),
         description=description or _DESCRIPTION_TEMPLATE.format(what=title),
+        depends_on=list(depends_on or []),
     )
     _save(task)
     return task
@@ -451,8 +564,19 @@ def board(env_dir: Path) -> str:
         if not items:
             continue
         lines.append(_STATUS_LABEL[status])
+        by_id = {x.id: x for x in load_tasks(env_dir)}
         for t in items:
             prds = f" · {', '.join(t.prds)}" if t.prds else ""
             subs = f" [{sum(1 for s in t.subtasks if s.status == DONE)}/{len(t.subtasks)} subtasks]" if t.subtasks else ""
-            lines.append(f"  - [{t.id}{prds}] {t.title} (priority {t.priority}){subs}")
+            if t.depends_on:
+                unmet = [d for d in t.depends_on
+                         if d not in by_id or not by_id[d].done]
+                deps = (f" ⛔ waits on {', '.join(unmet)}" if unmet
+                        else f" ✓ after {', '.join(t.depends_on)}")
+            else:
+                deps = ""
+            owner = f" 👷 {t.claimed_by}" if t.claimed_by else ""
+            lines.append(
+                f"  - [{t.id}{prds}] {t.title} (priority {t.priority})"
+                f"{subs}{deps}{owner}")
     return "\n".join(lines)

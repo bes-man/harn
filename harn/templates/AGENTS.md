@@ -87,6 +87,25 @@ never saved, and harn doesn't know it was asked.
   deviations with `save_to_skill` / `ask_user(skill=…)`.
 - Never implement a domain task with zero guidance: bootstrap or ask first.
 
+## Parallel work (multiple agents)
+
+Tasks run in parallel when they don't depend on each other. To enable it:
+
+- **Declare real ordering** with `create_task(..., depends_on=["PRJ-001"])`. A
+  task becomes runnable only once ALL its `depends_on` ids are `done`. Use this
+  ONLY for genuine constraints (build the API before wiring the UI to it) — for
+  soft "do this sooner" preference use `priority`, not a dependency.
+- **Leave independent tasks with no `depends_on`** so several agents can take
+  them at once.
+- **`get_next_task` claims atomically.** Each agent/window passes (or is
+  assigned) a `worker` id; the claim is locked so two agents never get the same
+  task. You always get your own in-progress task back if you ask again.
+
+To actually run agents in parallel: open multiple agent sessions (chat windows)
+in the project, or launch multiple `harn run` processes — each claims distinct
+runnable tasks. Give parallel agents separate git worktrees if their tasks
+touch overlapping files, so their edits don't collide.
+
 ## Code search (search before reading)
 
 harn integrates two optional code-search backends. Use whichever is available
