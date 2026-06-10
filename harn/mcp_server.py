@@ -108,14 +108,49 @@ def build_server():
         return f"saved to {path.relative_to(_env_dir())}"
 
     @mcp.tool()
+    def ensure_skill(domain: str) -> str:
+        """Bootstrap a best-practice baseline skill for a domain that has none.
+
+        Call this when a task touches a domain (frontend, backend, api, testing,
+        security, accessibility, performance, database) and `list_skills` shows
+        no skill covering it. harn installs an industry-baseline SKILL.md from
+        its built-in library and returns the body — read it, follow it, and
+        then capture this project's specific deviations with `save_to_skill` /
+        `ask_user(skill=…)`.
+
+        Available domains: frontend, backend, api, testing, security,
+        accessibility, performance, database. If `domain` isn't one of these,
+        nothing is installed (create a custom skill with `save_to_skill`)."""
+        from . import skill_library
+        md = skill_library.install(_env_dir(), domain)
+        if md is None:
+            avail = ", ".join(skill_library.LIBRARY.keys())
+            return (f"(no library baseline for '{domain}'). Available: {avail}. "
+                    f"For a custom domain, use `save_to_skill('{domain}', …)`.")
+        _log(f"bootstrapped baseline skill '{domain}' from library")
+        body = skills_mod.read_skill(_env_dir(), domain) or ""
+        return (f"Installed baseline skill '{domain}'. Now refine it with this "
+                f"project's specifics via save_to_skill/ask_user.\n\n{body}")
+
+    @mcp.tool()
     def get_next_task() -> str:
         """Return the highest-priority task that needs agent work, or a note if
-        none. Resumes an in-progress task before starting a new one."""
-        t = tasks_mod.next_task(_env_dir())
+        none. Resumes an in-progress task before starting a new one.
+
+        If the task touches a domain with no matching skill, the response ends
+        with a 'Skill gaps' note — call `ensure_skill(domain)` to bootstrap a
+        best-practice baseline before implementing."""
+        from . import skill_library
+        env = _env_dir()
+        t = tasks_mod.next_task(env)
         if t is None:
             return "(no pending tasks)"
         _log(f"{t.id}: picked up by agent ({t.title})")
-        return t.path.read_text(encoding="utf-8")
+        out = t.path.read_text(encoding="utf-8")
+        note = skill_library.gap_note(env, t)
+        if note:
+            out += "\n\n" + note
+        return out
 
     @mcp.tool()
     def create_task(

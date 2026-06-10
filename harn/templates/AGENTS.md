@@ -59,6 +59,19 @@ was asked.
   ask the user to run it. It handles Telegram escalation, oracle, and live
   status in the background.
 
+## Skills: load, and fill gaps
+
+- `list_skills` → scan; `read_skill(name)` → load a body ONLY when the task
+  needs it (keeps context small).
+- **Missing-skill gaps**: `get_next_task` flags domains the task touches that
+  have no skill (e.g. a frontend task with no `frontend`/`ui` skill). When you
+  see a "Skill gaps" note — or you notice a domain has no standard — call
+  `ensure_skill(domain)` to install an industry best-practice baseline
+  (frontend, backend, api, testing, security, accessibility, performance,
+  database). Read it, follow it, then capture this project's specific
+  deviations with `save_to_skill` / `ask_user(skill=…)`.
+- Never implement a domain task with zero guidance: bootstrap or ask first.
+
 ## Code search (search before reading)
 
 harn integrates two optional code-search backends. Use whichever is available

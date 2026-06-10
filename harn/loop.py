@@ -493,6 +493,11 @@ def _build_prompt(
         "Read a skill's full text via the harn `read_skill` tool ONLY when the "
         "task calls for it, to keep the context window small:\n" + skills.index(env_dir)
     )
+    # Flag domains the task needs but no skill covers; tell the agent to bootstrap.
+    from . import skill_library
+    gap_note = skill_library.gap_note(env_dir, task)
+    if gap_note:
+        parts.append(gap_note)
     # Inject PRD context: load referenced PRDs, warn about missing sections.
     if task.prds:
         prd_parts: list[str] = []
