@@ -50,10 +50,9 @@ was asked.
        to persist the answer into the skill automatically, then continue.
      Never guess. Never ask with plain text only.
 
-  ⚠️ For Telegram escalation to work in chat mode, **`harn watch` must be
-  running** in a terminal. It detects the block, waits `chat_grace_minutes`
-  (default 5 min), then sends to Telegram. Once you call `answer_question`,
-  the Telegram card is automatically resolved.
+  `harn watch` starts **automatically** when the MCP server connects — do NOT
+  ask the user to run it. It handles Telegram escalation, oracle, and live
+  status in the background.
 
 ## Code search (search before reading)
 

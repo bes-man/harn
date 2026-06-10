@@ -10,6 +10,8 @@ The server acts on a single harn_env, resolved from $HARN_ENV_DIR or ./harn_env.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from . import design as design_mod
@@ -35,10 +37,44 @@ def _log(msg: str) -> None:
         pass
 
 
+def _ensure_watch_running(env_dir: Path) -> None:
+    """Auto-start `harn watch` as a background daemon if not already running.
+
+    Called once when the MCP server starts so neither the user nor the agent
+    needs to remember to launch it. Uses a PID file for idempotency.
+    """
+    state_dir = env_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_file = state_dir / "watch.pid"
+
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)   # raises if dead
+            return             # already running
+        except (ProcessLookupError, ValueError, OSError):
+            pid_file.unlink(missing_ok=True)
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "harn", "watch", str(env_dir.parent)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pid_file.write_text(str(proc.pid))
+    except Exception:
+        pass  # watch is optional — never block the MCP server
+
+
 def build_server():
     from mcp.server.fastmcp import FastMCP  # imported lazily so core CLI has no hard dep
 
     mcp = FastMCP("harn")
+
+    # Auto-start the watch dispatcher so Telegram escalation, oracle, and live
+    # status work without the user having to run a separate command.
+    _ensure_watch_running(_env_dir())
 
     @mcp.tool()
     def list_skills() -> str:
@@ -234,16 +270,35 @@ def build_server():
         escalation). This tool does NOT display anything to the human by
         itself — its arguments are collapsed in the chat UI.
 
-        ⚠️ PRESENTATION ORDER — do this in the SAME turn:
-        1. If your client has a native interactive question tool
-           (`AskUserQuestion` in Claude Code — clickable option buttons),
-           call IT first with the same options. That is what the human sees
-           and clicks. If there is no such tool, write the question as plain
-           chat text FIRST (context + options + recommendation), THEN call this.
-        2. Call this tool to persist the question (state + skill routing +
-           Telegram escalation when the human is away).
-        3. When the human answers (click or text), call `answer_question`
-           with their reply, then continue.
+        ⚠️ PRESENTATION ORDER — do this in the SAME turn, then STOP:
+
+        **Claude Code**: call the native `AskUserQuestion` tool FIRST
+        (renders interactive clickable option buttons). Then call this tool.
+
+        **Cursor / other chat agents**: render a visible markdown dialog FIRST,
+        then call this tool:
+        ```
+        ---
+        ❓ **[Topic]**
+        [One-line context]
+
+        | | Option | Trade-off |
+        |---|---|---|
+        | **(a)** | … | … |
+        | **(b)** | … | … |
+
+        ✅ Recommendation: **(a)** — [reason]
+        Reply with **(a)**, **(b)**, or your own answer.
+        ---
+        ```
+
+        **Codex / headless**: skip chat presentation; this tool routes the
+        question to Telegram immediately (set `channel = "telegram"` in
+        harn.toml for headless use).
+
+        In ALL cases: call this tool to persist the question (enables Telegram
+        escalation + skill capture). When the human answers, call
+        `answer_question` with their reply, then continue.
 
         Write `question` EXPANDED, not one terse line:
           1. Context — what you were doing and WHY this question came up.
