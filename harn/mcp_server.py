@@ -442,8 +442,33 @@ def build_server():
                 _log(f"{task_id}: submitted for review — oracle will check it")
                 return (f"task '{task_id}' submitted for review. The oracle (run "
                         "by `harn watch`) will verify it; read its verdict in the "
-                        "task's review_log and relay it to the user.")
+                        "task's review_log and relay it to the user.\n\n"
+                        "➡️ NEXT: call `reconcile_skills(\"" + task_id + "\")` to "
+                        "capture what this task taught into skills before moving on.")
         return f"(no task '{task_id}')"
+
+    @mcp.tool()
+    def reconcile_skills(task_id: str = "") -> str:
+        """Capture what a finished task taught into skills (experience-driven
+        learning). Call after `submit_for_review`.
+
+        Returns a reconciliation brief: the files changed, the existing skills,
+        and instructions to (a) auto-save durable conventions you're confident
+        about via `save_to_skill` (prefix the entry `[auto]`), and (b) ask the
+        human via `ask_user(skill=…)` about trade-offs/policy that need
+        agreement. This is how harn's skills grow from its own work, not only
+        from questions — so the next task starts smarter."""
+        from . import skill_library
+        env = _env_dir()
+        t = tasks_mod.find(env, task_id) if task_id else None
+        if t is None:
+            # Fall back to the most recently active task.
+            st = state_mod.State.load(env / "state")
+            t = tasks_mod.find(env, st.current_task) if st.current_task else None
+        if t is None:
+            return ("(no task to reconcile — pass a task_id). After finishing "
+                    "work, call this so harn learns from it.")
+        return skill_library.reconcile_brief(env, env.parent, t)
 
     @mcp.tool()
     def loop_status() -> str:

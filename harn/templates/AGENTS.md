@@ -29,15 +29,21 @@ was asked.
      ("Picking up AUTH-42…", "Running tests…", "Submitting for review…"). The
      human must always be able to see what harn is doing from the chat.
   2. `get_next_task` → read only the skills you need → implement → `run_tests`.
-  3. **Don't stall.** After `submit_for_review`, immediately `get_next_task` and
-     start the next one — do NOT wait for the review to come back. A task in
-     `review` is the dispatcher's job, not yours.
-  4. **Oracle runs out-of-band.** After you submit, `harn watch` runs an
+  3. **Reconcile skills on completion.** After `submit_for_review`, call
+     `reconcile_skills(task_id)`. Compare what you built against existing
+     skills: auto-save durable conventions you're confident about with
+     `save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs
+     needing my agreement. This is how harn learns from its own work — do not
+     skip it.
+  4. **Don't stall.** After reconciling, immediately `get_next_task` and start
+     the next one — do NOT wait for the review to come back. A task in `review`
+     is the dispatcher's job, not yours.
+  5. **Oracle runs out-of-band.** After you submit, `harn watch` runs an
      independent oracle on the task. **Poll the task's `review_log`** (re-read it
      via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
      `oracle_debt` entry and **relay the verdict to me in the chat**. If
      `oracle_fail`, the task is back in `changes_requested` — rework it.
-  5. **Questions:** when something is ambiguous, surface it in your client's
+  6. **Questions:** when something is ambiguous, surface it in your client's
      NATIVE interactive-question UI first (check your own tool list — you know
      your runtime better than this doc), then persist it:
      - **Claude Code** — call the native `AskUserQuestion` tool (clickable

@@ -363,6 +363,10 @@ _LIFECYCLE_NOTE = (
     "tools (`get_next_task`, `read_skill`, `run_tests`, `board`, "
     "`submit_for_review`). If anything is ambiguous or risky, call `ask_user` "
     "(or write `harn_env/state/BLOCKED.md`) and STOP — do not guess.\n"
+    "Before you submit, RECONCILE SKILLS: compare what you built against the "
+    "project's skills; auto-save durable conventions you're confident about via "
+    "`save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs "
+    "needing human agreement. harn learns from its own work, not just questions.\n"
     + _ASK_GUIDANCE
 )
 

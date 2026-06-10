@@ -16,6 +16,7 @@ Flow:
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -365,3 +366,58 @@ def gap_note(env_dir: Path, task) -> str:
             f"then `read_skill(\"{lib.name}\")`."
         )
     return "\n".join(lines)
+
+
+def _changed_files(project_root: Path) -> list[str]:
+    """Files touched since HEAD (staged + unstaged). Empty on any git error."""
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=project_root, capture_output=True, text=True, timeout=10,
+        )
+        names = [l.strip() for l in out.stdout.splitlines() if l.strip()]
+        return names
+    except Exception:
+        return []
+
+
+def reconcile_brief(env_dir: Path, project_root: Path, task) -> str:
+    """Post-task skill reconciliation prompt (experience-driven learning).
+
+    After a task is done, the agent compares what it just built against the
+    existing skills, then: writes durable, confident conventions automatically
+    (`save_to_skill`, prefixed `[auto]`), and asks the human about anything that
+    is a debatable trade-off or project policy (`ask_user(skill=…)`). This is
+    how harn's skills grow from its own work, not just from human answers.
+    """
+    changed = _changed_files(project_root)
+    idx = skills_mod.index(env_dir)
+    domains = ", ".join(LIBRARY.keys())
+    files_block = (
+        "\n".join(f"  - {f}" for f in changed[:40]) if changed
+        else "  (no git diff detected — reason from the task description)"
+    )
+    return (
+        "## 🧠 Reconcile skills with what you just built\n"
+        f"Task: **{task.id} — {task.title}**\n\n"
+        "Compare the work in this iteration against the project's skills and "
+        "CLOSE THE GAPS so the next task starts smarter.\n\n"
+        "Files changed:\n" + files_block + "\n\n"
+        "Existing skills:\n" + idx + "\n\n"
+        "Do this:\n"
+        "1. List the durable conventions/patterns this task established "
+        "(libraries chosen, file/naming patterns, error shapes, data formats, "
+        "validation approach, gotchas you hit and how you solved them).\n"
+        "2. For each one NOT already covered by a skill:\n"
+        "   - **Confident & factual** (a convention the code now follows): call "
+        "`save_to_skill(<skill>, \"[auto] <the convention>\")`. Use an existing "
+        "skill name when it fits, else a domain name "
+        f"({domains}) or a sensible new one.\n"
+        "   - **A trade-off or policy needing human agreement** (security "
+        "posture, a choice with real downsides): call `ask_user(question, "
+        "skill=<skill>)` instead of writing it yourself.\n"
+        "3. Enrich — if a skill exists but this task revealed a better practice, "
+        "append it.\n"
+        "Keep entries short and reusable. Skip anything task-specific or obvious. "
+        "If nothing durable was learned, say so and move on."
+    )

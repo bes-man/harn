@@ -80,3 +80,24 @@ def test_no_gap_note_when_covered(tmp_path):
     # security covered; ensure no security gap remains
     note = skill_library.gap_note(env, task)
     assert "security" not in note
+
+
+def test_reconcile_brief_lists_skills_and_instructions(tmp_path):
+    env = _env(tmp_path)
+    skill_library.install(env, "frontend")
+    task = make_task(env, "T-9", title="Add stats screen",
+                     description="charts and progress")
+    brief = skill_library.reconcile_brief(env, tmp_path, task)
+    assert "Reconcile skills" in brief
+    assert "save_to_skill" in brief
+    assert "ask_user" in brief
+    assert "frontend" in brief          # existing skills listed
+    assert "T-9" in brief               # task id shown
+
+
+def test_reconcile_brief_handles_no_git(tmp_path):
+    env = _env(tmp_path)
+    task = make_task(env, "T-10", title="x")
+    # tmp_path is not a git repo → no diff, must not raise
+    brief = skill_library.reconcile_brief(env, tmp_path, task)
+    assert "no git diff detected" in brief
