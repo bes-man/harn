@@ -89,8 +89,28 @@ dependency graph and are language-independent.
   content)`** (e.g. `security`, `standards`, `frontend`, `testing`, `api`). It
   creates the skill if missing. Next time, you read it instead of asking again.
   An answer you don't capture is a question you'll ask twice.
+- **Design before code (user-facing tasks).** If a task changes anything the
+  user will SEE, generate a single-file static HTML mockup of the final
+  interface first and save it with `save_design(task_id, html)` — it lands in
+  `harn_env/design/<task_id>.html`. Ask the human to open it and confirm
+  (`ask_user`), iterating until approved. The approved mockup is the visual
+  contract: build to it, and tag the task with the `ui` skill (`update_task`)
+  so the browser verification phase runs on it. `read_design(task_id)` returns
+  it later.
 - **Feedback loop.** After changes, run the project's tests via the harn
   `run_tests` tool. Do not mark a task complete while tests fail.
+- **Write tests for what you build.** Every code change needs test coverage —
+  aim for one test per acceptance criterion. harn gates on this: a turn that
+  changes code without touching tests is sent back with a nudge. If something
+  genuinely can't be tested, record why with `record_decision`.
+- **Verify UI work in a real browser.** When the Playwright MCP tools
+  (`browser_navigate`, `browser_snapshot`, `browser_click`,
+  `browser_take_screenshot`, …) are available and the task is user-facing,
+  drive the running app like a user would: walk each acceptance criterion,
+  compare against the approved design, and save screenshots to
+  `harn_env/state/screenshots/<task_id>/`. In headless runs harn starts/stops
+  the app itself (`[browser]` in `harn_env/harn.toml`) and runs this as its own
+  phase; in chat mode, do it yourself before `submit_for_review`.
 - **Carry context between iterations (cheaply).** You run as a fresh process each
   turn, so you don't remember the last one — but the task file does. As you work:
   - `record_decision(task_id, decision, rationale)` for every non-obvious choice

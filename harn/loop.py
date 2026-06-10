@@ -18,7 +18,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitutil, progress, prd as prd_mod, semble_bridge, skills, state, tasks
+from . import browser, design as design_mod, gitutil, progress, prd as prd_mod, \
+    semble_bridge, skills, state, tasks
 from .adapters import Adapter, get_adapter
 from .config import Config
 from .feedback import run_feedback
@@ -133,6 +134,46 @@ description. Planning is complete once you do that.
 """
 
 
+def _design_instructions(cfg: Config, task: tasks.Task) -> str:
+    """Planning-phase step for user-facing tasks: mockup before code."""
+    if not cfg.design:
+        return ""
+    return f"""\
+## DESIGN — only if this task has a user-facing surface
+
+If the task changes or creates anything the user will SEE (a page, screen,
+component, dashboard, form), produce the interface design BEFORE implementation:
+
+1. Generate a single-file static HTML mockup of the final interface — inline
+   CSS, realistic sample data, every state the acceptance criteria mention —
+   and save it with the `save_design` MCP tool (it lands in
+   `harn_env/design/{task.id}.html`).
+2. Confirm it with the human: call `ask_user` summarising the mockup (layout,
+   key elements, flows) and pointing at the file. Iterate until approved.
+3. Ensure the task's `skills` list includes "ui" (via `update_task`) so the
+   browser-verification phase runs on this task.
+
+Once approved, the mockup is the visual contract: the executor builds to it and
+the verification phases check the real UI against it. If the task has no
+user-facing surface, skip this section entirely.
+"""
+
+
+def _design_block(env_dir: Path, task_id: str, max_chars: int = 4000) -> str:
+    """The approved mockup, injected into executor/oracle/UI-verify prompts."""
+    html = design_mod.load(env_dir, task_id)
+    if not html:
+        return ""
+    rel = design_mod.design_path(env_dir, task_id)
+    return (
+        f"## Approved UI design (visual contract) — {rel.name}\n"
+        "The human approved this mockup during planning. The implemented "
+        "interface must match its layout, elements, and states; deviations need "
+        "a recorded decision or a new `ask_user`.\n"
+        f"```html\n{html[:max_chars]}\n```"
+    )
+
+
 def _oracle_instructions(diff: str, cfg: Config) -> str:
     """Build oracle instructions with diff-scoped blast-radius guidance."""
     blast = semble_bridge.oracle_hint(cfg, diff)
@@ -192,6 +233,58 @@ def _git_diff(project_root: Path, max_chars: int = 6000) -> str:
         return ""
 
 
+# --------------------------------------------------------------------------- #
+# Test-writing gate: code changed but no tests did → one nudge per task
+# --------------------------------------------------------------------------- #
+_CODE_EXTS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java",
+    ".kt", ".rb", ".php", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".swift",
+    ".vue", ".svelte",
+}
+_TEST_FILE_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec)/"      # tests/ test/ __tests__/ spec/
+    r"|(^|/)test_[^/]+$"                  # test_foo.py
+    r"|(_test|\.test|\.spec)\.[^/.]+$",   # foo_test.go foo.test.ts foo.spec.js
+    re.IGNORECASE,
+)
+
+_TESTS_NUDGE = (
+    "Your change modifies code but adds/changes NO tests. Every code change "
+    "needs test coverage: write tests that pin down the new behaviour (one per "
+    "acceptance criterion where possible), make them pass, then finish the task. "
+    "If this change genuinely cannot be tested, record WHY with `record_decision`."
+)
+
+
+def _changed_files(project_root: Path) -> list[str]:
+    """Files changed vs HEAD (falling back to the last commit), best-effort."""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=project_root, capture_output=True, text=True, timeout=10,
+        )
+        files = r.stdout.split() if r.returncode == 0 else []
+        if not files:
+            r2 = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                cwd=project_root, capture_output=True, text=True, timeout=10,
+            )
+            files = r2.stdout.split() if r2.returncode == 0 else []
+        return files
+    except Exception:
+        return []
+
+
+def _missing_tests(project_root: Path) -> bool:
+    """True when the working diff touches code files but no test files."""
+    files = _changed_files(project_root)
+    code = [f for f in files
+            if Path(f).suffix.lower() in _CODE_EXTS
+            and not _TEST_FILE_RE.search(f)]
+    tests_touched = any(_TEST_FILE_RE.search(f) for f in files)
+    return bool(code) and not tests_touched
+
+
 def _build_planning_prompt(env_dir: Path, cfg: Config, task: tasks.Task) -> str:
     agents_md = env_dir.parent / "AGENTS.md"
     base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
@@ -210,6 +303,7 @@ def _build_planning_prompt(env_dir: Path, cfg: Config, task: tasks.Task) -> str:
     parts.append(f"## Task to clarify — {task.id}\n" + task_body)
     parts.append(_autonomy_note(cfg.autonomy))
     parts.append(_planning_instructions(cfg))
+    parts.append(_design_instructions(cfg, task))
     return "\n\n".join(p for p in parts if p.strip())
 
 
@@ -233,6 +327,17 @@ def _build_oracle_prompt(
             parts.append("## Requirements context (PRDs)\n" +
                          "\n\n---\n\n".join(prd_parts))
     parts.append(f"## Task specification — {task.id}\n" + task_body)
+    dz = _design_block(env_dir, task.id)
+    if dz:
+        parts.append(dz)
+        shots = env_dir / "state" / "screenshots" / task.id
+        if shots.is_dir() and any(shots.iterdir()):
+            parts.append(
+                "## UI evidence\nScreenshots from the browser-verification pass "
+                f"are in `{shots}`. Compare them against the approved design "
+                "above — a UI that diverges from the contract is grounds for "
+                "`ORACLE: FAIL`."
+            )
     claims = _decisions_to_verify(task)
     if claims:
         parts.append(claims)
@@ -420,6 +525,9 @@ def _build_prompt(
             + "\n\n" + "\n\n---\n\n".join(prd_parts)
         )
     parts.append(f"## Current task — {task.id} (status: {task.status})\n" + task_body)
+    dz = _design_block(env_dir, task.id)
+    if dz:
+        parts.append(dz)
     cont = _continuity_block(task)
     if cont:
         parts.append(cont)
@@ -477,6 +585,60 @@ def _verify_verdict(text: str) -> str:
     """'fail' only on an explicit VERIFY: FAIL; else 'pass' (lenient)."""
     t = (text or "").lower()
     if "verify: fail" in t and "verify: pass" not in t:
+        return "fail"
+    return "pass"
+
+
+# --------------------------------------------------------------------------- #
+# Browser verification (Playwright MCP) — check the criteria in the LIVE app
+# --------------------------------------------------------------------------- #
+def _ui_applicable(env_dir: Path, task: tasks.Task) -> bool:
+    """A task gets the browser pass when it has an approved design or is
+    explicitly tagged with the 'ui' skill (the planner sets one of the two)."""
+    return design_mod.exists(env_dir, task.id) or "ui" in task.skills
+
+
+def _build_ui_verify_prompt(
+    env_dir: Path, cfg: Config, task: tasks.Task, shots_dir: Path,
+    auto: bool = False,
+) -> str:
+    agents_md = env_dir.parent / "AGENTS.md"
+    base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+    instructions = f"""\
+## You are VERIFYING THE LIVE UI — do not start new work
+
+The app is RUNNING at **{cfg.app_url}**. Use the Playwright MCP tools
+(`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
+`browser_take_screenshot`, …) to check the task's acceptance criteria against
+the real interface, the way a user would:
+
+1. Walk EVERY user-visible acceptance criterion in the task's `## Done when` —
+   navigate, click, fill forms, observe the result. Not just the happy path:
+   try empty input, wrong input, repeated submits where the criteria imply them.
+2. Take a screenshot of each verified state and save it under `{shots_dir}`
+   (one file per criterion, named after what it shows).
+3. If there is an approved design above, compare what you see against it —
+   layout, key elements, states must match.
+4. If something is broken or diverges and you can safely fix it in code, fix it
+   (the loop will re-run tests). If it needs a human decision, call `ask_user`
+   (expanded) and STOP.
+5. End your reply with exactly one line: `UI: PASS` or `UI: FAIL — <reason>`.
+"""
+    parts = [
+        base,
+        f"## Task under UI verification — {task.id}\n" + _task_spec(task),
+        _design_block(env_dir, task.id),
+        _continuity_block(task),
+        instructions,
+        _AUTO_NOTE if auto else _ASK_GUIDANCE,
+    ]
+    return "\n\n".join(p for p in parts if p.strip())
+
+
+def _ui_verdict(text: str) -> str:
+    """'fail' only on an explicit UI: FAIL; else 'pass' (lenient)."""
+    t = (text or "").lower()
+    if "ui: fail" in t and "ui: pass" not in t:
         return "fail"
     return "pass"
 
@@ -702,6 +864,61 @@ def _run_verify(adapter, env_dir, cfg, task, project_root, st, state_dir, auto,
     return "ok"
 
 
+def _run_ui_verify(adapter, env_dir, cfg, task, project_root, st, state_dir,
+                   auto, tok_totals, tok_costs) -> str:
+    """Run the browser-verification turn against the live app. Returns 'ok',
+    'resumed', 'blocked', 'loop' (rework), or 'skipped' (app not reachable —
+    surfaced to PROGRESS, never blocks the pipeline)."""
+    app = browser.start_app(cfg.app_cmd, cfg.app_url, project_root,
+                            cfg.ready_timeout_s)
+    if not app.ready:
+        progress.log(env_dir,
+                     f"{task.id}: browser verify SKIPPED — {app.error}",
+                     agent=adapter.name)
+        print(f"[harn] Browser verify skipped: {app.error}")
+        return "skipped"
+
+    st.transition(state.UI_VERIFYING)
+    st.save(state_dir)
+    shots_dir = env_dir / "state" / "screenshots" / task.id
+    shots_dir.mkdir(parents=True, exist_ok=True)
+    if not auto:
+        progress.log(env_dir, f"{task.id}: verifying the live UI via Playwright",
+                     agent=adapter.name)
+    print(f"[harn] Browser-verifying '{task.id}' at {cfg.app_url}…")
+    try:
+        ures = adapter.run_turn(
+            _build_ui_verify_prompt(env_dir, cfg, task, shots_dir, auto=auto),
+            project_root)
+    finally:
+        app.stop()
+    print(ures.text[-1500:] if ures.text else "(ui verify: no output)")
+    _accumulate(tok_totals, tok_costs, task.id, ures)
+    if not auto and ures.usage_str():
+        progress.log(env_dir, f"{task.id}: ui verify used {ures.usage_str()}",
+                     agent=adapter.name)
+
+    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
+    if b in ("resumed", "blocked"):
+        return b
+    if b == "auto":
+        return "loop"
+
+    fb = run_feedback(cfg.test_cmd, project_root)
+    if fb.ran and not fb.ok:
+        print("[harn] UI verify left tests failing; looping to fix.")
+        return "loop"
+    if _ui_verdict(ures.text) == "fail":
+        if not auto:
+            progress.log(env_dir, f"{task.id}: UI verify found gaps; reworking",
+                         agent=adapter.name)
+        print("[harn] UI verify reported gaps; looping to address them.")
+        return "loop"
+    if not auto:
+        progress.log(env_dir, f"{task.id}: UI verify PASS", agent=adapter.name)
+    return "ok"
+
+
 def _pick_oracle_adapter(cfg: Config) -> "Adapter":
     """Return the oracle adapter (separate agent, or same as main)."""
     name = cfg.oracle_agent or cfg.agent_chain[0]
@@ -808,6 +1025,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     tok_totals: dict[str, int] = {}
     tok_costs: dict[str, float] = {}
     handled: set[str] = set()
+    tests_nudged: set[str] = set()   # test-writing gate fires once per task
     for _ in range(limit):
         task = tasks.next_task(env_dir, exclude=handled)
         if task is None:
@@ -917,6 +1135,19 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             print("[harn] Tests failing; looping to let the agent fix them.")
             continue  # task stays in_progress → another turn
 
+        # 2b) Test-writing gate: code changed but no tests did → one nudge
+        if (cfg.require_tests and task.id not in tests_nudged
+                and _missing_tests(project_root)):
+            tests_nudged.add(task.id)
+            feedback_tail = _TESTS_NUDGE
+            if not auto:
+                progress.log(env_dir,
+                             f"{task.id}: code changed without tests; "
+                             "asking the agent to add them",
+                             agent=adapter.name)
+            print("[harn] Code changed without tests; looping to add them.")
+            continue  # same task, with the nudge as feedback
+
         # 3) Verify the work against the task's acceptance criteria
         if cfg.verify:
             v = _run_verify(adapter, env_dir, cfg, task, project_root, st,
@@ -927,6 +1158,18 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             if v == "blocked":
                 return st.phase
             if v == "loop":
+                continue  # rework the same task
+
+        # 3a) Browser verification: drive the LIVE app through Playwright MCP
+        if cfg.browser_enabled and _ui_applicable(env_dir, task):
+            u = _run_ui_verify(adapter, env_dir, cfg, task, project_root, st,
+                               state_dir, auto, tok_totals, tok_costs)
+            if u == "resumed":
+                st = state.State.load(state_dir)
+                continue
+            if u == "blocked":
+                return st.phase
+            if u == "loop":
                 continue  # rework the same task
 
         # 3b) Oracle: independent agent checks correctness + technical debt

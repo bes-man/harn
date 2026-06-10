@@ -10,11 +10,13 @@ PLANNING = "PLANNING"
 READY = "READY"
 EXECUTING = "EXECUTING"
 VERIFYING = "VERIFYING"   # checking the work against the task's acceptance criteria
+UI_VERIFYING = "UI_VERIFYING"  # driving the live app via Playwright MCP
 BLOCKED = "BLOCKED"
 REVIEW = "REVIEW"   # an agent finished a task; waiting on the human to accept/comment
 DONE = "DONE"
 
-PHASES = {PLANNING, READY, EXECUTING, VERIFYING, BLOCKED, REVIEW, DONE}
+PHASES = {PLANNING, READY, EXECUTING, VERIFYING, UI_VERIFYING, BLOCKED, REVIEW,
+          DONE}
 
 
 @dataclass

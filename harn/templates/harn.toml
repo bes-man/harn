@@ -28,6 +28,10 @@ agent = "claude"           # claude | codex | cursor | antigravity | qwen
 # Language-agnostic feedback signal. Set this to your project's test command.
 # Examples: "pytest -q"  |  "npm test"  |  "go test ./..."  |  "cargo test"
 test_cmd = ""
+# require_tests (default true): when a turn changes code files but touches no
+# test files, harn feeds back ONE "write tests for this" nudge before the work
+# can proceed to verify (once per task — it never loops forever on it).
+require_tests = true
 
 [loop]
 max_iterations = 10
@@ -52,6 +56,12 @@ planning = true
 # passes to review with a debt note for the human. Costs one extra agent turn.
 oracle = true
 oracle_agent = ""   # empty = same agent as [harn].agent; or set e.g. "claude"
+# Design turn (default true): during planning of a USER-FACING task the agent
+# generates a static HTML mockup of the interface (harn_env/design/<task>.html)
+# and confirms it with you BEFORE any code is written. The approved mockup then
+# becomes the visual contract for the executor, the oracle, and the browser
+# verification phase.
+design = true
 # Autonomous mode (also: `harn run --auto` / `-a`). No human in the loop: the
 # agent researches best practices and decides for itself instead of asking, over
 # a larger iteration budget, and harn NEVER mutates harn_env .md files (no task
@@ -59,6 +69,20 @@ oracle_agent = ""   # empty = same agent as [harn].agent; or set e.g. "claude"
 # Not recommended for complex tasks.
 auto = false
 auto_max_iterations = 30
+
+[browser]
+# Browser verification (default off): after tests + verify pass on a UI task
+# (one with an approved design or the "ui" skill), harn starts your app, lets
+# the agent drive it through the Playwright MCP server — walking the acceptance
+# criteria like a real user and saving screenshots to
+# harn_env/state/screenshots/<task>/ — then stops it. `UI: FAIL` loops the task
+# back for rework. Enable, fill in the two values, and re-run `harn setup` so
+# the Playwright MCP server is added to your agent's MCP config (needs Node.js).
+enabled = false
+# How to start the app (empty = it's already running at app_url):
+app_cmd = ""               # e.g. "npm run dev"
+app_url = ""               # e.g. "http://localhost:3000"
+ready_timeout_s = 60       # how long to wait for app_url to answer after app_cmd
 
 [notify]
 idle_minutes = 30          # remind via Telegram/Slack if blocked this long

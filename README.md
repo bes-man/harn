@@ -49,6 +49,19 @@ Claude Code, Codex). Paste this to your agent in the project:
 > (use `ask_user` with `skill=`). Start `harn watch` in the background. From then
 > on, use harn's MCP tools for all work.
 
+Once `harn setup` is done and the MCP server is connected, paste this to start
+working on any task:
+
+> **Use harn MCP tools for all work in this project.**
+> 1. Call `get_next_task` to pick up the next task from the board.
+> 2. During planning, call `ask_user` (pass `skill=` for any durable standard —
+>    naming conventions, auth rules, test approach, …) before acting on anything
+>    ambiguous. Stop and wait after calling it — I will answer in this chat.
+> 3. Write code. Run `run_tests`. Fix until green.
+> 4. Call `submit_for_review` — harn runs the oracle automatically.
+> 5. Repeat until `board` shows all tasks done.
+> Read `harn_env/AGENTS.md` for the full protocol.
+
 `harn setup` is non-interactive when launched this way: it scaffolds `harn_env/`,
 writes the MCP connector for your agent (git-ignored), installs the code-search
 backends, checks the MCP server, **then runs onboarding** (detects the stack,
@@ -88,6 +101,7 @@ autonomy = 0.7                      # 0 ask-everything … 1 decide-everything
 
 [feedback]
 test_cmd = "pytest -q"              # your project's tests (any language)
+require_tests = true                # code change w/o tests → one "add tests" nudge
 
 [loop]
 max_iterations = 10
@@ -95,7 +109,13 @@ loop_aware = true                   # agent sees the board + progress + lifecycl
 verify = true                       # extra turn: check work vs acceptance criteria
 oracle = true                       # independent verification turn (blast-radius)
 planning = true                     # first turn writes acceptance criteria
+design = true                       # UI tasks: HTML mockup approved BEFORE code
 auto = false                        # autonomous (also `harn run --auto`); see below
+
+[browser]                           # Playwright phase: verify criteria in the LIVE app
+enabled = false                     # turn on, then re-run `harn setup` (adds the MCP)
+app_cmd = "npm run dev"             # how to start the app ("" = already running)
+app_url = "http://localhost:3000"   # where it answers
 
 [code_search]                       # search-before-reading; installed by `harn setup`
 semble = true                       # semantic chunk retrieval (no infra)
@@ -126,10 +146,12 @@ your-project/
 │  │   └─ constraints/  security/  ui/
 │  ├─ prd/<slug>.md            # product requirement docs (Markdown + frontmatter)
 │  ├─ tasks/<id>.json          # backlog — one JSON file per task (AUTH-42 / PRJ-001)
+│  ├─ design/<id>.html         # approved UI mockups — the visual contract per task
 │  ├─ state/                   # runtime state, written by the loop
 │  │   ├─ STATE.json          # loop phase, current task, iterations
 │  │   ├─ PROGRESS.md         # append-only history every agent reads on pickup
 │  │   ├─ ANSWERS.md          # your answers to blocking questions
+│  │   ├─ screenshots/<id>/   # evidence from the browser-verification pass
 │  │   ├─ BLOCKED.md          # (transient) the question the agent is blocked on
 │  │   └─ .telegram_offset    # (transient) Telegram long-poll cursor
 │  └─ mcp_snippets.md          # ready-to-paste MCP config for Codex, Antigravity, Qwen
@@ -268,7 +290,7 @@ serve over `127.0.0.1` instead (same tools; can later sit behind auth/TLS).
 ## Phases vs. task statuses
 
 - **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING →
-  VERIFYING → BLOCKED → REVIEW → DONE` — the overall run.
+  VERIFYING → UI_VERIFYING → BLOCKED → REVIEW → DONE` — the overall run.
 - **Task status** (each `tasks/*.json`): `todo → in_progress → review →
   changes_requested → done` — one task's journey.
 
@@ -284,6 +306,31 @@ When an agent CLI reports token usage (e.g. Claude via `--output-format json`),
 harn records the per-task total and cost in the task's Review log and in
 `PROGRESS.md`, so you can see what each task cost. Agents that don't expose usage
 simply show nothing.
+
+## UI tasks: design-first + browser verification (Playwright MCP)
+
+For user-facing work harn closes the visual loop end to end:
+
+1. **Design before code** (`[loop] design`, default on). During planning the
+   agent generates a single-file **HTML mockup** of the final interface
+   (`save_design` → `harn_env/design/<task>.html`), you open it in a browser and
+   approve it via the normal question flow (chat/Telegram). The approved mockup
+   becomes the *visual contract* — it is injected into the executor, oracle, and
+   browser-verify prompts.
+2. **Test-writing gate** (`[feedback] require_tests`, default on). A turn that
+   changes code without touching any test file gets ONE "write tests for this"
+   nudge before the work can proceed (once per task — it never loops forever).
+3. **Browser verification** (`[browser]`, default off). After tests + verify
+   pass on a UI task (one with an approved design or the `ui` skill), harn
+   starts your app (`app_cmd`), waits for `app_url`, and runs a dedicated
+   **Playwright turn**: the agent drives the live app like a user — walking each
+   acceptance criterion, comparing against the approved design, saving
+   screenshots to `harn_env/state/screenshots/<task>/` — then harn stops the
+   app. `UI: FAIL` loops the task back for rework; the oracle sees the
+   screenshots as evidence. Enable it and re-run `harn setup` so the
+   `@playwright/mcp` server is added to your agent's MCP config (needs Node.js).
+   If the app isn't reachable, the phase is skipped and logged — it never wedges
+   the loop.
 
 ## Code intelligence — semble + SocratiCode (recommended)
 
@@ -340,6 +387,109 @@ Instead the chat agent *is* the loop: it uses the harn MCP tools
 **you directly in the chat** when unsure. You accept with
 `harn review <id> --approve` (or just tell it to move on). This protocol is
 spelled out in the generated `AGENTS.md` so any agent follows it.
+
+### Connecting harn MCP to Claude (Claude Code & Claude Desktop)
+
+This is how you get harn's full power — clarifying questions, skill capture,
+oracle, socraticode blast-radius — directly inside a Claude chat, without
+running `harn run` separately.
+
+#### Step 1 — run `harn setup` in your project (or check it already ran)
+
+```bash
+cd /path/to/your-project
+harn setup          # scaffolds harn_env/, writes .mcp.json, checks health
+```
+
+This generates `.mcp.json` at the project root (and `.cursor/mcp.json` for
+Cursor). That file is the only thing Claude needs to find the harn server.
+
+#### How the MCP server starts
+
+You don't start it manually. Claude reads `.mcp.json` and **spawns
+`python -m harn mcp` as a stdio subprocess** when the session opens. The
+process lives for the duration of the chat and is killed when it closes.
+`harn_env/` must exist (created by `harn setup`) and be reachable from the
+working directory; the `HARN_ENV_DIR` env-var in `.mcp.json` points to it.
+
+#### Step 2a — Claude Code (CLI / VS Code / JetBrains extension)
+
+`.mcp.json` is picked up **automatically** when you open the project. Verify:
+
+```bash
+claude mcp list     # should show "harn" with status "connected"
+```
+
+If it isn't listed, register it manually once:
+
+```bash
+claude mcp add harn -- python -m harn.mcp_server
+```
+
+Or add to `~/.claude/mcp.json` for all projects:
+
+```json
+{
+  "mcpServers": {
+    "harn": {
+      "command": "python",
+      "args": ["-m", "harn.mcp_server"],
+      "cwd": "/path/to/your-project"
+    }
+  }
+}
+```
+
+#### Step 2b — Claude Desktop
+
+Open `~/Library/Application Support/Claude/claude_desktop_config.json`
+(create it if it doesn't exist) and add:
+
+```json
+{
+  "mcpServers": {
+    "harn": {
+      "command": "python",
+      "args": ["-m", "harn.mcp_server"],
+      "cwd": "/path/to/your-project"
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You'll see a 🔌 icon confirming the server is live.
+
+#### Step 3 — start the optional coordinator (for Telegram escalation)
+
+```bash
+harn watch          # runs in background; escalates unanswered questions to Telegram
+```
+
+Skip this if you're always at the keyboard and don't need Telegram notifications.
+
+#### Step 4 — paste this to Claude to kick off the workflow
+
+```
+You have access to harn MCP tools. Use them for all work in this project:
+1. Call `get_next_task` to pick up the next task from the board.
+2. During planning, call `ask_user` (with `skill=` for any durable standard)
+   before acting on anything ambiguous. Stop after calling it.
+3. Write code, run tests with `run_tests`.
+4. Call `submit_for_review` — harn runs the oracle automatically.
+5. Repeat.
+Read `harn_env/AGENTS.md` for the full protocol.
+```
+
+#### What you get
+
+| Feature | Without MCP | With harn MCP |
+|---|---|---|
+| Clarifying questions → saved as skills | ✗ | ✅ `ask_user(skill=…)` |
+| Oracle (independent second review) | ✗ | ✅ `submit_for_review` |
+| Token savings via socraticode/semble | ✗ | ✅ injected in every planning turn |
+| Design-first UI mockups | ✗ | ✅ `save_design` / `read_design` |
+| Task board & progress log | ✗ | ✅ `board`, `get_next_task` |
+| Telegram escalation | ✗ | ✅ (requires `harn watch`) |
 
 ## Where questions go: chat, Telegram, or both (with escalation)
 
@@ -413,6 +563,21 @@ harn review <id> --changes "переименовать модуль в auth/"
 
 Секреты — в переменных окружения: `HARN_TELEGRAM_BOT_TOKEN`,
 `HARN_TELEGRAM_CHAT_ID`, `HARN_SLACK_WEBHOOK_URL`.
+
+После того как `harn setup` выполнен и MCP подключён к Claude (см. раздел
+[Подключение harn MCP к Claude](#подключение-harn-mcp-к-claude-claude-code-и-claude-desktop)),
+вставьте этот промпт в чат — и Claude будет работать по полному протоколу harn:
+
+> **Используй MCP-инструменты harn для всей работы в этом проекте.**
+> 1. Вызови `get_next_task` — возьми следующую задачу с доски.
+> 2. При планировании вызывай `ask_user` (с `skill=` для любого стандарта —
+>    соглашения по именованию, правила авторизации, подход к тестам, …) перед
+>    любым неоднозначным решением. После вызова останови работу и жди — я отвечу
+>    прямо в этом чате.
+> 3. Пиши код. Запускай `run_tests`. Исправляй до зелёного.
+> 4. Вызови `submit_for_review` — harn автоматически запустит оракула.
+> 5. Повторяй, пока `board` не покажет все задачи выполненными.
+> Прочитай `harn_env/AGENTS.md` — там полный протокол.
 
 ### Идея
 
@@ -524,6 +689,27 @@ todo → in_progress → review ⇄ changes_requested → done
 петля. Для чат-режима (без `harn run`) держите рядом координатор —
 `harn watch` — он и эскалирует вопрос в Telegram после грации.
 
+### UI-задачи: дизайн до кода + проверка в браузере (Playwright MCP)
+
+Для пользовательских интерфейсов harn замыкает визуальный цикл:
+1. **Дизайн до кода** (`[loop] design`, вкл. по умолчанию): на этапе
+   планирования агент генерирует **HTML-мокап** интерфейса
+   (`harn_env/design/<task>.html`), вы открываете его в браузере и утверждаете
+   через обычный канал вопросов. Утверждённый мокап — визуальный контракт для
+   исполнителя, оракула и браузерной проверки.
+2. **Гейт на тесты** (`[feedback] require_tests`, вкл. по умолчанию): ход,
+   меняющий код без тестов, получает один возврат «напиши тесты» (не чаще
+   одного раза на задачу).
+3. **Проверка в браузере** (`[browser]`, выкл. по умолчанию): после тестов и
+   verify на UI-задаче harn сам запускает приложение (`app_cmd`), ждёт
+   `app_url` и даёт агенту отдельный ход через **Playwright MCP**: пройти
+   каждый критерий приёмки как живой пользователь, сравнить с мокапом, сложить
+   скриншоты в `harn_env/state/screenshots/<task>/`. `UI: FAIL` возвращает
+   задачу в доработку; скриншоты видит оракул. Включите и перезапустите
+   `harn setup` — он добавит `@playwright/mcp` в MCP-конфиг агента (нужен
+   Node.js). Недоступное приложение фазу не вешает — она пропускается с записью
+   в лог.
+
 ### Автономный режим (`harn run --auto` / `-a`)
 
 Без человека: вместо ожидания ответа на каждый `ask_user` агент сам исследует
@@ -542,3 +728,106 @@ todo → in_progress → review ⇄ changes_requested → done
 `run_tests` → `submit_for_review`, `board`) и задаёт вопросы **прямо вам в чате**.
 Приёмка — `harn review <id> --approve`. Протокол описан в сгенерированном
 `AGENTS.md`.
+
+### Подключение harn MCP к Claude (Claude Code и Claude Desktop)
+
+Так вы получаете всю мощь harn — уточняющие вопросы, сохранение стандартов в
+скиллы, оракул, socraticode — прямо в чате с Claude, без отдельного запуска
+`harn run`.
+
+#### Шаг 1 — запустите `harn setup` в проекте
+
+```bash
+cd /path/to/your-project
+harn setup          # создаёт harn_env/, пишет .mcp.json, проверяет сервер
+```
+
+В корне проекта появится `.mcp.json` — это всё, что нужно Claude для
+подключения.
+
+#### Как запускается MCP-сервер
+
+Вручную его запускать не нужно. Claude читает `.mcp.json` и **сам запускает
+`python -m harn mcp` как подпроцесс** при открытии сессии. Процесс живёт
+ровно пока открыт чат — потом завершается. Папка `harn_env/` должна
+существовать (её создаёт `harn setup`); путь к ней прописан в переменной
+`HARN_ENV_DIR` внутри `.mcp.json`.
+
+#### Шаг 2a — Claude Code (CLI / расширение VS Code / JetBrains)
+
+`.mcp.json` подхватывается **автоматически**. Проверьте:
+
+```bash
+claude mcp list     # должен показать "harn" — connected
+```
+
+Если не подхватился — зарегистрируйте вручную:
+
+```bash
+claude mcp add harn -- python -m harn.mcp_server
+```
+
+Или добавьте в `~/.claude/mcp.json` глобально (для всех проектов):
+
+```json
+{
+  "mcpServers": {
+    "harn": {
+      "command": "python",
+      "args": ["-m", "harn.mcp_server"],
+      "cwd": "/path/to/your-project"
+    }
+  }
+}
+```
+
+#### Шаг 2b — Claude Desktop
+
+Откройте `~/Library/Application Support/Claude/claude_desktop_config.json`
+(создайте, если нет) и добавьте:
+
+```json
+{
+  "mcpServers": {
+    "harn": {
+      "command": "python",
+      "args": ["-m", "harn.mcp_server"],
+      "cwd": "/path/to/your-project"
+    }
+  }
+}
+```
+
+Перезапустите Claude Desktop — появится значок 🔌.
+
+#### Шаг 3 — запустите координатор (опционально, для Telegram)
+
+```bash
+harn watch          # эскалирует неотвеченные вопросы в Telegram
+```
+
+Можно пропустить, если вы всегда рядом и уведомления не нужны.
+
+#### Шаг 4 — вставьте в чат с Claude, чтобы начать работу
+
+```
+У тебя есть MCP-инструменты harn. Используй их для всей работы в этом проекте:
+1. Вызови `get_next_task` — возьми следующую задачу с доски.
+2. При планировании вызывай `ask_user` (с `skill=` для любого стандарта)
+   перед любым неоднозначным решением. После вызова остановись.
+3. Пиши код, запускай тесты через `run_tests`.
+4. Вызови `submit_for_review` — harn автоматически запустит оракула.
+5. Повторяй.
+Прочитай `harn_env/AGENTS.md` — там полный протокол.
+```
+
+#### Что вы получаете
+
+| Возможность | Без MCP | С harn MCP |
+|---|---|---|
+| Уточняющие вопросы → сохраняются в скиллы | ✗ | ✅ `ask_user(skill=…)` |
+| Оракул (независимая проверка) | ✗ | ✅ `submit_for_review` |
+| Экономия токенов через socraticode/semble | ✗ | ✅ инжектируется при планировании |
+| Дизайн UI до кода | ✗ | ✅ `save_design` / `read_design` |
+| Доска задач и лог прогресса | ✗ | ✅ `board`, `get_next_task` |
+| Эскалация в Telegram | ✗ | ✅ (требует `harn watch`) |

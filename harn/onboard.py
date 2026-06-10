@@ -132,7 +132,13 @@ as a structured dialog (one question at a time), and STOP and ask the human via
 3. **Capture standards** — for each of security, testing, frontend/UI, API,
    code style: ask `ask_user(question, skill="<that skill>")` so the answer is
    saved into the skill automatically. These drive every later decision.
-4. **Confirm the picture** with the human, then create the first tasks
+4. **Set up verification** in `harn_env/harn.toml`:
+   - the test command → `[feedback] test_cmd` (e.g. "pytest -q", "npm test");
+   - if the project has a web UI: ask how to start it and where it answers,
+     then fill `[browser] enabled/app_cmd/app_url` so harn can verify UI tasks
+     in a real browser (Playwright MCP), and tell the human to re-run
+     `harn setup` once so the Playwright MCP server is wired in.
+5. **Confirm the picture** with the human, then create the first tasks
    (`create_task`).
 
 Do not start implementation until the PRD + key skills are filled and confirmed.

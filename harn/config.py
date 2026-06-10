@@ -36,10 +36,13 @@ DEFAULTS: dict = {
     # whichever one runs next understands what's done and what's planned.
     "harn": {"agent": "claude", "agents": [], "project": "prj001",
              "autonomy": 0.7, "require_mcp": True},
-    "feedback": {"test_cmd": ""},
+    "feedback": {"test_cmd": "", "require_tests": True},
     "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
              "auto": False, "auto_max_iterations": 30,
-             "planning": True, "oracle": True, "oracle_agent": ""},
+             "planning": True, "oracle": True, "oracle_agent": "",
+             "design": True},
+    "browser": {"enabled": False, "app_cmd": "", "app_url": "",
+                "ready_timeout_s": 60},
     "code_search": {"semble": True, "socraticcode": True},
     "notify": {"idle_minutes": 30, "wait_for_reply": True, "wait_timeout_minutes": 0,
                "channel": "both", "chat_grace_minutes": 5},
@@ -56,6 +59,9 @@ class Config:
     autonomy: float = 0.7
     require_mcp: bool = True   # setup/doctor insist the MCP server is enabled
     test_cmd: str = ""
+    # Test-writing gate: when a turn changes code but adds/changes no tests,
+    # feed back one "add tests" nudge before the work can proceed to verify.
+    require_tests: bool = True
     max_iterations: int = 10
     loop_aware: bool = True
     verify: bool = True
@@ -71,6 +77,16 @@ class Config:
     # whether the work actually solves the problem and flags technical debt.
     oracle: bool = True
     oracle_agent: str = ""   # empty = same as main agent
+    # Design turn: for user-facing tasks, planning generates an HTML mockup
+    # (harn_env/design/<task_id>.html) and confirms it with the human BEFORE
+    # implementation; executor/oracle then build/verify against it.
+    design: bool = True
+    # Browser verification: after tests+verify pass, drive the real app through
+    # the Playwright MCP server and check the acceptance criteria in the UI.
+    browser_enabled: bool = False
+    app_cmd: str = ""              # how to start the app; empty = already running
+    app_url: str = ""              # where the app answers, e.g. http://localhost:3000
+    ready_timeout_s: int = 60      # how long to wait for app_url after app_cmd
     idle_minutes: int = 30
     wait_for_reply: bool = True
     wait_timeout_minutes: int = 0
@@ -111,6 +127,7 @@ class Config:
             ),
             require_mcp=bool(data["harn"].get("require_mcp", True)),
             test_cmd=data["feedback"].get("test_cmd", ""),
+            require_tests=bool(data["feedback"].get("require_tests", True)),
             max_iterations=int(data["loop"].get("max_iterations", 10)),
             loop_aware=bool(data["loop"].get("loop_aware", True)),
             verify=bool(data["loop"].get("verify", True)),
@@ -121,6 +138,11 @@ class Config:
             planning=bool(data["loop"].get("planning", True)),
             oracle=bool(data["loop"].get("oracle", False)),
             oracle_agent=str(data["loop"].get("oracle_agent", "") or "").strip(),
+            design=bool(data["loop"].get("design", True)),
+            browser_enabled=bool(data["browser"].get("enabled", False)),
+            app_cmd=str(data["browser"].get("app_cmd", "") or "").strip(),
+            app_url=str(data["browser"].get("app_url", "") or "").strip(),
+            ready_timeout_s=int(data["browser"].get("ready_timeout_s", 60)),
             idle_minutes=int(data["notify"].get("idle_minutes", 30)),
             wait_for_reply=bool(data["notify"].get("wait_for_reply", True)),
             wait_timeout_minutes=int(data["notify"].get("wait_timeout_minutes", 0)),

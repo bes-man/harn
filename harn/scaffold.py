@@ -62,6 +62,13 @@ def _mcp_servers(project_root: Path) -> dict:
         cfg = Config()
     servers: dict = {"harn": _mcp_command()}
     servers.update(semble_bridge.mcp_servers(cfg))
+    # Browser verification drives the live app through the Playwright MCP
+    # server. Enable via [browser] in harn.toml, then re-run `harn setup`.
+    if cfg.browser_enabled:
+        servers["playwright"] = {
+            "command": "npx",
+            "args": ["-y", "@playwright/mcp@latest"],
+        }
     return servers
 
 
@@ -161,7 +168,7 @@ def setup(project_root: Path) -> dict:
 
     # A new project starts with EMPTY tasks/ and prd/ — no demo content. The
     # agent fills them during onboarding; samples live in harn_example/.
-    for sub in ("state", "tasks", "prd"):
+    for sub in ("state", "tasks", "prd", "design"):
         (env_dir / sub).mkdir(exist_ok=True)
 
     agent_cfgs, root_paths = _write_agent_configs(project_root)

@@ -13,9 +13,9 @@ to the file so context travels with the task to any future agent.
 ```mermaid
 stateDiagram-v2
     [*] --> todo: you add a task
-    todo --> in_progress: harn picks it up
-    in_progress --> in_progress: tests fail → agent retries
-    in_progress --> review: tests pass → submitted
+    todo --> in_progress: harn picks it up<br/>(planning: criteria + UI mockup approved first)
+    in_progress --> in_progress: tests fail / no tests written /<br/>verify gaps / UI: FAIL → agent retries
+    in_progress --> review: tests + verify + browser pass → submitted
     review --> changes_requested: you leave comments
     changes_requested --> in_progress: agent reworks
     review --> done: you accept (+ notes for future agents)
@@ -62,6 +62,13 @@ sequenceDiagram
             Loop->>Loop: record answer · resume task
         else Tests fail
             Loop->>Loop: keep in_progress · loop to fix
+        else Code changed without tests
+            Loop->>Loop: one "write tests" nudge · loop
+        else UI task ([browser] enabled)
+            Loop->>Loop: start app_cmd · wait for app_url
+            Adapter->>Agent: UI-verify turn (Playwright MCP)
+            Agent->>Agent: walk criteria in the live app ·<br/>compare vs design mockup · screenshots
+            Loop->>Loop: UI: FAIL → rework · UI: PASS → continue
         else Turn done + tests pass
             Loop->>Loop: status = review · submit
             Loop->>TG: 👀 review request (wait_for_reply)
@@ -85,7 +92,7 @@ sequenceDiagram
 
 ## Phases vs. task statuses
 
-- **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING → BLOCKED →
-  REVIEW → DONE` — the overall run.
+- **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING →
+  VERIFYING → UI_VERIFYING → BLOCKED → REVIEW → DONE` — the overall run.
 - **Task status** (each `tasks/*.json`): `todo → in_progress → review →
   changes_requested → done` — one task's journey.

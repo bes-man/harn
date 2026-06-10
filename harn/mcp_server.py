@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import design as design_mod
 from . import progress as progress_mod
 from . import skills as skills_mod
 from . import state as state_mod
@@ -262,6 +263,34 @@ def build_server():
             "Question recorded (BLOCKED). `harn watch` / the loop will route it to "
             "the user (chat → Telegram). STOP now; resume when it's answered."
         )
+
+    @mcp.tool()
+    def save_design(task_id: str, html: str) -> str:
+        """Save the UI mockup for a task — the visual contract agreed BEFORE
+        implementation. Call during the planning phase of any user-facing task.
+
+        `html` must be a SINGLE self-contained static HTML file (inline CSS, no
+        external assets, realistic sample data) showing the final interface,
+        including every state the acceptance criteria mention (empty, error,
+        success…). It is written to ``harn_env/design/<task_id>.html``; the
+        human opens it in a browser to approve. After approval the executor
+        builds to it and the verification phases (oracle + Playwright browser
+        pass) check the real UI against it. Saving again overwrites — iterate
+        until the human approves via `ask_user`."""
+        t = tasks_mod.find(_env_dir(), task_id)
+        if t is None:
+            return f"(task '{task_id}' not found)"
+        p = design_mod.save(_env_dir(), task_id, html)
+        _log(f"{task_id}: design mockup saved ({len(html)} chars)")
+        return (f"Design saved to {p}. Ask the human to open it in a browser "
+                "and confirm via `ask_user` before implementation starts.")
+
+    @mcp.tool()
+    def read_design(task_id: str) -> str:
+        """Return the approved UI mockup (HTML) for a task, or a note if none
+        exists. Read it before implementing or verifying user-facing work."""
+        html = design_mod.load(_env_dir(), task_id)
+        return html if html is not None else f"(no design for '{task_id}')"
 
     @mcp.tool()
     def run_tests() -> str:
