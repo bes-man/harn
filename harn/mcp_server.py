@@ -270,32 +270,25 @@ def build_server():
         escalation). This tool does NOT display anything to the human by
         itself — its arguments are collapsed in the chat UI.
 
-        ⚠️ PRESENTATION ORDER — surface the question in your host's NATIVE
-        planning UI FIRST (so the human gets clickable choices, not buried tool
-        args), THEN call this tool to persist it. Same turn, then STOP.
+        ⚠️ PRESENTATION ORDER — surface the question in an INTERACTIVE UI the
+        human can click FIRST (not buried tool args), THEN call this tool to
+        persist it. Same turn, then STOP.
 
-        **Claude Code**: call the native `AskUserQuestion` tool — it renders
-        interactive clickable option buttons. Then call this tool.
+        **Use your client's native interactive-question / planning capability.**
+        Check your own tool list — you know your runtime better than this text:
+        - **Claude Code** → the `AskUserQuestion` tool (clickable option buttons).
+        - **Cursor** → present the choice via Cursor's interactive question /
+          plan capability so the human gets selectable options. Cursor agents
+          CAN surface a clarifying-question dialog with selectable options
+          during agent mode — use it. Planning/clarifying questions are the
+          first-class path; prefer it over plain prose. (User shortcut to force
+          Plan Mode: `Shift+Tab`.)
+        - **Codex** → use Plan Mode's clarifying-question flow (`/plan` or
+          `Shift+Tab`) the same way.
 
-        **Cursor**: Cursor's Plan Mode IS the planning UI — it natively shows
-        clarifying questions as an interactive dialog. The user enters it with
-        `Shift+Tab`. If you are NOT already in a plan (no plan file is being
-        built), tell the user once: "For the best Q&A experience, press
-        Shift+Tab to enter Plan Mode." Then phrase your questions as numbered
-        clarifying questions (Cursor renders these in its plan dialog). There is
-        no agent-callable question tool in Cursor's agent mode — Plan Mode is
-        the supported path.
-
-        **Codex**: same model — Codex Plan Mode (`/plan` or `Shift+Tab`) is the
-        native planning UI that asks clarifying questions. Tell the user to
-        enable it once if questions are coming, then ask numbered questions.
-
-        **Headless (no human at the keyboard)**: set `channel = "telegram"` in
-        harn.toml; this tool routes the question straight to Telegram.
-
-        FALLBACK for any chat agent without an active plan/native dialog: render
-        a visible markdown block so the human sees it without expanding tool
-        args:
+        If — and only if — your runtime genuinely exposes NO interactive
+        question UI, fall back to a visible markdown block so the human still
+        sees it without expanding tool args:
         ```
         ---
         ❓ **[Topic]** — [one-line context]
@@ -304,6 +297,9 @@ def build_server():
         ✅ Recommendation: **(a)** — [reason].  Reply (a)/(b) or your own.
         ---
         ```
+
+        **Headless (no human at the keyboard)**: set `channel = "telegram"` in
+        harn.toml; this tool routes the question straight to Telegram.
 
         In ALL cases: call this tool to persist the question (enables Telegram
         escalation + skill capture). When the human answers, call

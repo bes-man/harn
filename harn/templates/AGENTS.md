@@ -37,22 +37,23 @@ was asked.
      via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
      `oracle_debt` entry and **relay the verdict to me in the chat**. If
      `oracle_fail`, the task is back in `changes_requested` — rework it.
-  5. **Questions:** when something is ambiguous, surface it in your host's
-     NATIVE planning UI first, then persist it:
-     - **Claude Code** — call the native `AskUserQuestion` tool (interactive
-       clickable option buttons). Include 2–4 options + your recommendation.
-     - **Cursor** — use Plan Mode (the user enters it with `Shift+Tab`); it
-       renders clarifying questions as an interactive dialog. If no plan is
-       active, tell the user once to press Shift+Tab, then ask numbered
-       clarifying questions. Cursor has no agent-callable question tool — Plan
-       Mode is the path.
-     - **Codex** — Plan Mode (`/plan` or `Shift+Tab`), same as Cursor.
+  5. **Questions:** when something is ambiguous, surface it in your client's
+     NATIVE interactive-question UI first (check your own tool list — you know
+     your runtime better than this doc), then persist it:
+     - **Claude Code** — call the native `AskUserQuestion` tool (clickable
+       option buttons). Include 2–4 options + your recommendation.
+     - **Cursor** — present the choice via Cursor's interactive question / Plan
+       Mode capability so the human gets selectable options; agents can surface
+       this in agent mode. (User shortcut to force Plan Mode: `Shift+Tab`.)
+     - **Codex** — Plan Mode clarifying-question flow (`/plan` or `Shift+Tab`).
+     - **No interactive UI** — fall back to a visible markdown block (options +
+       recommendation) so the human sees it without expanding tool args.
      - **Then** — call harn's `ask_user(question, skill=…)` to record the
        question and enable Telegram escalation. Stop after calling it.
      - **When the human answers** — call `answer_question(answer=…)` to persist
        it into the skill, then continue.
      Never guess. Never ask with collapsed tool args only — the human must see
-     the question in the planning UI or visible chat.
+     the question in an interactive UI or visible chat.
 
   `harn watch` starts **automatically** when the MCP server connects — do NOT
   ask the user to run it. It handles Telegram escalation, oracle, and live

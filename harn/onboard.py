@@ -122,15 +122,17 @@ _ONBOARD_BRIEF = """\
 harn knows nothing about this project yet, and is useless until it does. Do this
 as a structured dialog (one question at a time) — do not invent answers.
 
-**How to ask every question** — use the host's NATIVE planning UI, then STOP:
-- **Claude Code**: call native `AskUserQuestion` (clickable buttons), then
-  `ask_user(question, skill=…)` to persist.
-- **Cursor**: Plan Mode is the planning UI (`Shift+Tab`). If not in a plan,
-  tell the user once to press Shift+Tab, then ask numbered clarifying
-  questions; persist with `ask_user(question, skill=…)`.
-- **Codex**: Plan Mode (`/plan` or `Shift+Tab`) — same as Cursor.
+**How to ask every question** — use your client's NATIVE interactive question
+UI (check your own tool list), then persist + STOP:
+- **Claude Code**: call native `AskUserQuestion` (clickable buttons).
+- **Cursor**: present the choice via Cursor's interactive question / Plan Mode
+  capability (selectable options — agents can surface this in agent mode; user
+  shortcut `Shift+Tab`).
+- **Codex**: Plan Mode clarifying-question flow (`/plan` or `Shift+Tab`).
+- **No interactive UI**: visible markdown block (options + recommendation).
 - **Headless**: `ask_user` only — routes straight to Telegram.
-After the human answers: call `answer_question(answer=…)` to save to skill.
+Always persist with `ask_user(question, skill=…)`. After the human answers,
+call `answer_question(answer=…)` to save to skill.
 `harn watch` starts automatically — do NOT ask the user to run it.
 
 1. **Read what exists first** (cheap before asking): the auto-detected stack
