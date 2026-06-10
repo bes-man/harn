@@ -270,31 +270,40 @@ def build_server():
         escalation). This tool does NOT display anything to the human by
         itself — its arguments are collapsed in the chat UI.
 
-        ⚠️ PRESENTATION ORDER — do this in the SAME turn, then STOP:
+        ⚠️ PRESENTATION ORDER — surface the question in your host's NATIVE
+        planning UI FIRST (so the human gets clickable choices, not buried tool
+        args), THEN call this tool to persist it. Same turn, then STOP.
 
-        **Claude Code**: call the native `AskUserQuestion` tool FIRST
-        (renders interactive clickable option buttons). Then call this tool.
+        **Claude Code**: call the native `AskUserQuestion` tool — it renders
+        interactive clickable option buttons. Then call this tool.
 
-        **Cursor / other chat agents**: render a visible markdown dialog FIRST,
-        then call this tool:
+        **Cursor**: Cursor's Plan Mode IS the planning UI — it natively shows
+        clarifying questions as an interactive dialog. The user enters it with
+        `Shift+Tab`. If you are NOT already in a plan (no plan file is being
+        built), tell the user once: "For the best Q&A experience, press
+        Shift+Tab to enter Plan Mode." Then phrase your questions as numbered
+        clarifying questions (Cursor renders these in its plan dialog). There is
+        no agent-callable question tool in Cursor's agent mode — Plan Mode is
+        the supported path.
+
+        **Codex**: same model — Codex Plan Mode (`/plan` or `Shift+Tab`) is the
+        native planning UI that asks clarifying questions. Tell the user to
+        enable it once if questions are coming, then ask numbered questions.
+
+        **Headless (no human at the keyboard)**: set `channel = "telegram"` in
+        harn.toml; this tool routes the question straight to Telegram.
+
+        FALLBACK for any chat agent without an active plan/native dialog: render
+        a visible markdown block so the human sees it without expanding tool
+        args:
         ```
         ---
-        ❓ **[Topic]**
-        [One-line context]
-
-        | | Option | Trade-off |
-        |---|---|---|
-        | **(a)** | … | … |
-        | **(b)** | … | … |
-
-        ✅ Recommendation: **(a)** — [reason]
-        Reply with **(a)**, **(b)**, or your own answer.
+        ❓ **[Topic]** — [one-line context]
+        - **(a)** … — trade-off
+        - **(b)** … — trade-off
+        ✅ Recommendation: **(a)** — [reason].  Reply (a)/(b) or your own.
         ---
         ```
-
-        **Codex / headless**: skip chat presentation; this tool routes the
-        question to Telegram immediately (set `channel = "telegram"` in
-        harn.toml for headless use).
 
         In ALL cases: call this tool to persist the question (enables Telegram
         escalation + skill capture). When the human answers, call

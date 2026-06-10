@@ -37,18 +37,22 @@ was asked.
      via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
      `oracle_debt` entry and **relay the verdict to me in the chat**. If
      `oracle_fail`, the task is back in `changes_requested` — rework it.
-  5. **Questions:** when something is ambiguous, follow this exact sequence:
-     - **First** — call the native `AskUserQuestion` tool (Claude Code UI).
-       This opens an interactive planning dialog with clickable option buttons
-       — the human sees it immediately and can click without typing. Include
-       2–4 options and mark your recommendation. This is the ONLY acceptable
-       way to ask — plain chat text is not enough.
+  5. **Questions:** when something is ambiguous, surface it in your host's
+     NATIVE planning UI first, then persist it:
+     - **Claude Code** — call the native `AskUserQuestion` tool (interactive
+       clickable option buttons). Include 2–4 options + your recommendation.
+     - **Cursor** — use Plan Mode (the user enters it with `Shift+Tab`); it
+       renders clarifying questions as an interactive dialog. If no plan is
+       active, tell the user once to press Shift+Tab, then ask numbered
+       clarifying questions. Cursor has no agent-callable question tool — Plan
+       Mode is the path.
+     - **Codex** — Plan Mode (`/plan` or `Shift+Tab`), same as Cursor.
      - **Then** — call harn's `ask_user(question, skill=…)` to record the
-       question in harn state and enable Telegram escalation if the human is
-       away. Stop after calling it.
-     - **When the human clicks/replies** — call `answer_question(answer=…)`
-       to persist the answer into the skill automatically, then continue.
-     Never guess. Never ask with plain text only.
+       question and enable Telegram escalation. Stop after calling it.
+     - **When the human answers** — call `answer_question(answer=…)` to persist
+       it into the skill, then continue.
+     Never guess. Never ask with collapsed tool args only — the human must see
+     the question in the planning UI or visible chat.
 
   `harn watch` starts **automatically** when the MCP server connects — do NOT
   ask the user to run it. It handles Telegram escalation, oracle, and live
