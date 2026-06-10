@@ -52,11 +52,17 @@ Claude Code, Codex). Paste this to your agent in the project:
 Once `harn setup` is done and the MCP server is connected, paste this to start
 working on any task:
 
-> **Use harn MCP tools for all work in this project.**
+> **First, confirm your harn MCP tools are loaded** — you must see `ask_user`,
+> `answer_question`, `get_next_task` in your tool list. If any are missing,
+> stop and tell me so I can fix the connection before we continue.
+>
+> **Use harn MCP tools for all work in this project. Never ask questions as
+> plain chat text** — always use `ask_user(question, skill=…)` so answers are
+> saved to skills automatically.
 > 1. Call `get_next_task` to pick up the next task from the board.
-> 2. During planning, call `ask_user` (pass `skill=` for any durable standard —
->    naming conventions, auth rules, test approach, …) before acting on anything
->    ambiguous. Stop and wait after calling it — I will answer in this chat.
+> 2. During planning, call `ask_user(question, skill=…)` before acting on
+>    anything ambiguous. Stop after calling it — I will answer in this chat,
+>    then you call `answer_question(answer=…)` to record it and continue.
 > 3. Write code. Run `run_tests`. Fix until green.
 > 4. Call `submit_for_review` — harn runs the oracle automatically.
 > 5. Repeat until `board` shows all tasks done.
@@ -568,12 +574,17 @@ harn review <id> --changes "переименовать модуль в auth/"
 [Подключение harn MCP к Claude](#подключение-harn-mcp-к-claude-claude-code-и-claude-desktop)),
 вставьте этот промпт в чат — и Claude будет работать по полному протоколу harn:
 
-> **Используй MCP-инструменты harn для всей работы в этом проекте.**
+> **Сначала убедись, что MCP-инструменты harn загружены** — в твоём списке
+> инструментов должны быть `ask_user`, `answer_question`, `get_next_task`.
+> Если их нет — скажи мне, я проверю подключение.
+>
+> **Используй MCP-инструменты harn для всей работы. Никогда не задавай
+> вопросы текстом в чате** — всегда через `ask_user(question, skill=…)`,
+> чтобы ответы автоматически сохранялись в скиллы.
 > 1. Вызови `get_next_task` — возьми следующую задачу с доски.
-> 2. При планировании вызывай `ask_user` (с `skill=` для любого стандарта —
->    соглашения по именованию, правила авторизации, подход к тестам, …) перед
->    любым неоднозначным решением. После вызова останови работу и жди — я отвечу
->    прямо в этом чате.
+> 2. При планировании вызывай `ask_user(question, skill=…)` перед любым
+>    неоднозначным решением. После вызова стоп — я отвечу в чате, потом ты
+>    вызываешь `answer_question(answer=…)` и продолжаешь.
 > 3. Пиши код. Запускай `run_tests`. Исправляй до зелёного.
 > 4. Вызови `submit_for_review` — harn автоматически запустит оракула.
 > 5. Повторяй, пока `board` не покажет все задачи выполненными.

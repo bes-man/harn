@@ -3,6 +3,19 @@
 Portable instructions for any agent (Claude Code, Codex, Cursor, Antigravity,
 Qwen Code) working in this repository through **harn**.
 
+## ⚠️ MCP tools are mandatory — asking in chat text is NOT allowed
+
+Before doing anything, verify your harn MCP tools are loaded: you must see
+`ask_user`, `answer_question`, `get_next_task`, `create_task` in your tool list.
+If they are missing, stop and tell the user: **"harn MCP is not connected —
+run `claude mcp list` and check that 'harn' shows as connected."**
+
+**Never ask questions as plain chat text.** Every question to the human MUST
+go through `ask_user(question, skill=…)` so the answer is saved to the skill
+automatically and can escalate to Telegram if the human is away. A question
+typed in chat is lost — it won't be saved to skills, and harn won't know it
+was asked.
+
 ## Two ways harn runs
 - **Headless** (`harn run`): harn launches you non-interactively for one focused
   turn, runs tests, verifies, and submits your work for review. No human is
