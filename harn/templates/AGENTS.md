@@ -10,11 +10,20 @@ Before doing anything, verify your harn MCP tools are loaded: you must see
 If they are missing, stop and tell the user: **"harn MCP is not connected —
 run `claude mcp list` and check that 'harn' shows as connected."**
 
-**Never ask questions as plain chat text.** Every question to the human MUST
-go through `ask_user(question, skill=…)` so the answer is saved to the skill
-automatically and can escalate to Telegram if the human is away. A question
-typed in chat is lost — it won't be saved to skills, and harn won't know it
-was asked.
+**Never put a choice to the human as trailing chat prose.** This applies to
+EVERY decision you hand to the user — not just clarifying questions:
+- clarifying an ambiguous requirement,
+- "should I start PRJ-030 now, or commit the current changes first?",
+- "which approach do you want — A or B?",
+- "ready to proceed / anything to adjust?".
+
+ANY time you would end a turn with a question that has options, present it via
+your client's NATIVE interactive-question UI (Claude Code `AskUserQuestion`;
+Cursor/Codex Plan Mode) so the human gets clickable choices. If the question is
+about an ambiguous requirement or a durable standard, ALSO call
+`ask_user(question, skill=…)` so the answer is captured into a skill and can
+escalate to Telegram. A question typed as plain prose is a bug: easy to miss,
+never saved, and harn doesn't know it was asked.
 
 ## Two ways harn runs
 - **Headless** (`harn run`): harn launches you non-interactively for one focused
