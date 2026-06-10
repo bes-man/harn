@@ -418,18 +418,28 @@ process lives for the duration of the chat and is killed when it closes.
 `harn_env/` must exist (created by `harn setup`) and be reachable from the
 working directory; the `HARN_ENV_DIR` env-var in `.mcp.json` points to it.
 
-#### Step 2a — Claude Code (CLI / VS Code / JetBrains extension)
+#### Step 2a — Claude Code (desktop app / VS Code / JetBrains extension)
 
-`.mcp.json` is picked up **automatically** when you open the project. Verify:
+`.mcp.json` is picked up **automatically** when you open the project folder.
+Verify it exists and contains harn:
 
 ```bash
-claude mcp list     # should show "harn" with status "connected"
+cat .mcp.json      # should list "harn", "semble", "socraticode"
 ```
 
-If it isn't listed, register it manually once:
+In Claude Code's UI you'll see a 🔌 plug icon or the tool count increase when
+MCP servers connect. If harn tools (`ask_user`, `get_next_task`) are not
+available in the session, check:
+- You opened the folder that contains `.mcp.json` (not a parent folder)
+- `harn_env/` exists in that folder
+- The Python path in `.mcp.json` matches your environment (`which python3`)
+
+To fix the Python path in `.mcp.json`:
 
 ```bash
-claude mcp add harn -- python -m harn.mcp_server
+# Replace the python path with your actual interpreter:
+python3 -c "import sys; print(sys.executable)"
+# then edit .mcp.json accordingly
 ```
 
 Or add to `~/.claude/mcp.json` for all projects:
@@ -438,8 +448,8 @@ Or add to `~/.claude/mcp.json` for all projects:
 {
   "mcpServers": {
     "harn": {
-      "command": "python",
-      "args": ["-m", "harn.mcp_server"],
+      "command": "python3",
+      "args": ["-m", "harn", "mcp"],
       "cwd": "/path/to/your-project"
     }
   }
@@ -766,16 +776,22 @@ harn setup          # создаёт harn_env/, пишет .mcp.json, прове
 
 #### Шаг 2a — Claude Code (CLI / расширение VS Code / JetBrains)
 
-`.mcp.json` подхватывается **автоматически**. Проверьте:
+`.mcp.json` подхватывается **автоматически** при открытии папки проекта.
+Проверьте что файл существует и содержит harn:
 
 ```bash
-claude mcp list     # должен показать "harn" — connected
+cat .mcp.json      # должны быть "harn", "semble", "socraticode"
 ```
 
-Если не подхватился — зарегистрируйте вручную:
+В интерфейсе Claude Code появится значок 🔌 или увеличится счётчик инструментов.
+Если инструменты harn (`ask_user`, `get_next_task`) недоступны — проверьте:
+- Открыта именно папка с `.mcp.json`, а не родительская
+- `harn_env/` существует в этой папке
+- Python-путь в `.mcp.json` совпадает с вашим окружением:
 
 ```bash
-claude mcp add harn -- python -m harn.mcp_server
+python3 -c "import sys; print(sys.executable)"
+# вставьте результат в .mcp.json как "command"
 ```
 
 Или добавьте в `~/.claude/mcp.json` глобально (для всех проектов):
@@ -784,8 +800,8 @@ claude mcp add harn -- python -m harn.mcp_server
 {
   "mcpServers": {
     "harn": {
-      "command": "python",
-      "args": ["-m", "harn.mcp_server"],
+      "command": "python3",
+      "args": ["-m", "harn", "mcp"],
       "cwd": "/path/to/your-project"
     }
   }
