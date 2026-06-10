@@ -37,12 +37,28 @@ was asked.
      via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
      `oracle_debt` entry and **relay the verdict to me in the chat**. If
      `oracle_fail`, the task is back in `changes_requested` — rework it.
-  5. **Questions:** when something is ambiguous, call `ask_user(question,
-     skill=...)` and **stop**. Do not continue until the answer is recorded.
-     Then wait for the user to reply in this chat. As soon as they do, call
-     `answer_question(answer=<their reply>)` — this clears the block, saves
-     the answer into the skill, and signals `harn watch` that escalation is no
-     longer needed. Only then continue the task. Never guess.
+  5. **Questions:** when something is ambiguous, follow this exact sequence:
+     - **First** — write the question as regular chat text so the human sees it
+       immediately (don't bury it inside a tool call). Format it clearly:
+       ```
+       ---
+       ❓ **[Topic]**
+
+       [Context — why the question arose]
+
+       Options:
+       - **(a)** … — trade-off
+       - **(b)** … — trade-off
+
+       My recommendation: **(a)** because …
+       ---
+       ```
+     - **Then** — call `ask_user(question, skill=…)` to record it in harn and
+       enable Telegram escalation. **Stop after the call.**
+     - **When the human replies in chat** — call `answer_question(answer=…)`
+       to record the answer into the skill, then continue.
+     Never guess. Never skip the chat-text step — tool call arguments are
+     collapsed by default and the human may not see them.
 
   ⚠️ For Telegram escalation to work in chat mode, **`harn watch` must be
   running** in a terminal. It detects the block, waits `chat_grace_minutes`
