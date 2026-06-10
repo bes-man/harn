@@ -120,8 +120,15 @@ _ONBOARD_BRIEF = """\
 ## ONBOARDING — build the project picture before any task
 
 harn knows nothing about this project yet, and is useless until it does. Do this
-as a structured dialog (one question at a time), and STOP and ask the human via
-`ask_user` — do not invent answers.
+as a structured dialog (one question at a time) — do not invent answers.
+
+**How to ask every question** (three steps, same turn):
+1. Show it to the human via the native `AskUserQuestion` tool (interactive
+   option buttons in Claude Code). No such tool → write it as plain chat text.
+2. Persist it with harn's `ask_user(question, skill=…)`.
+3. After the human answers, record it with `answer_question(answer=…)`.
+Never rely on the `ask_user` tool call alone — its arguments are collapsed in
+the chat UI and the human will not see the question.
 
 1. **Read what exists first** (cheap before asking): the auto-detected stack
    above, the repo's README / docs ({docs}), and use code search

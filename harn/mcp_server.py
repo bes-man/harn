@@ -230,12 +230,22 @@ def build_server():
 
     @mcp.tool()
     def ask_user(question: str, skill: str = "") -> str:
-        """Ask the human a clarifying question when something is ambiguous,
-        risky, or you're unsure. This pauses the loop, notifies the user
-        (Telegram/Slack), and waits for `harn answer`. STOP after calling.
+        """Record a clarifying question in harn (BLOCKED state + Telegram
+        escalation). This tool does NOT display anything to the human by
+        itself — its arguments are collapsed in the chat UI.
 
-        Write the question EXPANDED, not one terse line, so the human can decide
-        fast without digging into the code:
+        ⚠️ PRESENTATION ORDER — do this in the SAME turn:
+        1. If your client has a native interactive question tool
+           (`AskUserQuestion` in Claude Code — clickable option buttons),
+           call IT first with the same options. That is what the human sees
+           and clicks. If there is no such tool, write the question as plain
+           chat text FIRST (context + options + recommendation), THEN call this.
+        2. Call this tool to persist the question (state + skill routing +
+           Telegram escalation when the human is away).
+        3. When the human answers (click or text), call `answer_question`
+           with their reply, then continue.
+
+        Write `question` EXPANDED, not one terse line:
           1. Context — what you were doing and WHY this question came up.
           2. Options — the 2-3 concrete choices, with the trade-off of each.
           3. Recommendation — the option you'd pick and a one-line reason.
@@ -261,9 +271,10 @@ def build_server():
         # card with escalation — we don't send a one-way push here.
         return (
             "Question recorded (BLOCKED). `harn watch` will route it to the user "
-            "(waits chat_grace_minutes, then escalates to Telegram). STOP now — "
-            "resume only after the user answers in this chat and you call "
-            "`answer_question` with their reply."
+            "(waits chat_grace_minutes, then escalates to Telegram). If you have "
+            "NOT yet shown the question to the human (native AskUserQuestion tool "
+            "or plain chat text), do it NOW in this same turn. Then STOP — resume "
+            "only after the user answers and you call `answer_question`."
         )
 
     @mcp.tool()
