@@ -260,9 +260,34 @@ def build_server():
         # `harn watch` (or the run loop) turns this into an interactive Telegram
         # card with escalation — we don't send a one-way push here.
         return (
-            "Question recorded (BLOCKED). `harn watch` / the loop will route it to "
-            "the user (chat → Telegram). STOP now; resume when it's answered."
+            "Question recorded (BLOCKED). `harn watch` will route it to the user "
+            "(waits chat_grace_minutes, then escalates to Telegram). STOP now — "
+            "resume only after the user answers in this chat and you call "
+            "`answer_question` with their reply."
         )
+
+    @mcp.tool()
+    def answer_question(answer: str) -> str:
+        """Record the human's answer to the last `ask_user` question.
+
+        Call this immediately after the user answers your question IN THIS CHAT,
+        before continuing with any work. This clears the BLOCKED state, saves the
+        answer to ANSWERS.md, promotes it into the skill (if the question had
+        `skill=`), and lets `harn watch` know escalation is no longer needed.
+
+        Workflow:
+          1. You called `ask_user(...)` and stopped.
+          2. The user replied here in the chat.
+          3. You call `answer_question(answer=<their reply>)`.
+          4. Continue the task."""
+        from . import loop as loop_mod
+        env_dir = _env_dir()
+        state_dir = env_dir / "state"
+        if not state_mod.read_block_question(state_dir):
+            return "No pending question found — nothing to answer."
+        loop_mod.answer(env_dir, answer)
+        _log(f"answer recorded in chat: {answer[:120]}")
+        return "Answer recorded. Block cleared. You may continue the task."
 
     @mcp.tool()
     def save_design(task_id: str, html: str) -> str:

@@ -24,12 +24,17 @@ Qwen Code) working in this repository through **harn**.
      via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
      `oracle_debt` entry and **relay the verdict to me in the chat**. If
      `oracle_fail`, the task is back in `changes_requested` — rework it.
-  5. **Questions:** ask me directly in the chat. If I might be away, also call
-     `ask_user` — the dispatcher posts it to Telegram with escalation and an
-     answer in either place resolves it. Never guess.
+  5. **Questions:** when something is ambiguous, call `ask_user(question,
+     skill=...)` and **stop**. Do not continue until the answer is recorded.
+     Then wait for the user to reply in this chat. As soon as they do, call
+     `answer_question(answer=<their reply>)` — this clears the block, saves
+     the answer into the skill, and signals `harn watch` that escalation is no
+     longer needed. Only then continue the task. Never guess.
 
-  ⚠️ For Telegram, oracle, and escalation to work in chat mode, **`harn watch`
-  must be running** in a terminal. If it isn't, tell me to start it.
+  ⚠️ For Telegram escalation to work in chat mode, **`harn watch` must be
+  running** in a terminal. It detects the block, waits `chat_grace_minutes`
+  (default 5 min), then sends to Telegram. Once you call `answer_question`,
+  the Telegram card is automatically resolved.
 
 ## Code search (search before reading)
 
