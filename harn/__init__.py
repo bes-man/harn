@@ -1,6 +1,6 @@
 """harn — agent-agnostic coding harness with a ralph-style loop."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Directory name created inside a target project by `harn setup`.
 ENV_DIRNAME = "harn_env"
