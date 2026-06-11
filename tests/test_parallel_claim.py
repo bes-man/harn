@@ -96,3 +96,32 @@ def test_depends_on_round_trips_through_json(tmp_path):
     tasks.create_task(env, "child", task_id="D2", depends_on=["D1"], priority=1)
     reloaded = tasks.find(env, "D2")
     assert reloaded.depends_on == ["D1"]
+
+
+def test_runnable_tasks_counts_independent(tmp_path):
+    env = _env(tmp_path)
+    tasks.create_task(env, "A", task_id="A", priority=1)
+    tasks.create_task(env, "B", task_id="B", priority=1)
+    tasks.create_task(env, "C", task_id="C", depends_on=["A"], priority=1)
+    # A and B runnable now; C blocked on A
+    runnable = {t.id for t in tasks.runnable_tasks(env)}
+    assert runnable == {"A", "B"}
+
+
+def test_runnable_excludes_claimed(tmp_path):
+    env = _env(tmp_path)
+    tasks.create_task(env, "A", task_id="A", priority=1)
+    tasks.create_task(env, "B", task_id="B", priority=1)
+    tasks.next_task(env, claim=True, worker="w1")  # claims A
+    runnable = {t.id for t in tasks.runnable_tasks(env)}
+    assert runnable == {"B"}
+
+
+def test_runnable_unblocks_after_dep_done(tmp_path):
+    env = _env(tmp_path)
+    tasks.create_task(env, "A", task_id="A", priority=1)
+    tasks.create_task(env, "C", task_id="C", depends_on=["A"], priority=1)
+    assert {t.id for t in tasks.runnable_tasks(env)} == {"A"}
+    a = tasks.find(env, "A")
+    tasks.accept(a); tasks.mark_done(tasks.find(env, "A"))
+    assert {t.id for t in tasks.runnable_tasks(env)} == {"C"}

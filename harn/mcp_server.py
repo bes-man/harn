@@ -165,7 +165,36 @@ def build_server():
         note = skill_library.gap_note(env, t)
         if note:
             out += "\n\n" + note
+        # Surface available parallelism so the agent can offer to fan out.
+        others = [r for r in tasks_mod.runnable_tasks(env) if r.id != t.id]
+        if others:
+            ids = ", ".join(r.id for r in others)
+            out += (f"\n\n## ⚡ Parallelism available\n{len(others)} other "
+                    f"task(s) are runnable right now with no dependency on this "
+                    f"one: {ids}. They can be worked in PARALLEL. Tell the user "
+                    f"they can speed things up by running multiple agents (extra "
+                    f"chat windows, or — if your runtime can spawn subagents — "
+                    f"offer to fan them out, one task per worker id).")
         return out
+
+    @mcp.tool()
+    def runnable_tasks() -> str:
+        """List every task that could START RIGHT NOW (deps satisfied, not
+        claimed) WITHOUT claiming any. The count is the available parallelism:
+        if it returns 2+ tasks, they're independent and can run concurrently
+        across multiple agents/windows. Use this to decide whether to suggest
+        parallelizing — then each worker claims one via `get_next_task(worker)`."""
+        rs = tasks_mod.runnable_tasks(_env_dir())
+        if not rs:
+            return "(nothing runnable right now — all done, blocked, or claimed)"
+        lines = [f"{len(rs)} task(s) runnable in parallel:"]
+        for t in rs:
+            dep = f" (after {', '.join(t.depends_on)})" if t.depends_on else ""
+            lines.append(f"  - {t.id}: {t.title} (priority {t.priority}){dep}")
+        if len(rs) > 1:
+            lines.append("→ These are independent; they can run concurrently. "
+                         "Offer the user parallel execution.")
+        return "\n".join(lines)
 
     @mcp.tool()
     def create_task(

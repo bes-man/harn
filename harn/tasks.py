@@ -365,6 +365,17 @@ def next_task(
         return chosen
 
 
+def runnable_tasks(env_dir: Path) -> list[Task]:
+    """All tasks that could be started RIGHT NOW by some worker: needs work,
+    deps satisfied, and not already claimed by another worker. The count is the
+    available parallelism — N>1 means N independent tasks can run at once."""
+    all_tasks = load_tasks(env_dir)
+    by_id = {t.id: t for t in all_tasks}
+    out = [t for t in all_tasks if _eligible(t, by_id, worker=None)]
+    out.sort(key=lambda t: (t.priority, t.id))
+    return out
+
+
 def release_task(env_dir: Path, task_id: str, worker: str | None = None) -> bool:
     """Drop a worker's claim on a task (e.g. it's giving up / handing off).
     Only the owning worker may release. Returns True if released."""
