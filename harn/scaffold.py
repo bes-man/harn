@@ -69,6 +69,14 @@ def _mcp_servers(project_root: Path) -> dict:
             "command": "npx",
             "args": ["-y", "@playwright/mcp@latest"],
         }
+    # context7: up-to-date library documentation on demand — the agent checks
+    # current APIs/best practices instead of relying on stale training data.
+    # Disable with [mcp] context7 = false in harn.toml.
+    if getattr(cfg, "mcp_context7", True):
+        servers["context7"] = {
+            "command": "npx",
+            "args": ["-y", "@upstash/context7-mcp"],
+        }
     return servers
 
 
@@ -101,16 +109,19 @@ def _write_agent_configs(project_root: Path) -> tuple[list[str], list[str]]:
     chain = _agent_chain(project_root)
     payload = json.dumps({"mcpServers": _mcp_servers(project_root)}, indent=2)
 
+    # Connectors are generated, git-ignored files — refresh them whenever the
+    # derived content changes (e.g. [browser]/[mcp]/[code_search] toggled and
+    # `harn setup` re-run), otherwise toggles silently do nothing.
     if "claude" in chain:
         p = project_root / ".mcp.json"
-        if not p.exists():
+        if not p.exists() or p.read_text() != payload:
             p.write_text(payload)
             written.append(".mcp.json (Claude Code)")
         root_paths.append(".mcp.json")
 
     if "cursor" in chain:
         p = project_root / ".cursor" / "mcp.json"
-        if not p.exists():
+        if not p.exists() or p.read_text() != payload:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(payload)
             written.append(".cursor/mcp.json (Cursor)")

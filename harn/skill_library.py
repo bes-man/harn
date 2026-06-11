@@ -418,6 +418,10 @@ def reconcile_brief(env_dir: Path, project_root: Path, task) -> str:
         "skill=<skill>)` instead of writing it yourself.\n"
         "3. Enrich — if a skill exists but this task revealed a better practice, "
         "append it.\n"
+        "4. **Codebase map** — if this task changed the structure, stack, a "
+        "module's responsibility, or established a new in-code standard, update "
+        "`harn_env/CODEBASE.md` via `update_codebase_map` (read it first, carry "
+        "over what's still true).\n"
         "Keep entries short and reusable. Skip anything task-specific or obvious. "
         "If nothing durable was learned, say so and move on."
     )

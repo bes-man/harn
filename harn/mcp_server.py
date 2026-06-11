@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import codebase as codebase_mod
 from . import design as design_mod
 from . import progress as progress_mod
 from . import skills as skills_mod
@@ -34,6 +35,32 @@ def _default_worker() -> str:
     per-worker id for the life of that agent's session. Override with
     HARN_WORKER for deterministic multi-process runs."""
     return os.environ.get("HARN_WORKER", "").strip() or f"pid-{os.getpid()}"
+
+
+_PRETASK_PROTOCOL = """\
+## 📋 Pre-task protocol — MANDATORY, in this order, BEFORE any code
+Ambiguity discovered while coding is 10× costlier than ambiguity resolved now.
+
+1. **AS IS** — how it works today. Start from the codebase map below; read the
+   relevant code (code search first). State the current behavior in 2-3
+   sentences.
+2. **TO BE** — the target behavior per the task + PRD. The AS IS → TO BE delta
+   is your exact scope; if you can't state the delta crisply, you have an
+   ambiguity for step 5.
+3. **Skills** — `list_skills`, then `read_skill` EVERY skill relevant to this
+   task and NAME them in your plan ("Loaded: frontend, security"). No relevant
+   skill for a domain you're touching? → `ensure_skill(domain)` for a baseline,
+   or create/extend the closest one via `save_to_skill`. Never implement a
+   domain task with zero skill guidance.
+4. **Best practices** — verify your approach against CURRENT practice, not
+   training data: context7 (`resolve-library-id` → `get-library-docs`) for the
+   libraries/APIs you'll touch; code search for in-repo precedent.
+5. **Clarify** — list every remaining ambiguity (scope, naming, UX, data,
+   edge cases, trade-offs). If ANY exist: present them via the native
+   interactive question UI (AskUserQuestion / Plan Mode) AND persist with
+   `ask_user(question, skill=…)`. STOP until answered. If none — say
+   "no ambiguities" explicitly, then implement.
+"""
 
 
 def _log(msg: str) -> None:
@@ -116,6 +143,32 @@ def build_server():
         return f"saved to {path.relative_to(_env_dir())}"
 
     @mcp.tool()
+    def read_codebase_map() -> str:
+        """Read harn_env/CODEBASE.md — the persistent AS-IS map of this project:
+        stack, services and their responsibilities, data flow, standards already
+        established in the code, gotchas. Read this INSTEAD of re-exploring the
+        repo; it answers the AS-IS step of the pre-task protocol cheaply."""
+        text = codebase_mod.read(_env_dir())
+        if text is None:
+            return ("(no codebase map yet) Create one with `update_codebase_map` "
+                    "after exploring the code — template:\n\n" + codebase_mod.TEMPLATE)
+        return text
+
+    @mcp.tool()
+    def update_codebase_map(content: str) -> str:
+        """Write harn_env/CODEBASE.md (full replacement). Call when the map is
+        missing, stale, or you discovered structure it lacks — new module,
+        changed responsibility, new standard established in code, a gotcha.
+
+        Keep it COMPACT and factual (it's loaded at every task pickup): stack,
+        services/modules with one-sentence responsibilities, data flow,
+        established standards, gotchas. Read the current map first and carry
+        over what's still true — this replaces the whole file."""
+        p = codebase_mod.save(_env_dir(), content)
+        _log(f"codebase map updated ({len(content)} chars)")
+        return f"saved to {p.name} — future tasks will start from this map."
+
+    @mcp.tool()
     def ensure_skill(domain: str) -> str:
         """Bootstrap a best-practice baseline skill for a domain that has none.
 
@@ -151,9 +204,10 @@ def build_server():
         / window / process; defaults to a generic shared id) so two parallel
         agents never get the same task, and so YOU can resume your own task.
 
-        If the task touches a domain with no matching skill, the response ends
-        with a 'Skill gaps' note — call `ensure_skill(domain)` to bootstrap a
-        best-practice baseline before implementing."""
+        The response bundles everything needed to start RIGHT: the mandatory
+        pre-task protocol (AS IS → TO BE → skills → best practices → clarify),
+        the codebase map, and a 'Skill gaps' note when the task touches a
+        domain with no matching skill."""
         from . import skill_library
         env = _env_dir()
         wid = worker.strip() or _default_worker()
@@ -162,6 +216,8 @@ def build_server():
             return "(no runnable tasks — all done, blocked by deps, or claimed)"
         _log(f"{t.id}: claimed by {wid} ({t.title})")
         out = t.path.read_text(encoding="utf-8")
+        out += "\n\n" + _PRETASK_PROTOCOL
+        out += "\n\n" + codebase_mod.prompt_note(env)
         note = skill_library.gap_note(env, t)
         if note:
             out += "\n\n" + note

@@ -44,6 +44,7 @@ DEFAULTS: dict = {
     "browser": {"enabled": False, "app_cmd": "", "app_url": "",
                 "ready_timeout_s": 60},
     "code_search": {"semble": True, "socraticcode": True},
+    "mcp": {"context7": True},
     "notify": {"idle_minutes": 30, "wait_for_reply": True, "wait_timeout_minutes": 0,
                "channel": "both", "chat_grace_minutes": 5},
 }
@@ -70,6 +71,9 @@ class Config:
     # Code search backends (both default on; gracefully degrade if not installed)
     code_search_semble: bool = True       # use semble for semantic chunk retrieval
     code_search_socraticcode: bool = True  # use SocratiCode for dependency graphs
+    # context7 MCP: up-to-date library docs for the agent (default on; set
+    # [mcp] context7 = false to drop it from the generated MCP config).
+    mcp_context7: bool = True
     # Planning turn: first agent turn for a new task asks clarifying questions
     # and writes acceptance criteria before any code is written.
     planning: bool = True
@@ -133,6 +137,7 @@ class Config:
             verify=bool(data["loop"].get("verify", True)),
             code_search_semble=bool(data["code_search"].get("semble", True)),
             code_search_socraticcode=bool(data["code_search"].get("socraticcode", True)),
+            mcp_context7=bool(data["mcp"].get("context7", True)),
             auto=bool(data["loop"].get("auto", False)),
             auto_max_iterations=int(data["loop"].get("auto_max_iterations", 30)),
             planning=bool(data["loop"].get("planning", True)),

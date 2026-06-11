@@ -363,10 +363,18 @@ _LIFECYCLE_NOTE = (
     "tools (`get_next_task`, `read_skill`, `run_tests`, `board`, "
     "`submit_for_review`). If anything is ambiguous or risky, call `ask_user` "
     "(or write `harn_env/state/BLOCKED.md`) and STOP — do not guess.\n"
+    "BEFORE any code, run the pre-task protocol in order: (1) AS IS — current "
+    "behavior from the codebase map + code search; (2) TO BE — target behavior; "
+    "the delta is your scope; (3) SKILLS — read and NAME every relevant skill; "
+    "none for a domain you touch → `ensure_skill(domain)` or extend the closest "
+    "via `save_to_skill`; (4) BEST PRACTICES — check current docs (context7) "
+    "and in-repo precedent; (5) CLARIFY — any remaining ambiguity goes to "
+    "`ask_user` and you STOP; none → say 'no ambiguities' and implement.\n"
     "Before you submit, RECONCILE SKILLS: compare what you built against the "
     "project's skills; auto-save durable conventions you're confident about via "
     "`save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs "
-    "needing human agreement. harn learns from its own work, not just questions.\n"
+    "needing human agreement; update the codebase map if structure/standards "
+    "changed. harn learns from its own work, not just questions.\n"
     + _ASK_GUIDANCE
 )
 
@@ -502,6 +510,10 @@ def _build_prompt(
     gap_note = skill_library.gap_note(env_dir, task)
     if gap_note:
         parts.append(gap_note)
+    # Persistent AS-IS knowledge: the codebase map (or the instruction to
+    # create it) — answers the AS-IS step without re-indexing the repo.
+    from . import codebase as codebase_mod
+    parts.append(codebase_mod.prompt_note(env_dir))
     # Inject PRD context: load referenced PRDs, warn about missing sections.
     if task.prds:
         prd_parts: list[str] = []

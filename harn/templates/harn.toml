@@ -127,3 +127,10 @@ semble = true
 # `harn setup` checks Docker and tells you. Source:
 # https://github.com/giancarloerra/SocratiCode
 socraticcode = true
+
+[mcp]
+# context7 (default true) — live, version-accurate library documentation as MCP
+# tools (resolve-library-id / get-library-docs). The agent consults CURRENT API
+# docs and best practices instead of stale training data. Needs Node.js (npx).
+# Set false and re-run `harn setup` to remove it from the generated MCP config.
+context7 = true

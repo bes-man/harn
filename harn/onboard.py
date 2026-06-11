@@ -139,18 +139,23 @@ call `answer_question(answer=…)` to save to skill.
    above, the repo's README / docs ({docs}), and use code search
    (`search` / `codebase_search`) to map the codebase. The human may point you
    at md files with project info — read those instead of asking from scratch.
-2. **Fill the PRD(s)** in `harn_env/prd/`: problem, goal, scope, constraints.
+2. **Write the codebase map** — distill what you just learned into
+   `update_codebase_map`: stack, each service/module with a one-sentence
+   responsibility, data flow, standards already established in the code,
+   gotchas. This is the project's persistent AS-IS memory: every future task
+   reads it instead of re-indexing the repo (fewer tokens, faster starts).
+3. **Fill the PRD(s)** in `harn_env/prd/`: problem, goal, scope, constraints.
    Ask only what the docs/code don't answer.
-3. **Capture standards** — for each of security, testing, frontend/UI, API,
+4. **Capture standards** — for each of security, testing, frontend/UI, API,
    code style: ask `ask_user(question, skill="<that skill>")` so the answer is
    saved into the skill automatically. These drive every later decision.
-4. **Set up verification** in `harn_env/harn.toml`:
+5. **Set up verification** in `harn_env/harn.toml`:
    - the test command → `[feedback] test_cmd` (e.g. "pytest -q", "npm test");
    - if the project has a web UI: ask how to start it and where it answers,
      then fill `[browser] enabled/app_cmd/app_url` so harn can verify UI tasks
      in a real browser (Playwright MCP), and tell the human to re-run
      `harn setup` once so the Playwright MCP server is wired in.
-5. **Confirm the picture** with the human, then create the first tasks
+6. **Confirm the picture** with the human, then create the first tasks
    (`create_task`).
 
 Do not start implementation until the PRD + key skills are filled and confirmed.

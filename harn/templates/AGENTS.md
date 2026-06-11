@@ -37,7 +37,8 @@ never saved, and harn doesn't know it was asked.
   1. **Report every step in the chat.** Before each action say what you're doing
      ("Picking up AUTH-42…", "Running tests…", "Submitting for review…"). The
      human must always be able to see what harn is doing from the chat.
-  2. `get_next_task` → read only the skills you need → implement → `run_tests`.
+  2. `get_next_task` → run the **pre-task protocol** (next section) →
+     implement → `run_tests`.
   3. **Reconcile skills on completion.** After `submit_for_review`, call
      `reconcile_skills(task_id)`. Compare what you built against existing
      skills: auto-save durable conventions you're confident about with
@@ -74,18 +75,41 @@ never saved, and harn doesn't know it was asked.
   ask the user to run it. It handles Telegram escalation, oracle, and live
   status in the background.
 
-## Skills: load, and fill gaps
+## 📋 Pre-task protocol — mandatory, in order, BEFORE any code
 
-- `list_skills` → scan; `read_skill(name)` → load a body ONLY when the task
-  needs it (keeps context small).
-- **Missing-skill gaps**: `get_next_task` flags domains the task touches that
-  have no skill (e.g. a frontend task with no `frontend`/`ui` skill). When you
-  see a "Skill gaps" note — or you notice a domain has no standard — call
-  `ensure_skill(domain)` to install an industry best-practice baseline
-  (frontend, backend, api, testing, security, accessibility, performance,
-  database). Read it, follow it, then capture this project's specific
-  deviations with `save_to_skill` / `ask_user(skill=…)`.
-- Never implement a domain task with zero guidance: bootstrap or ask first.
+Ambiguity discovered while coding is 10× costlier than ambiguity resolved in
+planning. For EVERY task:
+
+1. **AS IS** — how it works today. Start from the codebase map
+   (`read_codebase_map`), then read the relevant code (code search first).
+   State the current behavior in 2-3 sentences.
+2. **TO BE** — the target behavior per the task + PRD. The AS IS → TO BE delta
+   is your exact scope. Can't state the delta crisply? That's an ambiguity for
+   step 5.
+3. **Skills** — `list_skills`, then `read_skill` EVERY skill relevant to this
+   task, and **NAME them in your plan** ("Loaded skills: frontend, security")
+   so the human can verify nothing was skipped. Domain with no matching skill?
+   → `ensure_skill(domain)` for an industry baseline (frontend, backend, api,
+   testing, security, accessibility, performance, database), or create/extend
+   the closest skill via `save_to_skill`. Never implement a domain task with
+   zero skill guidance.
+4. **Best practices** — verify the approach against CURRENT practice, not
+   training data: context7 (`resolve-library-id` → `get-library-docs`) for the
+   libraries/APIs you'll touch; code search for in-repo precedent.
+5. **Clarify** — list every remaining ambiguity (scope, naming, UX, data, edge
+   cases, trade-offs). If ANY exist: present them via the native interactive
+   question UI AND persist with `ask_user(question, skill=…)`, then STOP until
+   answered. If none — say "no ambiguities" explicitly, then implement.
+
+## Codebase map (harn_env/CODEBASE.md)
+
+The persistent AS-IS description: stack, services + responsibilities, data
+flow, standards already established in the code, gotchas. Read it via
+`read_codebase_map` instead of re-exploring the repo — that's the point: less
+tokens, faster starts. Keep it alive: whenever a task changes structure, a
+module's responsibility, or establishes a new in-code standard, update it via
+`update_codebase_map` (it's part of the post-task reconcile step). If it's
+missing, create it after your first exploration of the code.
 
 ## Parallel work (multiple agents)
 

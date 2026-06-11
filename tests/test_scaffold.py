@@ -82,3 +82,22 @@ def test_refresh_preserves_user_claude_md(tmp_path):
     text = (tmp_path / "CLAUDE.md").read_text()
     assert "My own rules" in text          # user content kept
     assert "@AGENTS.md" in text            # import appended
+
+
+def test_context7_in_mcp_servers_by_default(tmp_path):
+    from harn import scaffold
+    scaffold.setup(tmp_path)
+    import json
+    cfg = json.loads((tmp_path / ".mcp.json").read_text())
+    assert "context7" in cfg["mcpServers"]
+
+
+def test_context7_disabled_via_config(tmp_path):
+    from harn import scaffold
+    scaffold.setup(tmp_path)
+    toml = tmp_path / "harn_env" / "harn.toml"
+    toml.write_text(toml.read_text().replace("context7 = true", "context7 = false"))
+    scaffold.setup(tmp_path)  # regenerate configs
+    import json
+    cfg = json.loads((tmp_path / ".mcp.json").read_text())
+    assert "context7" not in cfg["mcpServers"]
