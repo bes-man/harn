@@ -166,6 +166,11 @@ def setup(project_root: Path) -> dict:
     elif bundled_agents.exists():
         bundled_agents.unlink()
 
+    # Claude Code auto-loads CLAUDE.md, NOT AGENTS.md — without this, the harn
+    # protocol never reaches a Claude Code session. Write a thin CLAUDE.md that
+    # imports AGENTS.md and front-loads the single most-violated rule.
+    _write_claude_md(project_root)
+
     # A new project starts with EMPTY tasks/ and prd/ — no demo content. The
     # agent fills them during onboarding; samples live in harn_example/.
     for sub in ("state", "tasks", "prd", "design"):
@@ -178,8 +183,71 @@ def setup(project_root: Path) -> dict:
         "env_dir": str(env_dir),
         "created": created,
         "agent_configs": agent_cfgs,
-        "root_paths": ["AGENTS.md", *root_paths],
+        "root_paths": ["AGENTS.md", "CLAUDE.md", *root_paths],
     }
+
+
+_CLAUDE_MD = """\
+# Claude Code — project instructions
+
+This project is driven by **harn**. The full protocol is in AGENTS.md, imported
+below. Follow it for all work.
+
+## ⚠️ The one rule that's easy to miss
+**Never put a question or choice to the human as trailing chat prose.** ANY time
+you would end a turn asking the user to decide — "shall I proceed?", "build the
+module next?", "approach A or B?", a clarifying question — present it through the
+native **`AskUserQuestion`** tool (interactive clickable options). For ambiguous
+requirements or durable standards, ALSO call harn's `ask_user(question, skill=…)`
+so the answer is saved into a skill. A question typed as plain prose is a bug.
+
+@AGENTS.md
+"""
+
+
+def _write_claude_md(project_root: Path) -> str | None:
+    """Write/refresh root CLAUDE.md so Claude Code (which auto-loads CLAUDE.md,
+    not AGENTS.md) gets the harn protocol via an @AGENTS.md import. Backs up any
+    existing file to CLAUDE.md.bak. Returns the path, or None if unchanged."""
+    dest = project_root / "CLAUDE.md"
+    if dest.exists():
+        if dest.read_text(encoding="utf-8") == _CLAUDE_MD:
+            return None
+        # Only back up / overwrite a harn-managed file (contains our @AGENTS.md
+        # import). If the user has their own CLAUDE.md without it, append-import
+        # instead of clobbering.
+        cur = dest.read_text(encoding="utf-8")
+        if "@AGENTS.md" not in cur:
+            dest.write_text(cur.rstrip() + "\n\n@AGENTS.md\n", encoding="utf-8")
+            return str(dest)
+        shutil.copy2(dest, dest.with_suffix(".md.bak"))
+    dest.write_text(_CLAUDE_MD, encoding="utf-8")
+    return str(dest)
+
+
+def refresh_agents_md(project_root: Path) -> str | None:
+    """Re-copy the bundled AGENTS.md into the project root, replacing the old
+    harness-managed copy so template improvements (new protocol rules) reach
+    existing projects. Backs up the current file to AGENTS.md.bak. Returns the
+    path written, or None if it was already identical / no template found.
+
+    AGENTS.md is harness-managed (onboarding fills the PRD + skills, not this
+    file), so refreshing it is safe; the backup covers any local edits."""
+    project_root = project_root.resolve()
+    tpl = _templates_dir() / "AGENTS.md"
+    if not tpl.exists():
+        return None
+    new_text = tpl.read_text(encoding="utf-8")
+    dest = project_root / "AGENTS.md"
+    changed = None
+    if not dest.exists() or dest.read_text(encoding="utf-8") != new_text:
+        if dest.exists():
+            shutil.copy2(dest, dest.with_suffix(".md.bak"))
+        dest.write_text(new_text, encoding="utf-8")
+        changed = str(dest)
+    # Always ensure CLAUDE.md exists and imports AGENTS.md (Claude Code path).
+    claude = _write_claude_md(project_root)
+    return changed or claude
 
 
 def teardown(project_root: Path) -> list[str]:

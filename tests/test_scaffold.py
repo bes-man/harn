@@ -51,3 +51,34 @@ def test_setup_does_not_clobber(tmp_path: Path):
     custom.write_text("CUSTOM")
     scaffold.setup(tmp_path)  # run again
     assert custom.read_text() == "CUSTOM"  # fork/local edits preserved
+
+
+def test_setup_creates_claude_md_importing_agents(tmp_path):
+    from harn import scaffold
+    (tmp_path / "pkg.json").write_text("{}")  # minimal project marker
+    scaffold.setup(tmp_path)
+    claude = tmp_path / "CLAUDE.md"
+    assert claude.exists()
+    text = claude.read_text()
+    assert "@AGENTS.md" in text                     # imports the protocol
+    assert "AskUserQuestion" in text                # front-loads the key rule
+    assert (tmp_path / "AGENTS.md").exists()
+
+
+def test_refresh_agents_md_updates_and_backs_up(tmp_path):
+    from harn import scaffold
+    (tmp_path / "AGENTS.md").write_text("OLD STALE CONTENT")
+    written = scaffold.refresh_agents_md(tmp_path)
+    assert written is not None
+    assert (tmp_path / "AGENTS.md.bak").read_text() == "OLD STALE CONTENT"
+    assert "OLD STALE CONTENT" not in (tmp_path / "AGENTS.md").read_text()
+    assert (tmp_path / "CLAUDE.md").exists()
+
+
+def test_refresh_preserves_user_claude_md(tmp_path):
+    from harn import scaffold
+    (tmp_path / "CLAUDE.md").write_text("# My own rules\nDo X.\n")
+    scaffold.refresh_agents_md(tmp_path)
+    text = (tmp_path / "CLAUDE.md").read_text()
+    assert "My own rules" in text          # user content kept
+    assert "@AGENTS.md" in text            # import appended

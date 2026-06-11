@@ -243,8 +243,23 @@ def cmd_update(args) -> int:
         print("[harn] update failed (see output above).", file=sys.stderr)
         return 1
     print("[harn] updated. Your harn_env/ folders are untouched.")
-    print("[harn] tip: run `harn setup` in a project to pull any NEW bundled "
-          "templates/skills (existing files are never overwritten).")
+
+    # If run inside a project, refresh the harness-managed AGENTS.md so new
+    # protocol rules actually reach the agent (it reads project_root/AGENTS.md).
+    here = Path(args.path).resolve() if getattr(args, "path", None) else Path.cwd()
+    if (here / ENV_DIRNAME).exists():
+        try:
+            from . import scaffold
+            written = scaffold.refresh_agents_md(here)
+            if written:
+                print(f"[harn] refreshed AGENTS.md (backup: AGENTS.md.bak).")
+            else:
+                print("[harn] AGENTS.md already current.")
+        except Exception as e:
+            print(f"[harn] could not refresh AGENTS.md: {e}", file=sys.stderr)
+    else:
+        print("[harn] tip: run `harn update` from inside a project to also "
+              "refresh its AGENTS.md with the latest protocol.")
     return 0
 
 
