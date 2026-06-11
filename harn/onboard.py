@@ -139,11 +139,12 @@ call `answer_question(answer=…)` to save to skill.
    above, the repo's README / docs ({docs}), and use code search
    (`search` / `codebase_search`) to map the codebase. The human may point you
    at md files with project info — read those instead of asking from scratch.
-2. **Write the codebase map** — distill what you just learned into
-   `update_codebase_map`: stack, each service/module with a one-sentence
-   responsibility, data flow, standards already established in the code,
-   gotchas. This is the project's persistent AS-IS memory: every future task
-   reads it instead of re-indexing the repo (fewer tokens, faster starts).
+2. **Register the services** — for each service/module you just understood,
+   call `save_service(name, responsibility, content)`: one line of
+   responsibility for the index, and a body with Standards / Constraints /
+   Gotchas (duties and rules — NOT a code walkthrough). This is the project's
+   persistent AS-IS memory: future tasks scan the index, instantly see which
+   services matter, and read only those files (fewer tokens, faster starts).
 3. **Fill the PRD(s)** in `harn_env/prd/`: problem, goal, scope, constraints.
    Ask only what the docs/code don't answer.
 4. **Capture standards** — for each of security, testing, frontend/UI, API,

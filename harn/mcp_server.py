@@ -41,7 +41,8 @@ _PRETASK_PROTOCOL = """\
 ## 📋 Pre-task protocol — MANDATORY, in this order, BEFORE any code
 Ambiguity discovered while coding is 10× costlier than ambiguity resolved now.
 
-1. **AS IS** — how it works today. Start from the codebase map below; read the
+1. **AS IS** — how it works today. Scan the service registry below to see
+   which services this task touches; `read_service` ONLY those, then read the
    relevant code (code search first). State the current behavior in 2-3
    sentences.
 2. **TO BE** — the target behavior per the task + PRD. The AS IS → TO BE delta
@@ -143,30 +144,43 @@ def build_server():
         return f"saved to {path.relative_to(_env_dir())}"
 
     @mcp.tool()
-    def read_codebase_map() -> str:
-        """Read harn_env/CODEBASE.md — the persistent AS-IS map of this project:
-        stack, services and their responsibilities, data flow, standards already
-        established in the code, gotchas. Read this INSTEAD of re-exploring the
-        repo; it answers the AS-IS step of the pre-task protocol cheaply."""
-        text = codebase_mod.read(_env_dir())
-        if text is None:
-            return ("(no codebase map yet) Create one with `update_codebase_map` "
-                    "after exploring the code — template:\n\n" + codebase_mod.TEMPLATE)
-        return text
+    def list_services() -> str:
+        """Index of registered services/modules: name + one-line responsibility
+        (from harn_env/services/). Scan it to decide WHICH parts of the system a
+        task touches — then `read_service` only those. This is the cheap AS-IS
+        entry point; don't re-explore the repo for what's registered here."""
+        return codebase_mod.index(_env_dir())
 
     @mcp.tool()
-    def update_codebase_map(content: str) -> str:
-        """Write harn_env/CODEBASE.md (full replacement). Call when the map is
-        missing, stale, or you discovered structure it lacks — new module,
-        changed responsibility, new standard established in code, a gotcha.
+    def read_service(name: str) -> str:
+        """Full knowledge file for one service/module: its responsibility (what
+        it owns / doesn't own), the standards any change must follow, hard
+        constraints, and gotchas. Call ONLY for services the current task
+        touches — that's the point of the per-service split."""
+        body = codebase_mod.read(_env_dir(), name)
+        if body is None:
+            return (f"(no service '{name}' registered) If it exists in the code, "
+                    "explore it and register it via `save_service`. Template:\n\n"
+                    + codebase_mod.TEMPLATE)
+        return body
 
-        Keep it COMPACT and factual (it's loaded at every task pickup): stack,
-        services/modules with one-sentence responsibilities, data flow,
-        established standards, gotchas. Read the current map first and carry
-        over what's still true — this replaces the whole file."""
-        p = codebase_mod.save(_env_dir(), content)
-        _log(f"codebase map updated ({len(content)} chars)")
-        return f"saved to {p.name} — future tasks will start from this map."
+    @mcp.tool()
+    def save_service(name: str, responsibility: str, content: str) -> str:
+        """Register or refresh a service/module file in harn_env/services/.
+
+        `name`         — short slug (e.g. "auth-api", "frontend", "billing").
+        `responsibility` — ONE line: what it owns and does not own (shown in the
+                         index; this is how future agents decide whether the
+                         service is relevant at all).
+        `content`      — markdown body: ## Responsibility / ## Standards /
+                         ## Constraints / ## Gotchas. Describe duties, rules and
+                         limits — NOT a walkthrough of the code (code describes
+                         itself; this file says what any change must respect).
+
+        Full replacement: read_service first and carry over what's still true."""
+        p = codebase_mod.save(_env_dir(), name, responsibility, content)
+        _log(f"service '{name}' registered/updated ({len(content)} chars)")
+        return f"saved {p.name} — the index now lists '{name}'."
 
     @mcp.tool()
     def ensure_skill(domain: str) -> str:

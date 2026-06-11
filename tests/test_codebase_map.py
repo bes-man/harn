@@ -1,4 +1,4 @@
-"""Codebase map: storage, prompt injection, protocol presence."""
+"""Service registry: per-service files, index, prompt injection, protocol."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,37 +12,60 @@ def _env(tmp_path) -> Path:
     return env
 
 
-def test_read_missing_returns_none(tmp_path):
-    assert codebase.read(_env(tmp_path)) is None
-
-
-def test_save_and_read_roundtrip(tmp_path):
+def test_empty_registry(tmp_path):
     env = _env(tmp_path)
-    p = codebase.save(env, "# Codebase map\n\n## Stack\n- Python")
-    assert p == env / "CODEBASE.md"
-    assert "Python" in codebase.read(env)
+    assert codebase.list_services(env) == []
+    assert "no services registered" in codebase.index(env)
 
 
-def test_prompt_note_missing_instructs_creation(tmp_path):
+def test_save_and_read_service(tmp_path):
+    env = _env(tmp_path)
+    p = codebase.save(env, "Auth API", "owns login, tokens, sessions",
+                      "## Responsibility\n- auth\n\n## Standards\n- JWT 15m")
+    assert p == env / "services" / "auth-api.md"
+    body = codebase.read(env, "auth-api")
+    assert "JWT 15m" in body
+    # read by unslugged name too
+    assert codebase.read(env, "Auth API") == body
+
+
+def test_index_lists_responsibilities(tmp_path):
+    env = _env(tmp_path)
+    codebase.save(env, "frontend", "React PWA, all UI", "## Responsibility\n- UI")
+    codebase.save(env, "billing", "payments and invoices", "## Responsibility\n- money")
+    idx = codebase.index(env)
+    assert "frontend: React PWA, all UI" in idx
+    assert "billing: payments and invoices" in idx
+
+
+def test_prompt_note_empty_instructs_seeding(tmp_path):
     note = codebase.prompt_note(_env(tmp_path))
-    assert "MISSING" in note
-    assert "update_codebase_map" in note
+    assert "EMPTY" in note
+    assert "save_service" in note
 
 
-def test_prompt_note_includes_map(tmp_path):
+def test_prompt_note_lists_index_and_read_instruction(tmp_path):
     env = _env(tmp_path)
-    codebase.save(env, "# Map\n- service A: handles auth")
+    codebase.save(env, "api", "REST backend", "## Responsibility\n- API")
     note = codebase.prompt_note(env)
-    assert "service A" in note
-    assert "AS IS" in note
+    assert "api: REST backend" in note
+    assert "read_service" in note
 
 
-def test_prompt_note_truncates_long_map(tmp_path):
+def test_legacy_codebase_md_mentioned(tmp_path):
     env = _env(tmp_path)
-    codebase.save(env, "x" * 10_000)
-    note = codebase.prompt_note(env, limit=1000)
-    assert "truncated" in note
-    assert len(note) < 2000
+    (env / "CODEBASE.md").write_text("# old map")
+    note = codebase.prompt_note(env)
+    assert "legacy" in note.lower()
+
+
+def test_save_replaces_existing(tmp_path):
+    env = _env(tmp_path)
+    codebase.save(env, "api", "v1", "old body")
+    codebase.save(env, "api", "v2 responsibility", "new body")
+    assert codebase.read(env, "api") is not None
+    assert "new body" in codebase.read(env, "api")
+    assert ("api", "v2 responsibility") in codebase.list_services(env)
 
 
 def test_pretask_protocol_in_mcp_module():
@@ -52,3 +75,4 @@ def test_pretask_protocol_in_mcp_module():
     assert "ensure_skill" in _PRETASK_PROTOCOL
     assert "ask_user" in _PRETASK_PROTOCOL
     assert "context7" in _PRETASK_PROTOCOL
+    assert "read_service" in _PRETASK_PROTOCOL

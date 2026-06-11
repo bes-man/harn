@@ -184,7 +184,7 @@ def setup(project_root: Path) -> dict:
 
     # A new project starts with EMPTY tasks/ and prd/ — no demo content. The
     # agent fills them during onboarding; samples live in harn_example/.
-    for sub in ("state", "tasks", "prd", "design"):
+    for sub in ("state", "tasks", "prd", "design", "services"):
         (env_dir / sub).mkdir(exist_ok=True)
 
     agent_cfgs, root_paths = _write_agent_configs(project_root)

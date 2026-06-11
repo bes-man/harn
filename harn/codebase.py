@@ -1,81 +1,140 @@
-"""Codebase map — persistent AS-IS knowledge in ``harn_env/CODEBASE.md``.
+"""Service registry — per-service knowledge in ``harn_env/services/<name>.md``.
 
-One markdown file describing what the project IS: services and their
-responsibilities, the stack, entry points, data flow, and the standards already
-established in the code. The agent reads it at task pickup instead of
-re-indexing/re-discovering the repo every session — fewer tokens, faster start,
-and the AS-IS step of the pre-task protocol comes pre-answered.
+One file per service/module/project describing its RESPONSIBILITY, STANDARDS,
+and CONSTRAINTS — not the code itself (the code describes the code; these files
+answer "do we even need this service for the current task, and what must any
+change here respect?").
 
-Maintained by the agent: onboarding creates it, and the post-task reconcile
-step keeps it current as the code evolves.
+The pattern mirrors skills: a token-cheap index (name + one-line responsibility)
+is injected at task pickup; the agent reads a service file ONLY when the task
+touches it. Maintained by the agent: onboarding seeds it, the post-task
+reconcile step keeps it current.
+
+A legacy single-file ``harn_env/CODEBASE.md`` (pre-0.9) is still surfaced with
+a hint to split it into services.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-FILENAME = "CODEBASE.md"
+DIRNAME = "services"
+LEGACY_FILENAME = "CODEBASE.md"
+
+_FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 TEMPLATE = """\
-# Codebase map
+## Responsibility
+- (single paragraph: what this service owns and does NOT own — enough to decide
+   whether a task touches it at all)
 
-> Maintained by the agent (update via `update_codebase_map` whenever the
-> structure, stack, or responsibilities change). Keep it compact and factual —
-> this file is loaded at every task pickup.
+## Standards
+- (conventions any change here MUST follow: error shape, naming, layering,
+   patterns already established in this service's code)
 
-## Stack
-- (languages, frameworks, build tools, test runner — with versions where pinned)
-
-## Services / modules and responsibilities
-- `<path>` — (single-sentence responsibility; key entry points)
-
-## Data flow & storage
-- (where state lives, how data moves between modules, external APIs)
-
-## Established standards in the code
-- (conventions already followed: error shape, naming, file layout, patterns —
-   things a new change MUST stay consistent with)
+## Constraints
+- (hard limits: performance budgets, compatibility promises, do-not-touch
+   areas, security boundaries, external contracts)
 
 ## Gotchas
-- (non-obvious constraints discovered while working here)
+- (non-obvious traps discovered while working here)
 """
 
 
-def path(env_dir: Path) -> Path:
-    return env_dir / FILENAME
+def _dir(env_dir: Path) -> Path:
+    return env_dir / DIRNAME
 
 
-def read(env_dir: Path) -> str | None:
-    p = path(env_dir)
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-")
+
+
+def _frontmatter(text: str) -> dict:
+    m = _FM_RE.match(text)
+    fm: dict = {}
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                fm[k.strip().lower()] = v.strip()
+    return fm
+
+
+def list_services(env_dir: Path) -> list[tuple[str, str]]:
+    """[(name, one-line responsibility)] for every registered service."""
+    d = _dir(env_dir)
+    if not d.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    for p in sorted(d.glob("*.md")):
+        fm = _frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        out.append((fm.get("name", p.stem), fm.get("responsibility", "")))
+    return out
+
+
+def index(env_dir: Path) -> str:
+    """Token-cheap listing the agent scans to decide which services matter."""
+    lines = [f"- {n}: {r}" if r else f"- {n}" for n, r in list_services(env_dir)]
+    return "\n".join(lines) if lines else "(no services registered)"
+
+
+def read(env_dir: Path, name: str) -> str | None:
+    p = _dir(env_dir) / f"{_slug(name)}.md"
+    if not p.exists():
+        return None
+    return _FM_RE.sub("", p.read_text(encoding="utf-8", errors="replace"), count=1).strip()
+
+
+def save(env_dir: Path, name: str, responsibility: str, content: str) -> Path:
+    """Write/replace a service file. `responsibility` is the one-line summary
+    shown in the index; `content` is the markdown body (Responsibility /
+    Standards / Constraints / Gotchas)."""
+    slug = _slug(name)
+    d = _dir(env_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{slug}.md"
+    resp = " ".join(responsibility.split())  # one line
+    p.write_text(
+        f"---\nname: {slug}\nresponsibility: {resp}\n---\n\n"
+        f"# {slug}\n\n{content.rstrip()}\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def legacy_map(env_dir: Path) -> str | None:
+    p = env_dir / LEGACY_FILENAME
     if not p.exists():
         return None
     text = p.read_text(encoding="utf-8", errors="replace").strip()
     return text or None
 
 
-def save(env_dir: Path, content: str) -> Path:
-    env_dir.mkdir(parents=True, exist_ok=True)
-    p = path(env_dir)
-    p.write_text(content.rstrip() + "\n", encoding="utf-8")
-    return p
-
-
-def prompt_note(env_dir: Path, limit: int = 4000) -> str:
-    """Injection block for task prompts: the map if present (head-truncated),
-    or an instruction to create it."""
-    text = read(env_dir)
-    if text is None:
-        return (
-            "## Codebase map — MISSING\n"
-            "`harn_env/CODEBASE.md` doesn't exist yet. After you've explored "
-            "the code for this task, call `update_codebase_map` with a compact "
-            "map (stack, services + responsibilities, data flow, established "
-            "standards, gotchas) so future tasks skip re-discovery."
+def prompt_note(env_dir: Path) -> str:
+    """Injection block for task prompts: the service index (cheap), with
+    read-on-demand instructions — or how to seed the registry if empty."""
+    services = list_services(env_dir)
+    if not services:
+        note = (
+            "## Service registry — EMPTY\n"
+            "`harn_env/services/` has no entries yet. As you explore the code "
+            "for this task, register each service/module you understand via "
+            "`save_service(name, responsibility, content)` — responsibility, "
+            "standards, constraints (NOT a code walkthrough). Future tasks then "
+            "skip re-discovery and instantly know which services matter."
         )
-    if len(text) > limit:
-        text = text[:limit] + "\n…(truncated — read harn_env/CODEBASE.md for the rest)"
+        legacy = legacy_map(env_dir)
+        if legacy:
+            note += (
+                "\n\nA legacy single-file map exists (harn_env/CODEBASE.md) — "
+                "split it into per-service entries when convenient."
+            )
+        return note
     return (
-        "## Codebase map (AS IS — read this INSTEAD of re-indexing the repo)\n"
-        + text
-        + "\n\nIf this map is stale or missing something you discover, update "
-          "it via `update_codebase_map` at the end of your work."
+        "## Service registry (which parts of the system matter for this task?)\n"
+        "Scan the index; call `read_service(name)` ONLY for services this task "
+        "touches — each file states the service's responsibility, standards, "
+        "and constraints:\n" + index(env_dir) +
+        "\n\nIf a service you touch is missing/stale here, register/refresh it "
+        "via `save_service` at the end of your work."
     )

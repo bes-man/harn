@@ -364,7 +364,7 @@ _LIFECYCLE_NOTE = (
     "`submit_for_review`). If anything is ambiguous or risky, call `ask_user` "
     "(or write `harn_env/state/BLOCKED.md`) and STOP — do not guess.\n"
     "BEFORE any code, run the pre-task protocol in order: (1) AS IS — current "
-    "behavior from the codebase map + code search; (2) TO BE — target behavior; "
+    "behavior from the service registry + code search; (2) TO BE — target behavior; "
     "the delta is your scope; (3) SKILLS — read and NAME every relevant skill; "
     "none for a domain you touch → `ensure_skill(domain)` or extend the closest "
     "via `save_to_skill`; (4) BEST PRACTICES — check current docs (context7) "
@@ -373,7 +373,8 @@ _LIFECYCLE_NOTE = (
     "Before you submit, RECONCILE SKILLS: compare what you built against the "
     "project's skills; auto-save durable conventions you're confident about via "
     "`save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs "
-    "needing human agreement; update the codebase map if structure/standards "
+    "needing human agreement; refresh service files (save_service) if "
+    "responsibilities/standards/constraints "
     "changed. harn learns from its own work, not just questions.\n"
     + _ASK_GUIDANCE
 )
@@ -510,8 +511,8 @@ def _build_prompt(
     gap_note = skill_library.gap_note(env_dir, task)
     if gap_note:
         parts.append(gap_note)
-    # Persistent AS-IS knowledge: the codebase map (or the instruction to
-    # create it) — answers the AS-IS step without re-indexing the repo.
+    # Persistent AS-IS knowledge: the service registry index (or the
+    # instruction to seed it) — answers the AS-IS step without re-indexing.
     from . import codebase as codebase_mod
     parts.append(codebase_mod.prompt_note(env_dir))
     # Inject PRD context: load referenced PRDs, warn about missing sections.

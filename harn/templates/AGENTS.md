@@ -80,9 +80,10 @@ never saved, and harn doesn't know it was asked.
 Ambiguity discovered while coding is 10× costlier than ambiguity resolved in
 planning. For EVERY task:
 
-1. **AS IS** — how it works today. Start from the codebase map
-   (`read_codebase_map`), then read the relevant code (code search first).
-   State the current behavior in 2-3 sentences.
+1. **AS IS** — how it works today. Start from the service registry
+   (`list_services` → `read_service` for ONLY the services this task touches),
+   then read the relevant code (code search first). State the current behavior
+   in 2-3 sentences.
 2. **TO BE** — the target behavior per the task + PRD. The AS IS → TO BE delta
    is your exact scope. Can't state the delta crisply? That's an ambiguity for
    step 5.
@@ -101,15 +102,20 @@ planning. For EVERY task:
    question UI AND persist with `ask_user(question, skill=…)`, then STOP until
    answered. If none — say "no ambiguities" explicitly, then implement.
 
-## Codebase map (harn_env/CODEBASE.md)
+## Service registry (harn_env/services/)
 
-The persistent AS-IS description: stack, services + responsibilities, data
-flow, standards already established in the code, gotchas. Read it via
-`read_codebase_map` instead of re-exploring the repo — that's the point: less
-tokens, faster starts. Keep it alive: whenever a task changes structure, a
-module's responsibility, or establishes a new in-code standard, update it via
-`update_codebase_map` (it's part of the post-task reconcile step). If it's
-missing, create it after your first exploration of the code.
+One file per service/module describing its **responsibility, standards, and
+constraints** — duties and rules, NOT a code walkthrough. The token-cheap index
+(name + one-line responsibility) tells you instantly whether a service matters
+for the current task at all:
+
+- `list_services` → scan the index; `read_service(name)` → ONLY for services
+  the task touches.
+- A service you touch is missing or stale? → `save_service(name,
+  responsibility, content)` with ## Responsibility / ## Standards /
+  ## Constraints / ## Gotchas. (Part of the post-task reconcile step.)
+- Onboarding seeds the registry; every task keeps it current. This replaces
+  re-indexing the repo each session.
 
 ## Parallel work (multiple agents)
 
