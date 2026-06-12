@@ -7,8 +7,16 @@ Qwen Code) working in this repository through **harn**.
 
 Before doing anything, verify your harn MCP tools are loaded: you must see
 `ask_user`, `answer_question`, `get_next_task`, `create_task` in your tool list.
-If they are missing, stop and tell the user: **"harn MCP is not connected —
-run `claude mcp list` and check that 'harn' shows as connected."**
+
+**Deferred tools (Claude Code):** with several MCP servers connected, tool
+schemas may be deferred — visible by name but not callable until loaded. That
+is NOT "harn unavailable": load them as your FIRST action with
+`ToolSearch(query: "harn", max_results: 30)` (likewise `"context7"` /
+`"semble"` / `"socraticode"` when needed). Skipping harn because its tools
+were deferred is a protocol violation — even for one-line changes.
+
+If the tools are genuinely absent (not just deferred), stop and tell the user:
+**"harn MCP is not connected — check .mcp.json and restart the session."**
 
 **Never put a choice to the human as trailing chat prose.** This applies to
 EVERY decision you hand to the user — not just clarifying questions:

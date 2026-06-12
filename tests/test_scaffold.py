@@ -101,3 +101,13 @@ def test_context7_disabled_via_config(tmp_path):
     import json
     cfg = json.loads((tmp_path / ".mcp.json").read_text())
     assert "context7" not in cfg["mcpServers"]
+
+
+def test_claude_md_instructs_toolsearch_for_deferred(tmp_path):
+    from harn import scaffold
+    scaffold.setup(tmp_path)
+    text = (tmp_path / "CLAUDE.md").read_text()
+    assert "ToolSearch" in text          # step-0 loads deferred harn tools
+    assert "deferred" in text.lower()
+    agents = (tmp_path / "AGENTS.md").read_text()
+    assert "ToolSearch" in agents

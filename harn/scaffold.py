@@ -204,6 +204,20 @@ _CLAUDE_MD = """\
 This project is driven by **harn**. The full protocol is in AGENTS.md, imported
 below. Follow it for all work.
 
+## ⚠️ STEP 0 — load the harn tools (they may be deferred)
+Claude Code defers MCP tool schemas when many servers are connected: harn's
+tools (`ask_user`, `get_next_task`, `list_services`, …) then appear only as
+names and FAIL if called directly. **Before your first action in EVERY
+session**, load them in one call:
+
+    ToolSearch(query: "harn", max_results: 30)
+
+Same applies to semble / socraticode / context7 tools when you need them
+(`ToolSearch(query: "context7")`, etc.). Never skip harn because its tools
+weren't loaded — loading them IS your first step. Working around harn (editing
+files directly without `get_next_task` → pre-task protocol → `run_tests` →
+`submit_for_review`) is a protocol violation EVEN for one-line changes.
+
 ## ⚠️ The one rule that's easy to miss
 **Never put a question or choice to the human as trailing chat prose.** ANY time
 you would end a turn asking the user to decide — "shall I proceed?", "build the
