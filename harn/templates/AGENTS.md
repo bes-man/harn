@@ -18,6 +18,25 @@ were deferred is a protocol violation — even for one-line changes.
 If the tools are genuinely absent (not just deferred), stop and tell the user:
 **"harn MCP is not connected — check .mcp.json and restart the session."**
 
+## ⚠️ Every code-change request goes through harn — chat requests included
+
+A request typed in the chat ("fix X", "add Y") is a task that doesn't exist
+yet, NOT an exemption from the protocol:
+
+1. No matching task on the board? → `create_task` (one sentence is fine), then
+   `get_next_task` to claim it — that response carries the pre-task protocol,
+   the service registry, and skill-gap notes for free.
+2. **Skills on EVERY request, however small**: `list_skills` + `read_skill`
+   for each relevant skill, and NAME them in your reply ("Loaded: frontend,
+   standards"). An edit that ignores a project standard is a bug you just
+   haven't found yet.
+3. **Plan mode by default** for anything non-trivial — more than one file, any
+   ambiguity, or a behavior change: enter your client's plan mode (Claude Code
+   plan mode; Cursor/Codex Plan Mode) and walk the pre-task protocol there
+   (AS IS → TO BE → skills → best practices via context7 → clarifying
+   questions). Implementation starts only after the plan and questions are
+   resolved. Trivial one-liners may skip plan mode but never skip skills + task.
+
 **Never put a choice to the human as trailing chat prose.** This applies to
 EVERY decision you hand to the user — not just clarifying questions:
 - clarifying an ambiguous requirement,

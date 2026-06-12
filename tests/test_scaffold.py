@@ -111,3 +111,14 @@ def test_claude_md_instructs_toolsearch_for_deferred(tmp_path):
     assert "deferred" in text.lower()
     agents = (tmp_path / "AGENTS.md").read_text()
     assert "ToolSearch" in agents
+
+
+def test_claude_md_routes_chat_requests_through_harn(tmp_path):
+    from harn import scaffold
+    scaffold.setup(tmp_path)
+    text = (tmp_path / "CLAUDE.md").read_text()
+    assert "create_task" in text          # chat request → task
+    assert "list_skills" in text          # skills on every request
+    assert "plan mode" in text.lower()    # plan-first default
+    agents = (tmp_path / "AGENTS.md").read_text()
+    assert "create_task" in agents and "plan mode" in agents.lower()

@@ -218,6 +218,24 @@ weren't loaded — loading them IS your first step. Working around harn (editing
 files directly without `get_next_task` → pre-task protocol → `run_tests` →
 `submit_for_review`) is a protocol violation EVEN for one-line changes.
 
+## ⚠️ STEP 1 — every code-change request goes through harn, with skills
+A request typed in the chat ("fix the padding", "add a button") is NOT exempt
+from the protocol — it's just a task that doesn't exist yet:
+
+1. No matching task on the board? → `create_task` (one sentence is fine), then
+   `get_next_task` to claim it. This is 2 tool calls — cheaper than one rework.
+2. **Skills on EVERY request**: `list_skills` + `read_skill` for every skill
+   relevant to the change, and NAME them ("Loaded: frontend, standards") — even
+   for one-liners. An edit that ignores a project standard is a bug you just
+   haven't found yet.
+3. **Plan mode first** for anything non-trivial (more than one file, any
+   ambiguity, or touching behavior): enter your client's plan mode (Claude
+   Code: EnterPlanMode / plan mode; Cursor/Codex: Plan Mode) and walk the
+   pre-task protocol there — AS IS → TO BE → skills → best practices
+   (context7) → clarifying questions. Code starts only after the plan (and any
+   questions) are resolved. Trivial one-liners may skip plan mode but NEVER
+   skip skills + task.
+
 ## ⚠️ The one rule that's easy to miss
 **Never put a question or choice to the human as trailing chat prose.** ANY time
 you would end a turn asking the user to decide — "shall I proceed?", "build the
