@@ -142,6 +142,10 @@ class Task:
     depends_on:  list[str] = field(default_factory=list)
     claimed_by:  str | None = None
     claimed_at:  str = ""
+    # Clarification funnel: set once planning has narrowed the task to a
+    # verified, unambiguous spec (its `## Done when` is authoritative). The
+    # executor then trusts it and the full PRD is read-on-demand, not injected.
+    spec_locked: bool = False
 
     @property
     def done(self) -> bool:
@@ -210,6 +214,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         depends_on=list(d.get("depends_on") or []),
         claimed_by=d.get("claimed_by"),
         claimed_at=d.get("claimed_at") or "",
+        spec_locked=bool(d.get("spec_locked", False)),
     )
 
 
@@ -233,6 +238,7 @@ def _to_dict(task: Task) -> dict:
         "depends_on":  task.depends_on,
         "claimed_by":  task.claimed_by,
         "claimed_at":  task.claimed_at,
+        "spec_locked": task.spec_locked,
     }
 
 
@@ -507,6 +513,25 @@ def mark_done(task: Task, summary: str = "") -> None:
             ts=_now_iso(), event="done", summary=summary,
         ))
     set_status(task, DONE)
+
+
+def lock_spec(task: Task, done_when: str, approach: str = "",
+              decisions: list[tuple[str, str]] | None = None) -> None:
+    """Funnel result: write the narrowed, verified spec into the task and mark
+    it spec-locked. `done_when` becomes the authoritative `## Done when` block;
+    `approach` (optional) records the chosen implementation direction; each
+    (decision, rationale) is appended to the task's decision log."""
+    body = f"## What\n{task.title}\n\n## Done when\n{done_when.rstrip()}\n"
+    if approach.strip():
+        body += f"\n## Approach (locked)\n{approach.rstrip()}\n"
+    task.description = body
+    for dec, why in (decisions or []):
+        if dec.strip():
+            task.decisions.append(Decision(
+                decision=dec.strip(), rationale=why.strip(), ts=_now_iso(),
+                agent="planner"))
+    task.spec_locked = True
+    _save(task)
 
 
 def log_started(task: Task, agent: str, rework: bool = False) -> None:

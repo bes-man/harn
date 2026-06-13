@@ -48,21 +48,25 @@ def test_planning_turn_runs_first(tmp_path, monkeypatch):
     env = _env(tmp_path, planning=True)
     prompts_seen = []
 
+    def plan_then_lock(prompt, cwd):
+        # Realistic planner: closes the funnel by locking the spec, so the next
+        # turn is execution (not another planning turn).
+        prompts_seen.append(prompt)
+        tasks.lock_spec(tasks.find(env, "PRJ-001"), "- it works")
+        return AgentResult(ok=True, text="spec locked")
+
     def capture(prompt, cwd):
         prompts_seen.append(prompt)
         return AgentResult(ok=True, text="done")
 
-    # Both turns captured
-    fake = ScriptedAdapter([capture, capture])
+    fake = ScriptedAdapter([plan_then_lock, capture])
     _wire(monkeypatch, fake)
 
     loop.run(tmp_path, env, max_iterations=3)
 
     assert len(prompts_seen) >= 2
-    # First turn must be planning
-    assert "PLANNING PHASE" in prompts_seen[0]
-    # Second turn must be execution (not planning again)
-    assert "PLANNING PHASE" not in prompts_seen[1]
+    assert "PLANNING PHASE" in prompts_seen[0]        # first turn = funnel
+    assert "PLANNING PHASE" not in prompts_seen[1]    # locked → execution
 
 
 def test_planning_prompt_contains_task_and_prd(tmp_path):

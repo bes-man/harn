@@ -106,6 +106,12 @@ def _autonomy_note(level: float) -> str:
         )
     return f"## Autonomy: {pct}% self-directed\n{stance}"
 
+# Max consecutive planning turns per task before harn proceeds to execution
+# even without an explicit lock_spec — a backstop against a non-locking agent
+# burning the iteration budget on the funnel.
+_MAX_PLAN_TURNS = 3
+
+
 def _planning_instructions(cfg: Config) -> str:
     hint = semble_bridge.planning_hint(cfg)
     search_step = (
@@ -114,23 +120,30 @@ def _planning_instructions(cfg: Config) -> str:
     )
     n = 3 if hint else 2
     return f"""\
-## PLANNING PHASE — do not write any code yet
+## PLANNING PHASE — a funnel, not a code session (write no code yet)
 
-Your job is to make sure the requirements are unambiguous BEFORE implementation.
+Goal: NARROW the task from many possible interpretations down to ONE verified,
+unambiguous spec. Each question should eliminate the most uncertainty; after
+each answer, DROP the options it ruled out. Converge, then lock.
 
 {hint}
 
-1. **Read** the task description and every referenced PRD carefully.{search_step}
-{n}. **Identify gaps**: for each ambiguity, missing detail, or assumption — call \
-`ask_user` (expanded: context + options + recommendation). Never guess on scope.
-{n+1}. **Update the task**: once all questions are resolved, call `update_task` \
-with a refined `description` field. The `## Done when` section must list concrete, \
-independently verifiable acceptance criteria. Each criterion = one observable fact.
-{n+2}. **List skills**: confirm `skills` covers what the executor will need. \
-Update via `update_task` if not.
+1. **Read** the task and every referenced PRD carefully.{search_step}
+{n}. **Funnel the ambiguity**: surface the HIGHEST-LEVERAGE open question first \
+(the one whose answer collapses the most branches), via `ask_user` (expanded: \
+context + 2-3 options + your recommendation). One at a time — never dump a \
+questionnaire. After each answer, narrow scope and discard the rejected options. \
+Repeat only while real ambiguity remains. Never guess on scope.
+{n+1}. **Lock the spec**: when nothing material is left open, call `lock_spec` \
+with the final `done_when` (concrete, independently verifiable criteria — one \
+observable fact per line), the chosen `approach` (rejected alternatives dropped), \
+and the `decisions` you settled with the human. This is the funnel's output: a \
+tight spec the executor implements verbatim, so the full PRD need not be re-read.
+{n+2}. **Skills**: confirm the task's `skills` covers what the executor needs; \
+`update_task` if not.
 
-Do NOT touch the codebase. End your turn by calling `update_task` with the refined \
-description. Planning is complete once you do that.
+Do NOT touch the codebase. End the turn by calling `lock_spec`. Planning is \
+complete once the spec is locked.
 """
 
 
@@ -504,37 +517,54 @@ def _build_prompt(
     # instruction to seed it) — answers the AS-IS step without re-indexing.
     from . import codebase as codebase_mod
     parts.append(codebase_mod.prompt_note(env_dir))
-    # Inject PRD context: load referenced PRDs, warn about missing sections.
+    # Inject PRD context. Once the funnel has locked the spec, the task already
+    # carries the distilled criteria — inject only a COMPACT reference and let
+    # the agent `read_prd` on demand (big recurring token saving, no fidelity
+    # loss). Before lock (planning), inject the full PRD so questions converge.
     if task.prds:
-        prd_parts: list[str] = []
-        for prd_id in task.prds:
-            p = prd_mod.find(env_dir, prd_id)
-            if p:
-                prd_parts.append(
-                    f"### PRD: {p.id} — {p.title}\n\n{p.raw.strip()}"
-                )
-            else:
-                prd_parts.append(
-                    f"### PRD: {prd_id}\n(file not found — create "
-                    f"`harn_env/prd/{prd_id}.md`)"
-                )
-        prd_header = (
-            f"This task belongs to PRD(s): **{', '.join(task.prds)}**. "
-            "Read them for the why, scope, and acceptance criteria."
-        )
-        if task.epic:
-            prd_header += f" Epic: `{task.epic}`."
-        if task.user_story:
-            prd_header += f" User story: `{task.user_story}`."
-        hint = prd_mod.normalisation_hint(
-            [p for pid in task.prds
-             for p in ([prd_mod.find(env_dir, pid)] if prd_mod.find(env_dir, pid) else [])]
-        )
-        parts.append(
-            "## Task lineage\n" + prd_header
-            + ("\n\n" + hint if hint else "")
-            + "\n\n" + "\n\n---\n\n".join(prd_parts)
-        )
+        if task.spec_locked:
+            refs: list[str] = []
+            for prd_id in task.prds:
+                p = prd_mod.find(env_dir, prd_id)
+                if p:
+                    why = (p.sections.get("Problem")
+                           or p.sections.get("Goal") or "").strip().splitlines()
+                    one = (why[0] if why else "")[:160]
+                    refs.append(f"- **{p.id}** — {p.title}: {one} "
+                                f"(`read_prd(\"{p.id}\")` for full text)")
+                else:
+                    refs.append(f"- **{prd_id}** (missing — create "
+                                f"`harn_env/prd/{prd_id}.md`)")
+            parts.append(
+                "## Task lineage (spec locked — PRD on demand)\nThe `## Done "
+                "when` below is the verified, narrowed spec. Implement exactly "
+                "that; read a PRD only if you need the deeper why:\n"
+                + "\n".join(refs))
+        else:
+            prd_parts: list[str] = []
+            for prd_id in task.prds:
+                p = prd_mod.find(env_dir, prd_id)
+                if p:
+                    prd_parts.append(f"### PRD: {p.id} — {p.title}\n\n{p.raw.strip()}")
+                else:
+                    prd_parts.append(
+                        f"### PRD: {prd_id}\n(file not found — create "
+                        f"`harn_env/prd/{prd_id}.md`)")
+            prd_header = (
+                f"This task belongs to PRD(s): **{', '.join(task.prds)}**. "
+                "Read them for the why, scope, and acceptance criteria.")
+            if task.epic:
+                prd_header += f" Epic: `{task.epic}`."
+            if task.user_story:
+                prd_header += f" User story: `{task.user_story}`."
+            hint = prd_mod.normalisation_hint(
+                [p for pid in task.prds
+                 for p in ([prd_mod.find(env_dir, pid)] if prd_mod.find(env_dir, pid) else [])]
+            )
+            parts.append(
+                "## Task lineage\n" + prd_header
+                + ("\n\n" + hint if hint else "")
+                + "\n\n" + "\n\n---\n\n".join(prd_parts))
     parts.append(f"## Current task — {task.id} (status: {task.status})\n" + task_body)
     dz = _design_block(env_dir, task.id)
     if dz:
@@ -1046,6 +1076,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     tok_costs: dict[str, float] = {}
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
+    plan_turns: dict[str, int] = {}  # funnel turns per task (capped)
     for _ in range(limit):
         task = tasks.next_task(env_dir, exclude=handled)
         if task is None:
@@ -1073,15 +1104,21 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
         was_rework = task.status == tasks.CHANGES_REQUESTED
         is_new = not task.review_log      # never been touched → planning candidate
 
-        # ── PLANNING TURN ────────────────────────────────────────────────────
-        # First touch of a brand-new task: clarify requirements, write acceptance
-        # criteria. Skipped in auto mode (agent decides for itself) and on rework.
-        if cfg.planning and is_new and not auto and not was_rework:
+        # ── PLANNING TURN(S) ─────────────────────────────────────────────────
+        # The clarification funnel: keep planning until the agent locks the spec
+        # (`lock_spec` → task.spec_locked). Multiple narrowing questions can span
+        # several turns. Skipped in auto mode and on rework (spec already locked).
+        # Capped at _MAX_PLAN_TURNS so a non-locking agent can't burn the budget;
+        # past the cap we proceed to execution with the current description.
+        if (cfg.planning and not task.spec_locked and not auto and not was_rework
+                and plan_turns.get(task.id, 0) < _MAX_PLAN_TURNS):
+            plan_turns[task.id] = plan_turns.get(task.id, 0) + 1
             st.transition(state.PLANNING)
             tasks.set_status(task, tasks.IN_PROGRESS)
-            task.review_log.append(tasks.ReviewEntry(
-                ts=tasks._now_iso(), event="planning_started", agent=adapter.name,
-            ))
+            if is_new:
+                task.review_log.append(tasks.ReviewEntry(
+                    ts=tasks._now_iso(), event="planning_started", agent=adapter.name,
+                ))
             tasks._save(task)
             st.current_task = task.id
             st.iterations += 1
@@ -1104,10 +1141,15 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 continue
             if b == "blocked":
                 return st.phase
-            # Planning complete — reload task (agent may have called update_task)
+            # Reload task — the agent may have called lock_spec this turn.
             task = tasks.find(env_dir, task.id) or task
-            progress.log(env_dir, f"{task.id}: planning complete", agent=adapter.name)
-            continue   # next iteration runs the execution turn
+            if task.spec_locked:
+                progress.log(env_dir, f"{task.id}: spec locked — planning complete",
+                             agent=adapter.name)
+            else:
+                progress.log(env_dir, f"{task.id}: planning continues (spec not "
+                             "locked yet)", agent=adapter.name)
+            continue   # loop: execution if locked, else another planning turn
 
         # ── EXECUTION TURN ────────────────────────────────────────────────────
         if not auto:

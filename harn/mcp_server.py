@@ -17,6 +17,7 @@ from pathlib import Path
 from . import codebase as codebase_mod
 from . import design as design_mod
 from . import guidance as guidance_mod
+from . import prd as prd_mod
 from . import progress as progress_mod
 from . import skills as skills_mod
 from . import state as state_mod
@@ -297,6 +298,46 @@ def build_server():
         if changed:
             tasks_mod._save(t)
         return f"Updated {task_id}: {', '.join(changed) or 'nothing changed'}"
+
+    @mcp.tool()
+    def read_prd(slug: str) -> str:
+        """Read a PRD's full text on demand (harn_env/prd/<slug>.md). Needed for
+        the WHY/scope during PLANNING; after `lock_spec` the task carries the
+        distilled criteria, so you rarely re-read the PRD while implementing —
+        which is why it isn't injected every turn."""
+        p = prd_mod.find(_env_dir(), slug)
+        return p.raw.strip() if p else (f"(no PRD '{slug}'). Create "
+                                        f"harn_env/prd/{slug}.md")
+
+    @mcp.tool()
+    def lock_spec(task_id: str, done_when: str, approach: str = "",
+                  decisions: list[str] | None = None) -> str:
+        """CLOSE the clarification funnel: write the narrowed, verified spec into
+        the task and lock it. Call at the END of planning, once your clarifying
+        questions have eliminated the ambiguity — not before.
+
+        `done_when` — the authoritative acceptance criteria, one observable,
+        independently verifiable fact per line (this becomes `## Done when`).
+        `approach` — optional: the chosen implementation direction, with the
+        rejected alternatives DROPPED (the funnel's whole point).
+        `decisions` — optional "decision :: rationale" strings recording what
+        was settled with the human.
+
+        After this, executor turns trust the locked spec and the full PRD is
+        read-on-demand (`read_prd`) — saving tokens with no loss of fidelity,
+        because the spec already distilled it."""
+        t = tasks_mod.find(_env_dir(), task_id)
+        if t is None:
+            return f"(task '{task_id}' not found)"
+        decs = []
+        for d in (decisions or []):
+            dec, _, why = d.partition("::")
+            decs.append((dec, why))
+        tasks_mod.lock_spec(t, done_when, approach, decs)
+        _log(f"{task_id}: spec locked ({len(done_when)} chars criteria)")
+        return (f"Spec locked for {task_id}. The funnel is closed — implement "
+                "exactly the locked `## Done when`; re-open only if the human "
+                "changes requirements.")
 
     @mcp.tool()
     def record_decision(task_id: str, decision: str, rationale: str = "") -> str:

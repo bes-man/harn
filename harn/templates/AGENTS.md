@@ -48,9 +48,13 @@ Ambiguity found while coding is 10× costlier than ambiguity resolved now.
 4. **Best practices** — verify against CURRENT practice, not training data:
    context7 (`resolve-library-id` → `get-library-docs`) for the libraries
    you'll touch; code search for in-repo precedent.
-5. **Clarify** — list remaining ambiguities (scope, naming, UX, data, edge
-   cases, trade-offs). Any exist? → interactive UI + `ask_user`, then STOP.
-   None? → say "no ambiguities" explicitly, then implement.
+5. **Clarify (the funnel)** — narrow, don't enumerate. Ask the
+   highest-leverage question first (the one that collapses the most options),
+   via interactive UI + `ask_user`, one at a time; after each answer drop the
+   ruled-out branches. When nothing material is left open, `lock_spec(task_id,
+   done_when, approach, decisions)` — the verified minimal spec the executor
+   implements verbatim. After lock, the full PRD is read-on-demand (`read_prd`),
+   not re-read. No ambiguities at all? say so, lock, implement.
 
 ## Loop (chat mode)
 

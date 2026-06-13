@@ -5,6 +5,17 @@ summary: Author tasks with create_task; carry context cheaply between iterations
 
 # Creating tasks & carrying context
 
+## Planning as a funnel → locked spec
+Planning NARROWS the task from many interpretations to one verified spec:
+1. Ask the highest-leverage question first (the one that collapses the most
+   options), via `ask_user`, one at a time; after each answer drop the
+   ruled-out branches. Don't dump a questionnaire.
+2. When nothing material is open, `lock_spec(task_id, done_when, approach,
+   decisions)` — the tight, verified spec the executor implements verbatim.
+3. After lock, the task carries the spec and the full PRD is read-on-demand
+   (`read_prd(slug)`), not injected every turn — saves tokens, no fidelity loss
+   (the spec already distilled the PRD). Re-open only if requirements change.
+
 ## Creating a task
 When the human describes work (or points at a PRD), YOU author the task via the
 `create_task` MCP tool — don't hand-write JSON, don't make them format it.
