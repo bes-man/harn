@@ -52,3 +52,21 @@ def test_claude_falls_back_on_non_json():
     assert r.ok is True
     assert "plain text output" in r.text
     assert r.total_tokens is None  # no usage available
+
+
+def test_prompt_is_cache_friendly_stable_first(tmp_path):
+    """Headless prompt must order stable content first, volatile last, so the
+    agent CLI's prefix cache reuses the maximum across turns."""
+    from pathlib import Path
+    from harn import scaffold, tasks, loop, ENV_DIRNAME
+    from harn.config import Config
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    t = tasks.create_task(env, "Add login", task_id="PRJ-001",
+                          description="## What\nlogin\n## Done when\n- works")
+    p = loop._build_prompt(env, Config.load(env), t, feedback_tail="3 passed")
+    i_skills = p.find("Available skills")        # stable
+    i_task = p.find("Current task")              # task-stable
+    i_board = p.find("Task board")               # volatile
+    i_fb = p.find("Last feedback")               # volatile
+    assert -1 < i_skills < i_task < i_board < i_fb

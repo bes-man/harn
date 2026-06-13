@@ -477,6 +477,11 @@ def _build_prompt(
     base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
     task_body = _task_spec(task)
 
+    # Prompt is ordered STABLE-FIRST, VOLATILE-LAST so the agent CLI's automatic
+    # prompt caching (Anthropic 5-min prefix cache) reuses the longest possible
+    # prefix across turns. Keep per-turn-changing content (board, progress,
+    # answers, feedback) at the END — see the volatile tail below. Do NOT move
+    # volatile blocks up here or every turn busts the cache for everything after.
     parts: list[str] = [base]
 
     if auto:
@@ -484,13 +489,6 @@ def _build_prompt(
 
     if cfg.loop_aware:
         parts.append(_LIFECYCLE_NOTE)
-        parts.append("## Task board\n" + tasks.board(env_dir))
-        prog = progress.tail(env_dir)
-        if prog:
-            parts.append("## Progress so far (shared across agents)\n" + prog)
-        answers = _answers_tail(state_dir)
-        if answers:
-            parts.append("## Earlier answers from the human\n" + answers)
 
     parts.append(
         "## Available skills (load only what you need)\n"
@@ -557,6 +555,15 @@ def _build_prompt(
         "- When the task is complete and tests pass, say what you did so the "
         "human can review it."
     )
+    # --- Volatile tail (changes every turn → kept last for cache hits) -------
+    if cfg.loop_aware:
+        parts.append("## Task board\n" + tasks.board(env_dir))
+        prog = progress.tail(env_dir)
+        if prog:
+            parts.append("## Progress so far (shared across agents)\n" + prog)
+        answers = _answers_tail(state_dir)
+        if answers:
+            parts.append("## Earlier answers from the human\n" + answers)
     if feedback_tail:
         parts.append("## Last feedback (tests)\n```\n" + feedback_tail + "\n```")
     return "\n\n".join(p for p in parts if p.strip())
