@@ -77,3 +77,24 @@ def test_pretask_protocol_in_lean_agents_template():
     assert "ask_user" in text
     assert "context7" in text
     assert "list_services" in text
+
+
+def test_read_skill_accepts_param_aliases(tmp_path, monkeypatch):
+    """read_skill must tolerate name / skill / skill_name (LLMs guess all three)
+    — repro of the pydantic 'name field required' error on skill_name=…"""
+    import asyncio
+    import harn.mcp_server as ms
+    env = _env(tmp_path)
+    monkeypatch.setenv("HARN_ENV_DIR", str(env))
+    (env / "skills" / "ui").mkdir(parents=True)
+    (env / "skills" / "ui" / "SKILL.md").write_text(
+        "---\nname: ui\ndescription: UI\n---\n\n# ui\n\nUSE_TOKENS\n")
+    srv = ms.build_server()
+
+    async def call(args):
+        return await srv.call_tool("read_skill", args)
+
+    for kw in ("name", "skill", "skill_name"):
+        result = asyncio.new_event_loop().run_until_complete(call({kw: "ui"}))
+        text = str(result)
+        assert "USE_TOKENS" in text, f"alias {kw} failed: {text[:120]}"

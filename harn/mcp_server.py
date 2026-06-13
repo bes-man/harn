@@ -94,10 +94,14 @@ def build_server():
         return skills_mod.index(_env_dir())
 
     @mcp.tool()
-    def read_skill(name: str) -> str:
-        """Return the full body of one skill. Call ONLY when the task needs it."""
-        body = skills_mod.read_skill(_env_dir(), name)
-        return body if body is not None else f"(no skill named '{name}')"
+    def read_skill(name: str = "", skill: str = "", skill_name: str = "") -> str:
+        """Return the full body of one skill. Call ONLY when the task needs it.
+        Pass the skill name as `name` (aliases `skill`/`skill_name` also work)."""
+        n = (name or skill or skill_name).strip()
+        if not n:
+            return 'provide the skill name, e.g. read_skill(name="ui")'
+        body = skills_mod.read_skill(_env_dir(), n)
+        return body if body is not None else f"(no skill named '{n}')"
 
     @mcp.tool()
     def save_to_skill(skill: str, content: str, description: str = "") -> str:
@@ -132,14 +136,17 @@ def build_server():
         return codebase_mod.index(_env_dir())
 
     @mcp.tool()
-    def read_service(name: str) -> str:
+    def read_service(name: str = "", service: str = "") -> str:
         """Full knowledge file for one service/module: its responsibility (what
         it owns / doesn't own), the standards any change must follow, hard
         constraints, and gotchas. Call ONLY for services the current task
-        touches — that's the point of the per-service split."""
-        body = codebase_mod.read(_env_dir(), name)
+        touches. Pass the service name as `name` (alias `service`)."""
+        n = (name or service).strip()
+        if not n:
+            return 'provide the service name, e.g. read_service(name="auth-api")'
+        body = codebase_mod.read(_env_dir(), n)
         if body is None:
-            return (f"(no service '{name}' registered) If it exists in the code, "
+            return (f"(no service '{n}' registered) If it exists in the code, "
                     "explore it and register it via `save_service`. Template:\n\n"
                     + codebase_mod.TEMPLATE)
         return body
