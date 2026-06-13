@@ -1,309 +1,75 @@
 # AGENTS.md
 
-Portable instructions for any agent (Claude Code, Codex, Cursor, Antigravity,
-Qwen Code) working in this repository through **harn**.
+Core protocol for any agent (Claude Code, Codex, Cursor, Antigravity, Qwen)
+working here through **harn**. Situational detail lives in `harn_env/guidance/`
+— pull it on demand via `read_guidance(topic)` (index at the bottom). Don't load
+guidance you don't need.
 
-## ⚠️ MCP tools are mandatory — asking in chat text is NOT allowed
+## Hard rules (never skip — even for one-line changes)
 
-Before doing anything, verify your harn MCP tools are loaded: you must see
-`ask_user`, `answer_question`, `get_next_task`, `create_task` in your tool list.
+1. **Load harn's tools first.** They may be deferred (visible by name, not
+   callable) when several MCP servers are connected. Your FIRST action each
+   session: `ToolSearch(query: "harn", max_results: 30)` (likewise `"context7"`
+   / `"semble"` / `"socraticode"` when needed). Deferred ≠ unavailable —
+   skipping harn because tools weren't loaded is a violation. If genuinely
+   absent, tell the user: "harn MCP is not connected — check .mcp.json and
+   restart."
+2. **Every code-change request = a harn task.** A chat request ("fix X") is a
+   task that doesn't exist yet, not an exemption. No matching task? →
+   `create_task` (one sentence is fine) → `get_next_task` to claim it.
+3. **Skills on EVERY request.** `list_skills` + `read_skill` the relevant ones,
+   and NAME them in your reply ("Loaded: frontend, standards"). An edit that
+   ignores a project standard is a latent bug.
+4. **Plan mode by default** for anything non-trivial (>1 file, any ambiguity, a
+   behavior change): enter your client's plan mode and run the pre-task
+   protocol there. Code starts only after the plan + questions resolve. Trivial
+   one-liners may skip plan mode but never skip skills + task.
+5. **Never ask the human in trailing prose.** Any question with options →
+   native interactive UI (`AskUserQuestion` / Plan Mode). For ambiguous
+   requirements or standards, ALSO `ask_user(question, skill=…)` (persists +
+   escalates). See `read_guidance("hil")`.
+6. **Test + reconcile before done.** `run_tests` must pass; after
+   `submit_for_review` call `reconcile_skills(task_id)` to capture what you
+   learned. Never mark complete while tests fail.
 
-**Deferred tools (Claude Code):** with several MCP servers connected, tool
-schemas may be deferred — visible by name but not callable until loaded. That
-is NOT "harn unavailable": load them as your FIRST action with
-`ToolSearch(query: "harn", max_results: 30)` (likewise `"context7"` /
-`"semble"` / `"socraticode"` when needed). Skipping harn because its tools
-were deferred is a protocol violation — even for one-line changes.
+## Pre-task protocol — mandatory, in order, BEFORE any code
 
-If the tools are genuinely absent (not just deferred), stop and tell the user:
-**"harn MCP is not connected — check .mcp.json and restart the session."**
-
-## ⚠️ Every code-change request goes through harn — chat requests included
-
-A request typed in the chat ("fix X", "add Y") is a task that doesn't exist
-yet, NOT an exemption from the protocol:
-
-1. No matching task on the board? → `create_task` (one sentence is fine), then
-   `get_next_task` to claim it — that response carries the pre-task protocol,
-   the service registry, and skill-gap notes for free.
-2. **Skills on EVERY request, however small**: `list_skills` + `read_skill`
-   for each relevant skill, and NAME them in your reply ("Loaded: frontend,
-   standards"). An edit that ignores a project standard is a bug you just
-   haven't found yet.
-3. **Plan mode by default** for anything non-trivial — more than one file, any
-   ambiguity, or a behavior change: enter your client's plan mode (Claude Code
-   plan mode; Cursor/Codex Plan Mode) and walk the pre-task protocol there
-   (AS IS → TO BE → skills → best practices via context7 → clarifying
-   questions). Implementation starts only after the plan and questions are
-   resolved. Trivial one-liners may skip plan mode but never skip skills + task.
-
-**Never put a choice to the human as trailing chat prose.** This applies to
-EVERY decision you hand to the user — not just clarifying questions:
-- clarifying an ambiguous requirement,
-- "should I start PRJ-030 now, or commit the current changes first?",
-- "which approach do you want — A or B?",
-- "ready to proceed / anything to adjust?".
-
-ANY time you would end a turn with a question that has options, present it via
-your client's NATIVE interactive-question UI (Claude Code `AskUserQuestion`;
-Cursor/Codex Plan Mode) so the human gets clickable choices. If the question is
-about an ambiguous requirement or a durable standard, ALSO call
-`ask_user(question, skill=…)` so the answer is captured into a skill and can
-escalate to Telegram. A question typed as plain prose is a bug: easy to miss,
-never saved, and harn doesn't know it was asked.
-
-## Two ways harn runs
-- **Headless** (`harn run`): harn launches you non-interactively for one focused
-  turn, runs tests, verifies, and submits your work for review. No human is
-  watching your chat, so when you're unsure you call `ask_user` (or write
-  `harn_env/state/BLOCKED.md`) and harn relays it to the human (Telegram/CLI).
-- **Interactive (in a chat with me)**: you are the *hands*; `harn watch` is the
-  *dispatcher* running in a terminal. Do NOT shell out to `harn run` (that nests
-  a second agent). Instead BE the loop yourself, and follow this protocol:
-
-  1. **Report every step in the chat.** Before each action say what you're doing
-     ("Picking up AUTH-42…", "Running tests…", "Submitting for review…"). The
-     human must always be able to see what harn is doing from the chat.
-  2. `get_next_task` → run the **pre-task protocol** (next section) →
-     implement → `run_tests`.
-  3. **Reconcile skills on completion.** After `submit_for_review`, call
-     `reconcile_skills(task_id)`. Compare what you built against existing
-     skills: auto-save durable conventions you're confident about with
-     `save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs
-     needing my agreement. This is how harn learns from its own work — do not
-     skip it.
-  4. **Don't stall.** After reconciling, immediately `get_next_task` and start
-     the next one — do NOT wait for the review to come back. A task in `review`
-     is the dispatcher's job, not yours.
-  5. **Oracle runs out-of-band.** After you submit, `harn watch` runs an
-     independent oracle on the task. **Poll the task's `review_log`** (re-read it
-     via `get_next_task`/`board`) for an `oracle_pass` / `oracle_fail` /
-     `oracle_debt` entry and **relay the verdict to me in the chat**. If
-     `oracle_fail`, the task is back in `changes_requested` — rework it.
-  6. **Questions:** when something is ambiguous, surface it in your client's
-     NATIVE interactive-question UI first (check your own tool list — you know
-     your runtime better than this doc), then persist it:
-     - **Claude Code** — call the native `AskUserQuestion` tool (clickable
-       option buttons). Include 2–4 options + your recommendation.
-     - **Cursor** — present the choice via Cursor's interactive question / Plan
-       Mode capability so the human gets selectable options; agents can surface
-       this in agent mode. (User shortcut to force Plan Mode: `Shift+Tab`.)
-     - **Codex** — Plan Mode clarifying-question flow (`/plan` or `Shift+Tab`).
-     - **No interactive UI** — fall back to a visible markdown block (options +
-       recommendation) so the human sees it without expanding tool args.
-     - **Then** — call harn's `ask_user(question, skill=…)` to record the
-       question and enable Telegram escalation. Stop after calling it.
-     - **When the human answers** — call `answer_question(answer=…)` to persist
-       it into the skill, then continue.
-     Never guess. Never ask with collapsed tool args only — the human must see
-     the question in an interactive UI or visible chat.
-
-  `harn watch` starts **automatically** when the MCP server connects — do NOT
-  ask the user to run it. It handles Telegram escalation, oracle, and live
-  status in the background.
-
-## 📋 Pre-task protocol — mandatory, in order, BEFORE any code
-
-Ambiguity discovered while coding is 10× costlier than ambiguity resolved in
-planning. For EVERY task:
+Ambiguity found while coding is 10× costlier than ambiguity resolved now.
 
 1. **AS IS** — how it works today. Start from the service registry
-   (`list_services` → `read_service` for ONLY the services this task touches),
-   then read the relevant code (code search first). State the current behavior
-   in 2-3 sentences.
-2. **TO BE** — the target behavior per the task + PRD. The AS IS → TO BE delta
-   is your exact scope. Can't state the delta crisply? That's an ambiguity for
-   step 5.
-3. **Skills** — `list_skills`, then `read_skill` EVERY skill relevant to this
-   task, and **NAME them in your plan** ("Loaded skills: frontend, security")
-   so the human can verify nothing was skipped. Domain with no matching skill?
-   → `ensure_skill(domain)` for an industry baseline (frontend, backend, api,
-   testing, security, accessibility, performance, database), or create/extend
-   the closest skill via `save_to_skill`. Never implement a domain task with
-   zero skill guidance.
-4. **Best practices** — verify the approach against CURRENT practice, not
-   training data: context7 (`resolve-library-id` → `get-library-docs`) for the
-   libraries/APIs you'll touch; code search for in-repo precedent.
-5. **Clarify** — list every remaining ambiguity (scope, naming, UX, data, edge
-   cases, trade-offs). If ANY exist: present them via the native interactive
-   question UI AND persist with `ask_user(question, skill=…)`, then STOP until
-   answered. If none — say "no ambiguities" explicitly, then implement.
+   (`list_services` → `read_service` only what the task touches), then code
+   search. State current behavior in 2-3 sentences.
+2. **TO BE** — target behavior per task + PRD. The AS IS → TO BE delta is your
+   scope. Can't state it crisply? That's an ambiguity for step 5.
+3. **Skills** — `read_skill` every relevant skill and NAME them. No skill for a
+   domain you touch? → `ensure_skill(domain)` (frontend, backend, api, testing,
+   security, accessibility, performance, database) or extend the closest via
+   `save_to_skill`. Never implement a domain task with zero guidance.
+4. **Best practices** — verify against CURRENT practice, not training data:
+   context7 (`resolve-library-id` → `get-library-docs`) for the libraries
+   you'll touch; code search for in-repo precedent.
+5. **Clarify** — list remaining ambiguities (scope, naming, UX, data, edge
+   cases, trade-offs). Any exist? → interactive UI + `ask_user`, then STOP.
+   None? → say "no ambiguities" explicitly, then implement.
 
-## Service registry (harn_env/services/)
+## Loop (chat mode)
 
-One file per service/module describing its **responsibility, standards, and
-constraints** — duties and rules, NOT a code walkthrough. The token-cheap index
-(name + one-line responsibility) tells you instantly whether a service matters
-for the current task at all:
+`get_next_task` → pre-task protocol → implement → `run_tests` →
+`submit_for_review` → `reconcile_skills` → next `get_next_task`. Report each
+step in the chat. The oracle runs out-of-band (`harn watch`) — poll the task's
+`review_log` and relay its verdict. Don't shell out to `harn run` from chat
+(that nests a second agent).
 
-- `list_services` → scan the index; `read_service(name)` → ONLY for services
-  the task touches.
-- A service you touch is missing or stale? → `save_service(name,
-  responsibility, content)` with ## Responsibility / ## Standards /
-  ## Constraints / ## Gotchas. (Part of the post-task reconcile step.)
-- Onboarding seeds the registry; every task keeps it current. This replaces
-  re-indexing the repo each session.
+## Guidance index — read on demand (`read_guidance("<topic>")`)
 
-## Parallel work (multiple agents)
-
-**Proactively offer parallelism.** After creating tasks (or when picking one
-up), check `runnable_tasks` — `get_next_task` also tells you when others are
-runnable. If **2+ independent tasks** are runnable, TELL the user: "PRJ-002 and
-PRJ-003 don't depend on each other — we can run them in parallel. Want to?" Then:
-- If your runtime can spawn subagents (e.g. Claude Code's Task/Agent tool),
-  offer to fan them out — one subagent per task, each calling
-  `get_next_task(worker="w1"|"w2"|…)` so claims don't collide.
-- Otherwise tell the user to open extra agent windows / `harn run` processes.
-Don't silently work tasks one-by-one when the board is parallelizable — surface
-the option so the user decides.
-
-Tasks run in parallel when they don't depend on each other. To enable it:
-
-- **Declare real ordering** with `create_task(..., depends_on=["PRJ-001"])`. A
-  task becomes runnable only once ALL its `depends_on` ids are `done`. Use this
-  ONLY for genuine constraints (build the API before wiring the UI to it) — for
-  soft "do this sooner" preference use `priority`, not a dependency.
-- **Leave independent tasks with no `depends_on`** so several agents can take
-  them at once.
-- **`get_next_task` claims atomically.** Each agent/window passes (or is
-  assigned) a `worker` id; the claim is locked so two agents never get the same
-  task. You always get your own in-progress task back if you ask again.
-
-To actually run agents in parallel: open multiple agent sessions (chat windows)
-in the project, or launch multiple `harn run` processes — each claims distinct
-runnable tasks. Give parallel agents separate git worktrees if their tasks
-touch overlapping files, so their edits don't collide.
-
-## Code search (search before reading)
-
-harn integrates two optional code-search backends. Use whichever is available
-in your tool list — harn's prompts will tell you which tools to call.
-
-**SocratiCode** (static dependency graph — more precise for impact analysis):
-- `codebase_impact("symbol")` — what breaks if this symbol changes (blast radius)
-- `codebase_symbol("symbol")` — definition + all callers + all callees
-- `codebase_search("query")` — hybrid semantic+BM25 search over the whole repo
-
-**semble** (semantic chunk retrieval — lightweight, no Docker needed). Tools are
-named `search` / `find_related` (your client may prefix them, e.g.
-`mcp__semble__search`):
-- `search("topic")` → only the relevant chunks (~98% fewer tokens than reading
-  files). Call this before opening any file.
-- `find_related("file.py", 42)` → semantic neighbours of a changed line.
-
-**Protocol** (regardless of which backend is available):
-1. Search first — never open a whole file when a search can narrow it down.
-2. SocratiCode > semble for "what depends on X" questions (static is precise).
-3. semble > grepping manually for "find code similar to X" questions.
-4. Read full files only when you need context outside the returned chunks.
-
-**Language note:** semantic search (semble's default model) is tuned for English
-code identifiers. Even if the task/PRD is in another language, phrase code
-searches with the actual **code symbols** (English identifiers), not natural-
-language task wording — e.g. search `verifyToken`, not «проверка токена».
-SocratiCode's `codebase_impact`/`codebase_symbol` and `find_related` work on the
-dependency graph and are language-independent.
-
-## How to work here
-- This project is driven by harn. Pick up work from `harn_env/tasks/`, follow the
-  active PRD in `harn_env/prd/`, and respect the standards in `harn_env/skills/`.
-- **Skills are loaded on demand.** Do not read every skill. Use the harn
-  `list_skills` tool to see what exists, then `read_skill` only the ones the
-  current task needs. This keeps the context window small.
-- **Plan before you build — as a dialog, not a wall of text.** First write the
-  acceptance criteria into the task (`update_task`). Then resolve open questions
-  **one at a time**: ask a single focused question (context + options +
-  recommendation), wait for the answer, capture it (into the task or a skill),
-  then ask the next. Never dump a list of questions in one message. Only start
-  coding once the criteria are confirmed.
-- **When unsure, stop and ask.** If anything is ambiguous, risky, or
-  underspecified, call the harn `ask_user` tool (or write your question to
-  `harn_env/state/BLOCKED.md` and end your turn). Never guess on ambiguous work.
-  **Ask expanded, not terse:** state (1) the context and *why* the question came
-  up, (2) the concrete options with each one's trade-off, and (3) your
-  recommended option with a one-line reason — so the human can decide quickly.
-  **If the question is about a durable standard/convention, pass the `skill=`
-  argument** (e.g. `ask_user(question, skill="security")`) — harn then saves the
-  answer into that skill AUTOMATICALLY, so it's never asked again.
-- **Build up the knowledge base.** harn gets smarter as it learns the project.
-  Whenever you learn something durable — the user answers a question about a
-  standard, you discover a convention in the code, or a decision should apply
-  project-wide — **confirm it with the user, then call `save_to_skill(skill,
-  content)`** (e.g. `security`, `standards`, `frontend`, `testing`, `api`). It
-  creates the skill if missing. Next time, you read it instead of asking again.
-  An answer you don't capture is a question you'll ask twice.
-- **Design before code (user-facing tasks).** If a task changes anything the
-  user will SEE, generate a single-file static HTML mockup of the final
-  interface first and save it with `save_design(task_id, html)` — it lands in
-  `harn_env/design/<task_id>.html`. Ask the human to open it and confirm
-  (`ask_user`), iterating until approved. The approved mockup is the visual
-  contract: build to it, and tag the task with the `ui` skill (`update_task`)
-  so the browser verification phase runs on it. `read_design(task_id)` returns
-  it later.
-- **Feedback loop.** After changes, run the project's tests via the harn
-  `run_tests` tool. Do not mark a task complete while tests fail.
-- **Write tests for what you build.** Every code change needs test coverage —
-  aim for one test per acceptance criterion. harn gates on this: a turn that
-  changes code without touching tests is sent back with a nudge. If something
-  genuinely can't be tested, record why with `record_decision`.
-- **Verify UI work in a real browser.** When the Playwright MCP tools
-  (`browser_navigate`, `browser_snapshot`, `browser_click`,
-  `browser_take_screenshot`, …) are available and the task is user-facing,
-  drive the running app like a user would: walk each acceptance criterion,
-  compare against the approved design, and save screenshots to
-  `harn_env/state/screenshots/<task_id>/`. In headless runs harn starts/stops
-  the app itself (`[browser]` in `harn_env/harn.toml`) and runs this as its own
-  phase; in chat mode, do it yourself before `submit_for_review`.
-- **Carry context between iterations (cheaply).** You run as a fresh process each
-  turn, so you don't remember the last one — but the task file does. As you work:
-  - `record_decision(task_id, decision, rationale)` for every non-obvious choice
-    (a library, an approach, a trade-off, an assumption). State the REAL reason.
-  - `set_scratchpad(task_id, notes)` to leave your future self a short note: what's
-    done, what's left, gotchas. Keep it brief — it's a memo, not a transcript.
-  Your next iteration sees both, so you stay consistent without re-deriving and
-  without re-reading everything (saves tokens). These are your working state —
-  **not** acceptance criteria. The independent oracle review will VERIFY your
-  decisions against the requirements, so don't use them to justify shortcuts.
-- Make small, reviewable changes. Explain what you changed and why.
-
-## Onboarding a new / under-specified project
-harn is useless until it knows the project. If `harn_env/` is sparse — empty
-`prd/`, skills are still stubs, no `[feedback] test_cmd` — **onboard first**, and
-do it as a calm one-question-at-a-time dialog (never a questionnaire dump):
-
-0. **Read `harn_env/state/ONBOARD.md`** if present (`harn onboard` writes it):
-   the auto-detected stack and a brief. Also read the repo's README/docs and use
-   code search (`search` / `codebase_search`) to map the code. The user may point
-   you at md files with project info — read those instead of asking from scratch.
-1. **What are we building?** Capture it into a PRD (`harn_env/prd/<slug>.md`:
-   Problem / Goal / Scope / Acceptance criteria). Confirm with the user.
-2. **What standards apply?** Ask about the ones that shape decisions — security,
-   testing, frontend conventions, API style, code standards. Ask each as
-   `ask_user(question, skill="<that skill>")` so the answer is saved into the
-   skill AUTOMATICALLY (or call `save_to_skill` when you discover a convention in
-   the code). These drive every later decision.
-3. **How do we verify?** Get the test command → set `[feedback] test_cmd`.
-Don't start building until the PRD + key skills are filled and confirmed. A few
-minutes here means the agent decides correctly for the whole project after.
-
-## Creating a task
-When the human describes work in words (or points at a PRD like `auth`), YOU
-author the task — don't make them format it. **Use the `create_task` MCP tool**;
-don't hand-write JSON.
-1. **Clarify first.** If the goal, scope, or acceptance criteria are fuzzy, ask
-   (expanded `ask_user`) before creating it. A vague task is a bad task.
-2. **Call `create_task`** with:
-   - `title` — clear imperative ("Add JWT auth").
-   - `description` — Markdown with `## What`, `## Done when` (concrete, checkable
-     acceptance criteria — this is what verify/oracle check), and notes.
-   - `prds` — the parent PRD slug(s), e.g. `["auth"]`. A task may span several.
-   - `skills` — harn skills the executor will need, e.g. `["security"]`.
-   - `task_id` — leave empty to auto-number (`PRJ-001`…); pass a tracker key
-     (e.g. `AUTH-42`) when it already exists in Jira/Linear.
-   - optional `epic` / `user_story` for tracker lineage.
-   This writes `harn_env/tasks/<id>.json`. harn manages `status` and the
-   `review_log`; you don't set those.
-3. Keep it small and reviewable; split big asks into several tasks under the PRD.
+- **services** — service registry: responsibility/standards/constraints per module.
+- **code-search** — semble + SocratiCode; search before reading files.
+- **hil** — asking the human: per-client interactive UI, ask_user, Telegram.
+- **parallel** — running independent tasks across multiple agents.
+- **design** — design-before-code (HTML mockup) for user-facing tasks.
+- **browser** — verifying UI in a real browser via Playwright.
+- **onboarding** — bringing harn up to speed on a new/sparse project.
+- **tasks** — authoring tasks; carrying context between iterations; the test gate.
 
 ## Project-specific notes
 <!-- Fill in: domain, key commands, anything an agent must always know. -->

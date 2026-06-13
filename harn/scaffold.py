@@ -27,10 +27,17 @@ def _templates_dir() -> Path:
     return Path(str(resources.files("harn") / "templates"))
 
 
+# Top-level template files handled explicitly (not bulk-copied into harn_env):
+# the AGENTS.md variants are written to the project ROOT per the guidance mode.
+_SKIP_TOP = {"AGENTS.md", "AGENTS.full.md"}
+
+
 def _copy_tree(src: Path, dst: Path) -> list[str]:
     created: list[str] = []
     for item in src.rglob("*"):
         rel = item.relative_to(src)
+        if rel.parts and rel.parts[0] in _SKIP_TOP and len(rel.parts) == 1:
+            continue
         target = dst / rel
         if item.is_dir():
             target.mkdir(parents=True, exist_ok=True)
@@ -41,6 +48,23 @@ def _copy_tree(src: Path, dst: Path) -> list[str]:
             shutil.copy2(item, target)
             created.append(str(rel))
     return created
+
+
+def _guidance_mode(project_root: Path) -> str:
+    from .config import Config
+    try:
+        return Config.load(project_root / ENV_DIRNAME).guidance
+    except Exception:
+        return "lean"
+
+
+def _agents_template_text(mode: str) -> str:
+    """Return the AGENTS.md body for the guidance mode ('full' → verbose
+    variant, else the lean core)."""
+    tpl = _templates_dir() / ("AGENTS.full.md" if mode == "full" else "AGENTS.md")
+    if not tpl.exists():
+        tpl = _templates_dir() / "AGENTS.md"
+    return tpl.read_text(encoding="utf-8")
 
 
 def _mcp_command() -> dict:
@@ -169,13 +193,14 @@ def setup(project_root: Path) -> dict:
 
     created = _copy_tree(_templates_dir(), env_dir)
 
-    # AGENTS.md must sit in the project root (agents read it there).
-    bundled_agents = env_dir / "AGENTS.md"
+    # AGENTS.md sits in the project ROOT (agents read it there), written from
+    # the lean core or the full variant per [harn] guidance (harn.toml was just
+    # copied, so the config is now readable).
     root_agents = project_root / "AGENTS.md"
-    if bundled_agents.exists() and not root_agents.exists():
-        shutil.move(str(bundled_agents), str(root_agents))
-    elif bundled_agents.exists():
-        bundled_agents.unlink()
+    if not root_agents.exists():
+        root_agents.write_text(
+            _agents_template_text(_guidance_mode(project_root)), encoding="utf-8")
+        created.append("AGENTS.md")
 
     # Claude Code auto-loads CLAUDE.md, NOT AGENTS.md — without this, the harn
     # protocol never reaches a Claude Code session. Write a thin CLAUDE.md that
@@ -275,12 +300,11 @@ def refresh_agents_md(project_root: Path) -> str | None:
     path written, or None if it was already identical / no template found.
 
     AGENTS.md is harness-managed (onboarding fills the PRD + skills, not this
-    file), so refreshing it is safe; the backup covers any local edits."""
+    file), so refreshing it is safe; the backup covers any local edits. The
+    variant (lean vs full) follows [harn] guidance. Guidance topic files in
+    harn_env/guidance/ are refreshed too (new ones added; existing left)."""
     project_root = project_root.resolve()
-    tpl = _templates_dir() / "AGENTS.md"
-    if not tpl.exists():
-        return None
-    new_text = tpl.read_text(encoding="utf-8")
+    new_text = _agents_template_text(_guidance_mode(project_root))
     dest = project_root / "AGENTS.md"
     changed = None
     if not dest.exists() or dest.read_text(encoding="utf-8") != new_text:
@@ -288,6 +312,16 @@ def refresh_agents_md(project_root: Path) -> str | None:
             shutil.copy2(dest, dest.with_suffix(".md.bak"))
         dest.write_text(new_text, encoding="utf-8")
         changed = str(dest)
+    # Ensure the on-demand guidance topics exist (add any new ones).
+    g_src = _templates_dir() / "guidance"
+    if g_src.exists():
+        g_dst = project_root / ENV_DIRNAME / "guidance"
+        g_dst.mkdir(parents=True, exist_ok=True)
+        for f in g_src.glob("*.md"):
+            t = g_dst / f.name
+            if not t.exists():
+                shutil.copy2(f, t)
+                changed = changed or str(t)
     # Always ensure CLAUDE.md exists and imports AGENTS.md (Claude Code path).
     claude = _write_claude_md(project_root)
     return changed or claude

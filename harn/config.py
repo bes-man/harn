@@ -35,7 +35,7 @@ DEFAULTS: dict = {
     # all context (AGENTS.md, the task board, PROGRESS.md, ANSWERS.md, MCP), so
     # whichever one runs next understands what's done and what's planned.
     "harn": {"agent": "claude", "agents": [], "project": "prj001",
-             "autonomy": 0.7, "require_mcp": True},
+             "autonomy": 0.7, "require_mcp": True, "guidance": "lean"},
     "feedback": {"test_cmd": "", "require_tests": True},
     "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
              "auto": False, "auto_max_iterations": 30,
@@ -59,6 +59,10 @@ class Config:
     # everything), 1 = creative (decide for itself). Default 0.7.
     autonomy: float = 0.7
     require_mcp: bool = True   # setup/doctor insist the MCP server is enabled
+    # Guidance verbosity: "lean" = compact core AGENTS.md + on-demand
+    # harn_env/guidance/ (fewer tokens); "full" = everything inline (max
+    # predictability, more tokens).
+    guidance: str = "lean"
     test_cmd: str = ""
     # Test-writing gate: when a turn changes code but adds/changes no tests,
     # feed back one "add tests" nudge before the work can proceed to verify.
@@ -130,6 +134,7 @@ class Config:
                 os.environ.get("HARN_AUTONOMY") or data["harn"].get("autonomy", 0.7)
             ),
             require_mcp=bool(data["harn"].get("require_mcp", True)),
+            guidance=str(data["harn"].get("guidance", "lean") or "lean").strip().lower(),
             test_cmd=data["feedback"].get("test_cmd", ""),
             require_tests=bool(data["feedback"].get("require_tests", True)),
             max_iterations=int(data["loop"].get("max_iterations", 10)),

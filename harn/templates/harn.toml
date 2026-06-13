@@ -17,6 +17,14 @@ autonomy = 0.7
 # until you confirm — harn is useless to the agent until MCP is on. Set false to
 # silence the check.
 require_mcp = true
+# Guidance verbosity (default "lean"). Controls the generated root AGENTS.md:
+#   "lean" — compact core (hard rules + pre-task protocol) + an index; the
+#            situational detail lives in harn_env/guidance/<topic>.md and the
+#            agent pulls it on demand via read_guidance(). ~1k tokens/session.
+#   "full" — everything inline in AGENTS.md (~4.8k tokens), maximum
+#            predictability at higher token cost.
+# Re-run `harn setup` (or `harn update` inside the project) after changing.
+guidance = "lean"
 # Single agent (shorthand):
 agent = "claude"           # claude | codex | cursor | antigravity | qwen
 # Or several, tried in order — the first one installed runs. Whichever agent

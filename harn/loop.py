@@ -363,19 +363,10 @@ _LIFECYCLE_NOTE = (
     "tools (`get_next_task`, `read_skill`, `run_tests`, `board`, "
     "`submit_for_review`). If anything is ambiguous or risky, call `ask_user` "
     "(or write `harn_env/state/BLOCKED.md`) and STOP — do not guess.\n"
-    "BEFORE any code, run the pre-task protocol in order: (1) AS IS — current "
-    "behavior from the service registry + code search; (2) TO BE — target behavior; "
-    "the delta is your scope; (3) SKILLS — read and NAME every relevant skill; "
-    "none for a domain you touch → `ensure_skill(domain)` or extend the closest "
-    "via `save_to_skill`; (4) BEST PRACTICES — check current docs (context7) "
-    "and in-repo precedent; (5) CLARIFY — any remaining ambiguity goes to "
-    "`ask_user` and you STOP; none → say 'no ambiguities' and implement.\n"
-    "Before you submit, RECONCILE SKILLS: compare what you built against the "
-    "project's skills; auto-save durable conventions you're confident about via "
-    "`save_to_skill` (prefix `[auto]`), and `ask_user(skill=…)` for trade-offs "
-    "needing human agreement; refresh service files (save_service) if "
-    "responsibilities/standards/constraints "
-    "changed. harn learns from its own work, not just questions.\n"
+    "BEFORE any code, run the pre-task protocol from AGENTS.md (AS IS → TO BE → "
+    "skills, named → best practices → clarify). BEFORE you submit, RECONCILE: "
+    "`save_to_skill` for confident conventions ([auto]), `ask_user(skill=…)` "
+    "for trade-offs, refresh touched service files. harn learns from its work.\n"
     + _ASK_GUIDANCE
 )
 

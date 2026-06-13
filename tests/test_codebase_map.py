@@ -68,11 +68,12 @@ def test_save_replaces_existing(tmp_path):
     assert ("api", "v2 responsibility") in codebase.list_services(env)
 
 
-def test_pretask_protocol_in_mcp_module():
-    from harn.mcp_server import _PRETASK_PROTOCOL
+def test_pretask_protocol_in_lean_agents_template():
+    from harn.scaffold import _agents_template_text
+    text = _agents_template_text("lean")
     for step in ("AS IS", "TO BE", "Skills", "Best practices", "Clarify"):
-        assert step in _PRETASK_PROTOCOL
-    assert "ensure_skill" in _PRETASK_PROTOCOL
-    assert "ask_user" in _PRETASK_PROTOCOL
-    assert "context7" in _PRETASK_PROTOCOL
-    assert "read_service" in _PRETASK_PROTOCOL
+        assert step in text
+    assert "ensure_skill" in text
+    assert "ask_user" in text
+    assert "context7" in text
+    assert "list_services" in text
