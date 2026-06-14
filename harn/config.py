@@ -12,6 +12,35 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
 
+def autonomy_directive(level: float) -> str:
+    """Translate the 0.0–1.0 autonomy level into a behavioural directive.
+    Low = ask about almost everything; high = decide and proceed. Surfaced to
+    BOTH the headless loop and the chat agent (via get_next_task) so the
+    harn.toml setting actually governs how often the agent asks."""
+    pct = int(round(level * 100))
+    if level <= 0.3:
+        stance = (
+            "Be METICULOUS. Surface every ambiguity, missing detail, or "
+            "assumption and call `ask_user` BEFORE acting — including small or "
+            "routine choices. Prefer asking over deciding; the human wants tight "
+            "control over direction. When in doubt, ask."
+        )
+    elif level <= 0.7:
+        stance = (
+            "Be BALANCED. Decide routine, low-risk, reversible matters yourself "
+            "using best practices and state your assumption. Reserve `ask_user` "
+            "for choices that are BOTH ambiguous AND significant or hard to undo."
+        )
+    else:
+        stance = (
+            "Be DECISIVE and creative. Resolve ambiguity yourself with current "
+            "best practices and proceed, stating your assumptions and recording "
+            "them via `record_decision`. Only `ask_user` when truly blocked or a "
+            "decision is high-stakes AND irreversible."
+        )
+    return f"## Autonomy: {pct}% self-directed\n{stance}"
+
+
 def _clamp01(value) -> float:
     """Parse a 0.0–1.0 autonomy value, clamped into range (default 0.7)."""
     try:

@@ -84,27 +84,8 @@ _AUTO_BUTTON_NOTE = (
 
 def _autonomy_note(level: float) -> str:
     """Translate the 0.0–1.0 autonomy level into a behavioural directive."""
-    pct = int(round(level * 100))
-    if level <= 0.3:
-        stance = (
-            "Be METICULOUS. Surface every ambiguity, missing detail, or "
-            "assumption and call `ask_user` BEFORE acting. Prefer asking over "
-            "deciding — the human wants tight control over direction."
-        )
-    elif level <= 0.7:
-        stance = (
-            "Be BALANCED. Decide routine, low-risk, reversible matters yourself "
-            "using best practices and state your assumption. Reserve `ask_user` "
-            "for choices that are BOTH ambiguous AND significant or hard to undo."
-        )
-    else:
-        stance = (
-            "Be DECISIVE and creative. Resolve ambiguity yourself with current "
-            "best practices and proceed, stating your assumptions and recording "
-            "them via `record_decision`. Only `ask_user` when truly blocked or a "
-            "decision is high-stakes AND irreversible."
-        )
-    return f"## Autonomy: {pct}% self-directed\n{stance}"
+    from .config import autonomy_directive
+    return autonomy_directive(level)
 
 # Max consecutive planning turns per task before harn proceeds to execution
 # even without an explicit lock_spec — a backstop against a non-locking agent

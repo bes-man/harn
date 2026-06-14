@@ -88,3 +88,28 @@ def test_planning_cap_proceeds_without_lock(tmp_path, monkeypatch):
     # At most _MAX_PLAN_TURNS planning turns, then execution (a non-planning turn)
     assert seen.count(True) <= loop._MAX_PLAN_TURNS
     assert False in seen  # execution turn happened
+
+
+def test_autonomy_reaches_chat_mode_get_next_task(tmp_path, monkeypatch):
+    """[harn] autonomy must govern ask-vs-decide in CHAT mode (get_next_task),
+    not only headless. autonomy=0 → METICULOUS; autonomy=1 → DECISIVE."""
+    import asyncio
+    import harn.mcp_server as ms
+    env = _proj(tmp_path)
+    monkeypatch.setenv("HARN_ENV_DIR", str(env))
+    toml = env / "harn.toml"
+
+    def next_task_text():
+        srv = ms.build_server()
+        return str(asyncio.new_event_loop().run_until_complete(
+            srv.call_tool("get_next_task", {})))
+
+    tasks.create_task(env, "Add login", task_id="PRJ-001",
+                      description="## What\nx\n## Done when\n- works")
+    toml.write_text(toml.read_text().replace("autonomy = 0.7", "autonomy = 0.0"))
+    assert "METICULOUS" in next_task_text()
+
+    tasks.create_task(env, "Add logout", task_id="PRJ-002",
+                      description="## What\nx\n## Done when\n- works")
+    toml.write_text(toml.read_text().replace("autonomy = 0.0", "autonomy = 1.0"))
+    assert "DECISIVE" in next_task_text()

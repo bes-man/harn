@@ -199,6 +199,10 @@ def build_server():
         out = t.path.read_text(encoding="utf-8")
         out += ("\n\n▶ Run the pre-task protocol from AGENTS.md before any code: "
                 "AS IS → TO BE → skills (name them) → best practices → clarify.")
+        # Surface the configured autonomy level so [harn] autonomy actually
+        # governs ask-vs-decide in chat mode (it only reached headless before).
+        from .config import autonomy_directive
+        out += "\n\n" + autonomy_directive(Config.load(env).autonomy)
         out += "\n\n" + codebase_mod.prompt_note(env)
         note = skill_library.gap_note(env, t)
         if note:
