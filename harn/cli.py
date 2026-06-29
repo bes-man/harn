@@ -166,6 +166,12 @@ def _run_onboard(root: Path, env_dir: Path) -> None:
         f"# Auto-detected stack\n{onboard.stack_summary(stack)}\n\n{brief}",
         encoding="utf-8")
 
+    # Ensure WORKFLOW.md exists and refresh ONLY its skills snapshot to reflect
+    # the skills just seeded (never clobbering hand-edited steps).
+    from . import workflow
+    workflow.write(env_dir)            # create from template if missing
+    workflow.refresh_skills(env_dir)   # update the snapshot block in place
+
 
 def cmd_onboard(args) -> int:
     root = Path(args.path).resolve()
@@ -342,6 +348,111 @@ def cmd_board(args) -> int:
     return 0
 
 
+def cmd_ui(args) -> int:
+    from . import studio
+    env_dir = _env_dir(Path(args.path).resolve())
+    if not env_dir.exists():
+        print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
+        return 1
+    studio.serve(env_dir, host=args.host, port=args.port,
+                 open_browser=not args.no_open)
+    return 0
+
+
+def cmd_workflow(args) -> int:
+    from . import workflow
+    env_dir = _env_dir(Path(args.path).resolve())
+    if args.refresh:
+        p = workflow.refresh_skills(env_dir)
+        print(f"[harn] refreshed skills snapshot in {p}")
+        return 0
+    if args.force:
+        p = workflow.write(env_dir, force=True)
+        print(f"[harn] reset WORKFLOW.md to the default template at {p}")
+        return 0
+    p = env_dir / workflow.FILENAME
+    if not p.exists():
+        workflow.write(env_dir)
+    print(p.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_explain(args) -> int:
+    from . import loop
+    from .config import Config
+    env_dir = _env_dir(Path(args.path).resolve())
+    print(loop.explain(Config.load(env_dir)))
+    return 0
+
+
+def cmd_trace(args) -> int:
+    from . import events
+    env_dir = _env_dir(Path(args.path).resolve())
+    evs = events.read(env_dir, task_id=args.task_id or None,
+                      run_id=args.run_id or None)
+    if not evs:
+        print("(no events recorded yet)")
+        return 0
+    for e in evs:
+        ts = e.get("ts", "")
+        ev = e.get("event", "")
+        stage = e.get("stage", "")
+        task = e.get("task_id", "")
+        bits = [f"{ts}", f"{ev}"]
+        if task:
+            bits.append(task)
+        if stage:
+            bits.append(stage)
+        for k in ("verdict", "outcome", "phase", "source"):
+            if e.get(k):
+                bits.append(f"{k}={e[k]}")
+        if e.get("dur_ms") is not None:
+            bits.append(f"{e['dur_ms']}ms")
+        toks = (e.get("tok_in") or 0) + (e.get("tok_out") or 0)
+        if toks:
+            bits.append(f"{toks}tok")
+        line = "  ".join(str(b) for b in bits)
+        if e.get("summary"):
+            line += f"\n      └ {e['summary']}"
+        print(line)
+    return 0
+
+
+def cmd_metrics(args) -> int:
+    from . import events
+    env_dir = _env_dir(Path(args.path).resolve())
+    m = events.metrics(env_dir, run_id=args.run_id or None)
+    if not m["events"]:
+        print("(no events recorded yet)")
+        return 0
+    print(f"runs={m['runs']}  cycles={m['cycles']}  blocks={m['blocks']}  "
+          f"errors={m['errors']}  events={m['events']}")
+    print(f"tokens: {m['tok_in']} in + {m['tok_out']} out  "
+          f"(~${m['cost_usd']})")
+    o = m["oracle"]
+    if any(o.values()):
+        print(f"oracle: PASS={o['PASS']}  FAIL={o['FAIL']}  DEBT={o['DEBT']}")
+    if m["stages"]:
+        print("stages (turns · tokens · mean dur):")
+        for name, s in m["stages"].items():
+            print(f"  {name:<10} {s['count']:>3} · {s['tok']:>7}tok · "
+                  f"{s['mean_dur_ms']:>6}ms")
+    return 0
+
+
+def cmd_changelog(args) -> int:
+    from . import tasks
+    env_dir = _env_dir(Path(args.path).resolve())
+    md = tasks.render_changelog(env_dir, args.task_id)
+    if args.write:
+        out = env_dir / "CHANGELOG.md"
+        out.write_text(md, encoding="utf-8")
+        print(f"[harn] changelog written to {out}")
+    else:
+        print(md)
+    return 0
+
+
 def cmd_review(args) -> int:
     from . import loop
     env_dir = _env_dir(Path(args.path).resolve())
@@ -452,6 +563,50 @@ def build_parser() -> argparse.ArgumentParser:
     bp = sub.add_parser("board", help="show the task track (todo→review→done)")
     bp.add_argument("path", nargs="?", default=".")
     bp.set_defaults(func=cmd_board)
+
+    uip = sub.add_parser("ui",
+                         help="visual editor for the workflow + skills (localhost)")
+    uip.add_argument("--port", type=int, default=9999)
+    uip.add_argument("--host", default="127.0.0.1")
+    uip.add_argument("--no-open", action="store_true", help="don't open a browser")
+    uip.add_argument("path", nargs="?", default=".")
+    uip.set_defaults(func=cmd_ui)
+
+    wfp = sub.add_parser("workflow",
+                         help="show/refresh harn_env/WORKFLOW.md (the agent's flow)")
+    wfp.add_argument("--refresh", action="store_true",
+                     help="update only the skills snapshot, keep edits")
+    wfp.add_argument("--force", action="store_true",
+                     help="reset to the default template (discards edits)")
+    wfp.add_argument("path", nargs="?", default=".")
+    wfp.set_defaults(func=cmd_workflow)
+
+    exp = sub.add_parser("explain",
+                         help="show the pipeline stages that run for this config")
+    exp.add_argument("path", nargs="?", default=".")
+    exp.set_defaults(func=cmd_explain)
+
+    trp = sub.add_parser("trace",
+                         help="print the structured event stream (one run/task)")
+    trp.add_argument("--task", dest="task_id", default=None, help="filter by task id")
+    trp.add_argument("--run", dest="run_id", default=None, help="filter by run id")
+    trp.add_argument("path", nargs="?", default=".")
+    trp.set_defaults(func=cmd_trace)
+
+    mtp = sub.add_parser("metrics",
+                         help="aggregate observability numbers from the event stream")
+    mtp.add_argument("--run", dest="run_id", default=None, help="limit to one run id")
+    mtp.add_argument("path", nargs="?", default=".")
+    mtp.set_defaults(func=cmd_metrics)
+
+    cp = sub.add_parser("changelog",
+                        help="assemble release notes from tasks' changelog + decisions")
+    cp.add_argument("--task", dest="task_id", default=None,
+                    help="limit to one task id (default: all)")
+    cp.add_argument("--write", action="store_true",
+                    help="also write to harn_env/CHANGELOG.md")
+    cp.add_argument("path", nargs="?", default=".")
+    cp.set_defaults(func=cmd_changelog)
 
     vp = sub.add_parser("review", help="accept a task or request changes")
     vp.add_argument("task_id", help="task id (file stem) currently in review")

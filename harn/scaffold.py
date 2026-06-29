@@ -212,6 +212,14 @@ def setup(project_root: Path) -> dict:
     for sub in ("state", "tasks", "prd", "design", "services"):
         (env_dir / sub).mkdir(exist_ok=True)
 
+    # The single-file workflow the agent follows (flow + likely skills). Written
+    # after the skill templates are copied so the skills index is populated;
+    # refreshed by `harn onboard` once more skills are seeded.
+    from . import workflow
+    workflow.write(env_dir)
+    if workflow.FILENAME not in created:
+        created.append(workflow.FILENAME)
+
     agent_cfgs, root_paths = _write_agent_configs(project_root)
     _gitignore_add(project_root, root_paths)
 
@@ -242,6 +250,10 @@ Same applies to semble / socraticode / context7 tools when you need them
 weren't loaded — loading them IS your first step. Working around harn (editing
 files directly without `get_next_task` → pre-task protocol → `run_tests` →
 `submit_for_review`) is a protocol violation EVEN for one-line changes.
+
+## ⚠️ STEP 0.5 — orient (first turn)
+Read `harn_env/WORKFLOW.md` (flow + likely skills). If `harn_env/state/ONBOARD.md`
+exists and the PRD/standards are empty, onboard first (per that file).
 
 ## ⚠️ STEP 1 — every code-change request goes through harn, with skills
 A request typed in the chat ("fix the padding", "add a button") is NOT exempt

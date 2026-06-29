@@ -99,10 +99,10 @@ def test_loop_nudges_once_per_task(tmp_path, monkeypatch):
     phase = loop.run(repo, env)
 
     # turn 1: code w/o tests → nudge; turn 2 carries the nudge, gate doesn't
-    # re-fire (once per task) → task proceeds to review.
+    # re-fire (once per task) → task proceeds to review; turn 3 is reconcile.
     assert phase == state.REVIEW
-    assert fake.calls == 2
-    assert fake.feedbacks == [False, True]
+    assert fake.calls == 3  # work×2 + reconcile×1
+    assert fake.feedbacks == [False, True, False]  # reconcile prompt has no nudge
     assert tasks.find(env, "PRJ-001").status == tasks.REVIEW
 
 
@@ -123,4 +123,4 @@ def test_gate_off_by_config(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
 
     assert loop.run(repo, env) == state.REVIEW
-    assert fake.calls == 1
+    assert fake.calls == 2  # work turn + reconcile turn

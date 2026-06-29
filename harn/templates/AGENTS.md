@@ -7,13 +7,12 @@ guidance you don't need.
 
 ## Hard rules (never skip — even for one-line changes)
 
-1. **Load harn's tools first.** They may be deferred (visible by name, not
-   callable) when several MCP servers are connected. Your FIRST action each
-   session: `ToolSearch(query: "harn", max_results: 30)` (likewise `"context7"`
-   / `"semble"` / `"socraticode"` when needed). Deferred ≠ unavailable —
-   skipping harn because tools weren't loaded is a violation. If genuinely
-   absent, tell the user: "harn MCP is not connected — check .mcp.json and
-   restart."
+1. **Load harn's tools first, then the workflow.** Tools may be deferred (visible
+   by name, not callable) when several MCP servers are connected. Your FIRST
+   action each session: `ToolSearch(query: "harn", max_results: 30)` (likewise
+   `"context7"` / `"semble"` when needed). Then `read_workflow` (the
+   always-followed flow + required skills per step) and follow it. Deferred ≠
+   unavailable. If absent: "harn MCP is not connected — check .mcp.json."
 2. **Every code-change request = a harn task.** A chat request ("fix X") is a
    task that doesn't exist yet, not an exemption. No matching task? →
    `create_task` (one sentence is fine) → `get_next_task` to claim it.
@@ -27,10 +26,14 @@ guidance you don't need.
 5. **Never ask the human in trailing prose.** Any question with options →
    native interactive UI (`AskUserQuestion` / Plan Mode). For ambiguous
    requirements or standards, ALSO `ask_user(question, skill=…)` (persists +
-   escalates). See `read_guidance("hil")`.
-6. **Test + reconcile before done.** `run_tests` must pass; after
-   `submit_for_review` call `reconcile_skills(task_id)` to capture what you
-   learned. Never mark complete while tests fail.
+   escalates). When resuming, call `check_pending_answer()` first — the answer
+   may have arrived via Telegram. See `read_guidance("hil")`.
+6. **Test → verify → reconcile (never skip).** `run_tests` must pass. Then
+   verify EACH `## Done when` criterion against the actual implementation (not
+   just test output). Then `submit_for_review`; then `reconcile_skills(task_id)`
+   to capture learnings — this is how harn accumulates project standards; skipping
+   it is a protocol violation. Check `board()` for the oracle verdict and relay it.
+   Never mark done while tests fail.
 
 ## Pre-task protocol — mandatory, in order, BEFORE any code
 
@@ -59,10 +62,28 @@ Ambiguity found while coding is 10× costlier than ambiguity resolved now.
 ## Loop (chat mode)
 
 `get_next_task` → pre-task protocol → implement → `run_tests` →
-`submit_for_review` → `reconcile_skills` → next `get_next_task`. Report each
-step in the chat. The oracle runs out-of-band (`harn watch`) — poll the task's
-`review_log` and relay its verdict. Don't shell out to `harn run` from chat
-(that nests a second agent).
+**VERIFY** (re-read `## Done when`, check each criterion against the actual code —
+not just test output; fix gaps or call `ask_user` for human decisions; end with
+`VERIFY: PASS` or `VERIFY: FAIL`) →
+`submit_for_review` →
+`reconcile_skills(task_id)` (read the brief, call `save_to_skill` for confident
+conventions and `ask_user(skill=…)` for trade-offs; end with `RECONCILE: DONE`) →
+**oracle check**: call `board()` to read the oracle verdict once `harn watch` runs
+it; relay PASS / FAIL / DEBT to the user; FAIL returns the task to
+`changes_requested` →
+next `get_next_task`. Report each step in the chat.
+
+**Log significant changes** (when `[log] changes` is on, the default): after a
+meaningful piece of work, `record_change(task_id, summary, detail)` — ONE
+release-notes line per change (not a per-edit diary). Reconcile backstops it;
+docs come from `generate_changelog`.
+Don't shell out to `harn run` from chat (that nests a second agent).
+
+**Bidirectional answers:** after `ask_user`, if the human replies with an
+ambiguous message ('ok', 'continue'), call `check_pending_answer()` before
+`answer_question` — the reply may have come via Telegram while you were stopped.
+`harn watch` auto-starts and handles Telegram escalation (after
+`chat_grace_minutes`, default 5 min) and idle-silence notifications.
 
 ## Guidance index — read on demand (`read_guidance("<topic>")`)
 

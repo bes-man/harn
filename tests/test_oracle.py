@@ -86,7 +86,7 @@ def test_oracle_fail_loops_to_rework(tmp_path, monkeypatch):
     phase = loop.run(tmp_path, env)
 
     assert phase == state.REVIEW
-    assert work.calls == 2           # had to rework
+    assert work.calls == 3           # work×2 + reconcile×1 (oracle failure re-runs work)
     assert oracle_calls[0] == 2      # oracle ran twice
 
     t = tasks.find(env, "PRJ-001")

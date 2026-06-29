@@ -67,7 +67,7 @@ def test_loop_submits_for_review_then_waits_cli(tmp_path, monkeypatch):
     assert phase == state.REVIEW
     t = tasks.find(env, "PRJ-001")
     assert t.status == tasks.REVIEW
-    assert fake.calls == 1
+    assert fake.calls == 2  # work turn + reconcile turn
     # progress log recorded the journey
     log = progress.tail(env)
     assert "started" in log and "submitted for review" in log
@@ -93,7 +93,7 @@ def test_cli_review_changes_then_accept(tmp_path, monkeypatch):
     # agent reworks → back to review
     loop.run(tmp_path, env)
     assert tasks.find(env, "PRJ-001").status == tasks.REVIEW
-    assert fake.calls == 2  # worked twice
+    assert fake.calls == 4  # work×2 + reconcile×2
 
     # user accepts with notes
     loop.review(env, "PRJ-001", approve=True, notes="watch the edge case in parse()")
@@ -130,4 +130,4 @@ def test_loop_review_via_telegram(tmp_path, monkeypatch):
     assert done.status == tasks.DONE
     notes_entry = next((e for e in done.review_log if e.event == "accepted"), None)
     assert notes_entry and "great job" in notes_entry.notes
-    assert fake.calls == 2
+    assert fake.calls == 4  # work×2 + reconcile×2

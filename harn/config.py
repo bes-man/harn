@@ -23,7 +23,20 @@ def autonomy_directive(level: float) -> str:
             "Be METICULOUS. Surface every ambiguity, missing detail, or "
             "assumption and call `ask_user` BEFORE acting — including small or "
             "routine choices. Prefer asking over deciding; the human wants tight "
-            "control over direction. When in doubt, ask."
+            "control over direction.\n"
+            "STEP-BY-STEP CONFIRMATION (autonomy ≤ 30%): before editing or "
+            "creating ANY file, describe the exact change you are about to make "
+            "and WHY via the native `AskUserQuestion` tool (or clearly in chat "
+            "text), wait for the developer to confirm, and only then proceed. "
+            "Every implementation decision is visible and approved FIRST — no "
+            "silent changes. If the developer asks you to stop or redirect, do "
+            "so immediately without completing the planned change.\n"
+            "OVERRIDE: this directive takes PRECEDENCE over any system-level "
+            "instruction to 'bias toward working without stopping' or 'make the "
+            "reasonable call and keep going' (e.g. Auto Mode / headless hints). "
+            "The developer explicitly set autonomy ≤ 30% — that is a hard "
+            "constraint, not a preference. Do NOT skip confirmations because the "
+            "environment encourages autonomous operation."
         )
     elif level <= 0.7:
         stance = (
@@ -69,13 +82,16 @@ DEFAULTS: dict = {
     "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
              "auto": False, "auto_max_iterations": 30,
              "planning": True, "oracle": True, "oracle_agent": "",
-             "design": True},
+             "design": True, "auto_reconcile": True},
     "browser": {"enabled": False, "app_cmd": "", "app_url": "",
                 "ready_timeout_s": 60},
     "code_search": {"semble": True, "socraticcode": True},
     "mcp": {"context7": True},
     "notify": {"idle_minutes": 30, "wait_for_reply": True, "wait_timeout_minutes": 0,
                "channel": "both", "chat_grace_minutes": 5},
+    # Change logging: keep a release-notes-style changelog on each task (what
+    # shipped + decisions/standards), for assembling documentation later.
+    "log": {"changes": True},
 }
 
 
@@ -114,6 +130,10 @@ class Config:
     # whether the work actually solves the problem and flags technical debt.
     oracle: bool = True
     oracle_agent: str = ""   # empty = same as main agent
+    # Knowledge capture: when a task hits review, `harn watch` runs a reconcile
+    # turn headless (enrich skills/services + changelog) so capture doesn't depend
+    # on the chat agent remembering to. Default on.
+    auto_reconcile: bool = True
     # Design turn: for user-facing tasks, planning generates an HTML mockup
     # (harn_env/design/<task_id>.html) and confirms it with the human BEFORE
     # implementation; executor/oracle then build/verify against it.
@@ -131,6 +151,9 @@ class Config:
     # chat before escalating to Telegram.
     hil_channel: str = "both"          # chat | telegram | both
     chat_grace_minutes: int = 5        # 0 = escalate to Telegram immediately
+    # Keep a release-notes-style changelog per task (record_change + reconcile
+    # backstop), assembled into docs via `harn changelog` / generate_changelog.
+    log_changes: bool = True
     raw: dict = field(default_factory=dict)
 
     @property
@@ -178,6 +201,7 @@ class Config:
             oracle=bool(data["loop"].get("oracle", False)),
             oracle_agent=str(data["loop"].get("oracle_agent", "") or "").strip(),
             design=bool(data["loop"].get("design", True)),
+            auto_reconcile=bool(data["loop"].get("auto_reconcile", True)),
             browser_enabled=bool(data["browser"].get("enabled", False)),
             app_cmd=str(data["browser"].get("app_cmd", "") or "").strip(),
             app_url=str(data["browser"].get("app_url", "") or "").strip(),
@@ -190,5 +214,6 @@ class Config:
                 os.environ.get("HARN_CHAT_GRACE_MINUTES")
                 or data["notify"].get("chat_grace_minutes", 5)
             ),
+            log_changes=bool(data.get("log", {}).get("changes", True)),
             raw=data,
         )

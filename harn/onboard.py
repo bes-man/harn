@@ -156,10 +156,17 @@ call `answer_question(answer=…)` to save to skill.
      then fill `[browser] enabled/app_cmd/app_url` so harn can verify UI tasks
      in a real browser (Playwright MCP), and tell the human to re-run
      `harn setup` once so the Playwright MCP server is wired in.
-6. **Confirm the picture** with the human, then create the first tasks
+6. **Co-author the WORKFLOW** — read `read_workflow` (the default in
+   `harn_env/WORKFLOW.md`), then walk the user through it: which steps fit this
+   project, what to add/remove, and the `Skills (required: …)` per step. Save the
+   agreed version with `save_workflow(content)`. Keep the structured Markdown
+   shape (`## N. Step` + a `Skills (required: …)` line) so harn can parse the
+   mandatory skills. This file is then ALWAYS followed by every agent.
+7. **Confirm the picture** with the human, then create the first tasks
    (`create_task`).
 
-Do not start implementation until the PRD + key skills are filled and confirmed.
+Do not start implementation until the PRD + key skills + WORKFLOW are filled and
+confirmed.
 """
 
 

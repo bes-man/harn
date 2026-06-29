@@ -117,6 +117,25 @@ class Decision:
 
 
 @dataclass
+class ChangeEntry:
+    """A release-notes-style record of a significant change made on a task.
+
+    Distinct from `Decision` (the *why* behind a choice) and `review_log` (the
+    task's lifecycle events): a ChangeEntry is the *what shipped* — a concise
+    line plus optional detail on decisions/standards it established. Append-only,
+    timestamped, NEVER injected into work prompts (so it costs zero context
+    tokens during execution); read on demand to assemble documentation.
+    """
+    ts:      str
+    summary: str
+    detail:  str = ""
+    agent:   str | None = None
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in vars(self).items() if v}
+
+
+@dataclass
 class Task:
     id:          str
     path:        Path
@@ -133,6 +152,9 @@ class Task:
     # carries to its next iteration, plus the structured decisions it has made.
     scratchpad:  str = ""
     decisions:   list[Decision] = field(default_factory=list)
+    # Release-notes-style log of significant changes (see ChangeEntry). Governed
+    # by [log] changes; append-only; doc-source, NOT injected into work prompts.
+    changelog:   list[ChangeEntry] = field(default_factory=list)
     # Git commit captured when work first started — `harn rollback` returns the
     # working tree to this point to redo the task from scratch.
     baseline_ref: str = ""
@@ -195,6 +217,16 @@ def _from_dict(path: Path, d: dict) -> Task:
         for x in (d.get("decisions") or [])
         if x.get("decision")
     ]
+    changelog = [
+        ChangeEntry(
+            ts=c.get("ts", ""),
+            summary=c.get("summary", ""),
+            detail=c.get("detail", ""),
+            agent=c.get("agent"),
+        )
+        for c in (d.get("changelog") or [])
+        if c.get("summary")
+    ]
     return Task(
         id=d.get("id") or path.stem,
         path=path,
@@ -209,6 +241,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         description=d.get("description") or "",
         scratchpad=d.get("scratchpad") or "",
         decisions=decisions,
+        changelog=changelog,
         baseline_ref=d.get("baseline_ref") or "",
         review_log=review_log,
         depends_on=list(d.get("depends_on") or []),
@@ -233,6 +266,7 @@ def _to_dict(task: Task) -> dict:
         "description": task.description,
         "scratchpad":  task.scratchpad,
         "decisions":   [x.to_dict() for x in task.decisions],
+        "changelog":   [c.to_dict() for c in task.changelog],
         "baseline_ref": task.baseline_ref,
         "review_log":  [e.to_dict() for e in task.review_log],
         "depends_on":  task.depends_on,
@@ -563,6 +597,21 @@ def record_decision(task: Task, decision: str, rationale: str = "",
     _save(task)
 
 
+def record_change(task: Task, summary: str, detail: str = "",
+                  agent: str | None = None) -> None:
+    """Append a release-notes-style change entry (what shipped + optional
+    decisions/standards). Append-only; timestamped; used to assemble docs."""
+    if not summary.strip():
+        return
+    task.changelog.append(ChangeEntry(
+        ts=_now_iso(),
+        summary=summary.strip(),
+        detail=detail.strip(),
+        agent=agent,
+    ))
+    _save(task)
+
+
 def clear_scratchpad(task: Task) -> None:
     """Clear the transient note once a task is accepted (decisions are kept)."""
     if task.scratchpad:
@@ -616,3 +665,43 @@ def board(env_dir: Path) -> str:
                 f"  - [{t.id}{prds}] {t.title} (priority {t.priority})"
                 f"{subs}{deps}{owner}")
     return "\n".join(lines)
+
+
+def render_changelog(env_dir: Path, task_id: str | None = None) -> str:
+    """Assemble structured documentation from tasks' changelog + decisions.
+
+    One section per task (newest changes last), each entry timestamped — the
+    raw material for release notes / a CHANGELOG. `task_id` limits it to one
+    task; otherwise every task with logged changes or decisions is included.
+    """
+    all_tasks = load_tasks(env_dir)
+    if task_id:
+        key = task_id.strip().lower()
+        all_tasks = [t for t in all_tasks if t.id.lower() == key]
+    sections: list[str] = []
+    for t in all_tasks:
+        if not t.changelog and not t.decisions:
+            continue
+        head = f"## {t.id} — {t.title}"
+        meta = _STATUS_LABEL.get(t.status, t.status).strip()
+        block = [head, f"_Status: {meta}_", ""]
+        if t.changelog:
+            block.append("### Changes")
+            for c in t.changelog:
+                stamp = f"{c.ts} · " if c.ts else ""
+                block.append(f"- {stamp}{c.summary}")
+                if c.detail:
+                    for ln in c.detail.splitlines():
+                        block.append(f"  {ln}")
+            block.append("")
+        if t.decisions:
+            block.append("### Decisions")
+            for d in t.decisions:
+                stamp = f"{d.ts} · " if d.ts else ""
+                why = f" — {d.rationale}" if d.rationale else ""
+                block.append(f"- {stamp}{d.decision}{why}")
+            block.append("")
+        sections.append("\n".join(block).rstrip())
+    if not sections:
+        return "(no changes logged yet)"
+    return "# Changelog\n\n" + "\n\n".join(sections) + "\n"

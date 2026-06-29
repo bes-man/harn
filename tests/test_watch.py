@@ -8,14 +8,16 @@ from harn.adapters.base import AgentResult
 from .conftest import make_task
 
 
-def _env(tmp_path: Path, *, oracle=True) -> Path:
+def _env(tmp_path: Path, *, oracle=True, auto_reconcile=False) -> Path:
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
     for p in (env / "tasks").glob("*.json"):
         p.unlink()
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
-        f"[loop]\noracle = {str(oracle).lower()}\n[notify]\nwait_for_reply = false\n"
+        f"[loop]\noracle = {str(oracle).lower()}\n"
+        f"auto_reconcile = {str(auto_reconcile).lower()}\n"
+        "[notify]\nwait_for_reply = false\n"
     )
     return env
 
@@ -103,3 +105,49 @@ def test_oracle_review_standalone(tmp_path, monkeypatch):
     from harn.config import Config
     verdict, detail, res = loop.oracle_review(env, Config.load(env), t, tmp_path)
     assert verdict == "PASS"
+
+
+# --------------------------------------------------------------------------- #
+# auto-reconcile: knowledge capture runs headless, no agent discipline needed
+# --------------------------------------------------------------------------- #
+def test_watch_auto_reconciles_review_task(tmp_path, monkeypatch):
+    env = _env(tmp_path, oracle=False, auto_reconcile=True)
+    make_task(env, "PRJ-001", status=tasks.REVIEW)
+    calls = {"n": 0}
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, prompt, cwd):
+            calls["n"] += 1
+            assert "ask_user" in prompt  # reconcile prompt; told NOT to use it
+            return AgentResult(ok=True, text="RECONCILE: DONE")
+    monkeypatch.setattr(loop, "get_adapter", lambda name: FakeAdapter())
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.watch(env, tmp_path, _once=True, _sleep=lambda s: None)
+
+    fresh = tasks.find(env, "PRJ-001")
+    assert calls["n"] == 1                                   # reconcile turn ran
+    assert any(e.event == "reconciled" for e in fresh.review_log)
+    assert fresh.changelog                                   # documentation backstop fired
+
+
+def test_watch_skips_already_reconciled(tmp_path, monkeypatch):
+    env = _env(tmp_path, oracle=False, auto_reconcile=True)
+    t = make_task(env, "PRJ-001", status=tasks.REVIEW)
+    t.review_log.append(tasks.ReviewEntry(ts="t", event="reconciled", agent="x"))
+    tasks._save(t)
+    calls = {"n": 0}
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, prompt, cwd):
+            calls["n"] += 1
+            return AgentResult(ok=True, text="x")
+    monkeypatch.setattr(loop, "get_adapter", lambda name: FakeAdapter())
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.watch(env, tmp_path, _once=True, _sleep=lambda s: None)
+    assert calls["n"] == 0  # already reconciled → not re-run

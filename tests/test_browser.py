@@ -145,7 +145,7 @@ def test_loop_skips_ui_verify_when_app_unreachable(tmp_path, monkeypatch):
 
     # unreachable app skips the phase but never blocks the pipeline
     assert phase == state.REVIEW
-    assert len(fake.prompts) == 1
+    assert len(fake.prompts) == 2  # work turn + reconcile turn
 
 
 def test_scaffold_adds_playwright_mcp_when_browser_enabled(tmp_path):

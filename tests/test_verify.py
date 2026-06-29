@@ -58,7 +58,7 @@ def test_verify_pass_goes_to_review(tmp_path, monkeypatch):
 
     assert phase == state.REVIEW
     assert tasks.find(env, "PRJ-001").status == tasks.REVIEW
-    assert fake.calls == 2  # one work turn + one verify turn
+    assert fake.calls == 3  # work turn + verify turn + reconcile turn
 
 
 def test_verify_fail_loops_then_passes(tmp_path, monkeypatch):
@@ -74,7 +74,7 @@ def test_verify_fail_loops_then_passes(tmp_path, monkeypatch):
     phase = loop.run(tmp_path, env)
 
     assert phase == state.REVIEW
-    assert fake.calls == 4
+    assert fake.calls == 5  # work×2 + verify×2 + reconcile×1
     # the progress log shows the verify-driven rework
     from harn import progress
     assert "verify found gaps" in progress.tail(env)

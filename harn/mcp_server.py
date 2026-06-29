@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import codebase as codebase_mod
 from . import design as design_mod
+from . import events as events_mod
 from . import guidance as guidance_mod
 from . import prd as prd_mod
 from . import progress as progress_mod
@@ -86,6 +87,10 @@ def build_server():
     # Auto-start the watch dispatcher so Telegram escalation, oracle, and live
     # status work without the user having to run a separate command.
     _ensure_watch_running(_env_dir())
+
+    # Open a correlation scope for this chat session so every logged cycle
+    # (submit, reconcile, oracle) joins up under one run_id in events.jsonl.
+    events_mod.new_run(_env_dir(), kind="chat")
 
     @mcp.tool()
     def list_skills() -> str:
@@ -199,11 +204,45 @@ def build_server():
         out = t.path.read_text(encoding="utf-8")
         out += ("\n\n▶ Run the pre-task protocol from AGENTS.md before any code: "
                 "AS IS → TO BE → skills (name them) → best practices → clarify.")
-        # Surface the configured autonomy level so [harn] autonomy actually
+        # Surface the configured autonomy level so harn autonomy actually
         # governs ask-vs-decide in chat mode (it only reached headless before).
         from .config import autonomy_directive
-        out += "\n\n" + autonomy_directive(Config.load(env).autonomy)
+        cfg = Config.load(env)
+        out += "\n\n" + autonomy_directive(cfg.autonomy)
         out += "\n\n" + codebase_mod.prompt_note(env)
+
+        # Low autonomy (≤ 30%): MCP itself gates on developer confirmation so
+        # the block fires regardless of Auto Mode / headless hints.
+        if cfg.autonomy <= 0.3:
+            q = (
+                f"Task {t.id} claimed: \"{t.title}\".\n\n"
+                "Before I make ANY file changes, please tell me:\n"
+                "1. What should I focus on or get right?\n"
+                "2. Any constraints or things to avoid?\n"
+                "3. Or simply confirm: \"proceed as the task describes.\"\n\n"
+                "(Autonomy is ≤ 30% — every implementation decision needs "
+                "explicit approval before I act.)"
+            )
+            state_dir = env / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            if not state_mod.read_block_question(state_dir):
+                state_mod.blocked_marker(state_dir).write_text(
+                    q, encoding="utf-8")
+                st = state_mod.State.load(state_dir)
+                st.block(q)
+                st.current_task = t.id
+                st.save(state_dir)
+                _log(f"{t.id}: awaiting developer confirmation (autonomy ≤ 30%)")
+            out += (
+                "\n\n⛔ CONFIRMATION REQUIRED (autonomy ≤ 30%)\n"
+                "harn has registered a clarifying question in BLOCKED state — "
+                "`harn watch` will escalate to Telegram if unanswered.\n"
+                "PRESENT THE QUESTION BELOW to the developer NOW via your "
+                "native `AskUserQuestion` tool, then STOP.\n"
+                "Do NOT make any file changes until you call "
+                "`answer_question(their_answer)` to clear the block.\n\n"
+                f"Question to show:\n---\n{q}\n---"
+            )
         note = skill_library.gap_note(env, t)
         if note:
             out += "\n\n" + note
@@ -363,6 +402,38 @@ def build_server():
         return f"Recorded decision on {task_id} ({len(t.decisions)} total)"
 
     @mcp.tool()
+    def record_change(task_id: str, summary: str, detail: str = "") -> str:
+        """Log a SIGNIFICANT change, release-notes style — call after finishing a
+        meaningful piece of work. ONE concise line per change, NOT a per-edit
+        diary. `summary` = what shipped (user-facing voice); `detail` = decisions/
+        standards it set. Never injected into prompts (zero context cost); feeds
+        `generate_changelog`. No-op when [log] changes = false."""
+        cfg = Config.load(_env_dir())
+        if not cfg.log_changes:
+            return "(change logging off — [log] changes = false)"
+        t = tasks_mod.find(_env_dir(), task_id)
+        if t is None:
+            return f"(task '{task_id}' not found)"
+        tasks_mod.record_change(t, summary, detail)
+        _log(f"{task_id}: change logged — {summary[:100]}")
+        return f"Change logged on {task_id} ({len(t.changelog)} total)"
+
+    @mcp.tool()
+    def generate_changelog(task_id: str = "", write: bool = False) -> str:
+        """Assemble docs (release notes) from tasks' changelog + decisions,
+        timestamped, one section per task. `task_id` scopes to one task;
+        `write=true` saves to harn_env/CHANGELOG.md. Use when the human asks for
+        a changelog/release notes/summary of what was built."""
+        env = _env_dir()
+        md = tasks_mod.render_changelog(env, task_id or None)
+        if write:
+            out = env / "CHANGELOG.md"
+            out.write_text(md, encoding="utf-8")
+            _log(f"changelog written to {out.name}")
+            return f"Written to {out}.\n\n{md}"
+        return md
+
+    @mcp.tool()
     def set_scratchpad(task_id: str, notes: str) -> str:
         """Save a short note to your next iteration (replaces the previous one):
         what's done, what's left, gotchas. Lightweight continuity, not a log —
@@ -407,8 +478,12 @@ def build_server():
             "Question recorded (BLOCKED). `harn watch` will route it to the user "
             "(waits chat_grace_minutes, then escalates to Telegram). If you have "
             "NOT yet shown the question to the human (native AskUserQuestion tool "
-            "or plain chat text), do it NOW in this same turn. Then STOP — resume "
-            "only after the user answers and you call `answer_question`."
+            "or plain chat text), do it NOW in this same turn. Then STOP.\n\n"
+            "**Resuming:** when the human sends any message — even 'ok' or 'continue' "
+            "— call `check_pending_answer()` FIRST. If the answer came via Telegram "
+            "while you were stopped, it returns the text. If 'still_waiting', show "
+            "the question again via AskUserQuestion. If the human's message IS the "
+            "answer, call `answer_question(answer)` as usual."
         )
 
     @mcp.tool()
@@ -425,6 +500,26 @@ def build_server():
         loop_mod.answer(env_dir, answer)
         _log(f"answer recorded in chat: {answer[:120]}")
         return "Answer recorded. Block cleared. You may continue the task."
+
+    @mcp.tool()
+    def check_pending_answer() -> str:
+        """Check if a pending ask_user question was answered via Telegram or the
+        'Decide for me' button while you were stopped. Call on resume when the
+        human's message is ambiguous ('ok', 'continue') rather than the answer.
+        Returns the answer text if found, 'still_waiting', or
+        'no_pending_answer'."""
+        env_dir = _env_dir()
+        state_dir = env_dir / "state"
+        pending_file = state_dir / "PENDING_TELEGRAM_ANSWER.txt"
+        if pending_file.exists():
+            ans = pending_file.read_text(encoding="utf-8").strip()
+            pending_file.unlink(missing_ok=True)
+            _log(f"chat agent consumed Telegram answer: {ans[:80]}")
+            return f"Answer received (via Telegram/auto): {ans}"
+        q = state_mod.read_block_question(state_dir)
+        if q:
+            return f"still_waiting — question still pending: {q[:200]}"
+        return "no_pending_answer"
 
     @mcp.tool()
     def save_design(task_id: str, html: str) -> str:
@@ -463,13 +558,31 @@ def build_server():
         turn, so calling this is an explicit, optional signal with a summary."""
         for t in tasks_mod.load_tasks(_env_dir()):
             if t.id == task_id:
+                # Deterministic documentation backstop: guarantee a changelog
+                # entry exists even if the agent never called record_change.
+                from . import loop as loop_mod
+                loop_mod._auto_changelog(_env_dir(), Config.load(_env_dir()), t,
+                                         summary)
+                t = tasks_mod.find(_env_dir(), task_id) or t
                 tasks_mod.submit_for_review(t, agent="agent", summary=summary)
-                _log(f"{task_id}: submitted for review — oracle will check it")
-                return (f"task '{task_id}' submitted for review. The oracle (run "
-                        "by `harn watch`) will verify it; read its verdict in the "
-                        "task's review_log and relay it to the user.\n\n"
-                        "➡️ NEXT: call `reconcile_skills(\"" + task_id + "\")` to "
-                        "capture what this task taught into skills before moving on.")
+                _log(f"{task_id}: submitted for review — oracle + reconcile run next")
+                events_mod.emit(_env_dir(), "cycle_end", task_id=task_id,
+                                outcome="submitted", summary=summary[:200] or None)
+                return (
+                    f"task '{task_id}' submitted for review.\n\n"
+                    "Do these steps IN ORDER — do not skip either:\n\n"
+                    "1. **Reconcile**: call `reconcile_skills(\"" + task_id + "\")` "
+                    "NOW. Read the brief it returns, then call `save_to_skill` for "
+                    "each confident convention ([auto] prefix) and "
+                    "`ask_user(skill=…)` for any trade-off needing developer input. "
+                    "End by saying `RECONCILE: DONE`.\n\n"
+                    "2. **Oracle**: `harn watch` runs the oracle in the background. "
+                    "Call `board()` to check the verdict. Relay the oracle's "
+                    "PASS / FAIL / DEBT result to the developer. If FAIL, the task "
+                    "returns to `changes_requested` and you rework it next. "
+                    "If the oracle hasn't run yet, note it and move on — it will "
+                    "appear in the task's review_log."
+                )
         return f"(no task '{task_id}')"
 
     @mcp.tool()
@@ -497,6 +610,33 @@ def build_server():
         the ralph-loop state, not an OS/service healthcheck)."""
         st = state_mod.State.load(_env_dir() / "state")
         return f"phase={st.phase} task={st.current_task} question={st.question}"
+
+    @mcp.tool()
+    def explain_pipeline() -> str:
+        """Show which pipeline stages run for the current config, gated-off ones
+        marked. Tells the user what will happen before work starts."""
+        from . import loop as loop_mod
+        return loop_mod.explain(Config.load(_env_dir()))
+
+    @mcp.tool()
+    def read_workflow() -> str:
+        """Return harn_env/WORKFLOW.md — the always-followed flow + required skills
+        per step. Read at session start; load each step's required + relevant
+        skills (never all)."""
+        from . import workflow as wf
+        p = _env_dir() / wf.FILENAME
+        return p.read_text(encoding="utf-8") if p.exists() else "(no WORKFLOW.md yet)"
+
+    @mcp.tool()
+    def save_workflow(content: str) -> str:
+        """Write harn_env/WORKFLOW.md. Use in onboarding to save the workflow you
+        co-authored with the user. Keep the shape `## N. Step` + `Skills
+        (required: …)` so harn can parse mandatory skills."""
+        from . import workflow as wf
+        p = _env_dir() / wf.FILENAME
+        p.write_text(content, encoding="utf-8")
+        _log("workflow saved")
+        return f"WORKFLOW.md saved ({len(content)} chars)."
 
     return mcp
 

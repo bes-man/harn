@@ -96,3 +96,25 @@ def append_learning(env_dir: Path, name: str, content: str,
         text += f"\n\n{_LEARNED_HEADING}\n{entry}\n"
     md.write_text(text, encoding="utf-8")
     return md
+
+
+def write_skill_body(env_dir: Path, name: str, body: str,
+                     description: str | None = None) -> Path:
+    """Replace a skill's BODY (everything after the frontmatter), keeping its
+    name/description frontmatter (or setting description if given). Creates the
+    skill if missing. Used by the visual editor to save hand-edited skills."""
+    name = name.strip().lower().replace(" ", "-")
+    skill_dir = env_dir / "skills" / name
+    md = skill_dir / "SKILL.md"
+    existing_desc = ""
+    if md.exists():
+        existing_desc = _frontmatter(
+            md.read_text(encoding="utf-8", errors="replace")).get("description", "")
+    desc = (description if description is not None else existing_desc) or \
+        f"{name} standards and conventions for this project."
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    md.write_text(
+        f"---\nname: {name}\ndescription: {desc.strip()}\n---\n\n{body.strip()}\n",
+        encoding="utf-8",
+    )
+    return md

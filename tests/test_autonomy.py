@@ -106,3 +106,36 @@ def test_handle_block_delegates_on_auto(monkeypatch, tmp_path):
     assert state.read_block_question(env / "state") is None  # cleared
     answers = (env / "state" / "ANSWERS.md").read_text()
     assert "Decide for me" in answers
+
+
+def test_low_autonomy_get_next_task_writes_block(tmp_path, monkeypatch):
+    """get_next_task at autonomy ≤ 30% must write BLOCKED.md so harn watch can
+    escalate to Telegram — MCP enforces confirmation regardless of Auto Mode."""
+    import asyncio
+    from harn import scaffold, tasks, state, ENV_DIRNAME
+    import harn.mcp_server as ms
+
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\nautonomy = 0.2\n'
+        '[notify]\nwait_for_reply = false\n'
+    )
+    tasks.create_task(env, "Add login", task_id="PRJ-001",
+                      description="## What\nx\n## Done when\n- works")
+
+    monkeypatch.setenv("HARN_ENV_DIR", str(env))
+    monkeypatch.setattr(ms, "_ensure_watch_running", lambda e: None)
+    srv = ms.build_server()
+    result = str(asyncio.new_event_loop().run_until_complete(
+        srv.call_tool("get_next_task", {})))
+
+    # MCP must have written BLOCKED.md
+    state_dir = env / "state"
+    q = state.read_block_question(state_dir)
+    assert q is not None, "BLOCKED.md should be written when autonomy ≤ 30%"
+    assert "PRJ-001" in q
+    # Response must tell the agent to show the question and not proceed
+    assert "CONFIRMATION REQUIRED" in result
+    assert "AskUserQuestion" in result
+    assert "answer_question" in result
