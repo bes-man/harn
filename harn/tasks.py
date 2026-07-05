@@ -168,6 +168,11 @@ class Task:
     # verified, unambiguous spec (its `## Done when` is authoritative). The
     # executor then trusts it and the full PRD is read-on-demand, not injected.
     spec_locked: bool = False
+    # Named workflow preset this task runs under (workflows/<name>.json). Empty/
+    # None → the project default (WORKFLOW.md). The loop renders the selected
+    # workflow into WORKFLOW.md when the task is picked up, so every agent
+    # (Claude/Codex/Cursor) reads the right flow from the one file they all read.
+    workflow: str | None = None
 
     @property
     def done(self) -> bool:
@@ -248,6 +253,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         claimed_by=d.get("claimed_by"),
         claimed_at=d.get("claimed_at") or "",
         spec_locked=bool(d.get("spec_locked", False)),
+        workflow=d.get("workflow") or None,
     )
 
 
@@ -273,7 +279,15 @@ def _to_dict(task: Task) -> dict:
         "claimed_by":  task.claimed_by,
         "claimed_at":  task.claimed_at,
         "spec_locked": task.spec_locked,
+        "workflow":    task.workflow,
     }
+
+
+def to_dict(task: Task) -> dict:
+    """The full task as a JSON-safe dict (status, workflow, scratchpad, decisions,
+    review_log, …) — how the studio UI's board renders task detail without
+    re-deriving the shape `_to_dict` already owns."""
+    return _to_dict(task)
 
 
 def _save(task: Task) -> None:
@@ -366,6 +380,7 @@ def next_task(
     *,
     claim: bool = False,
     worker: str | None = None,
+    only: str | None = None,
 ) -> Task | None:
     """Return the highest-priority runnable task.
 
@@ -376,13 +391,19 @@ def next_task(
     flipped to `in_progress` and stamped `claimed_by=worker` before the lock is
     released, so two concurrent workers never get the same task. Pass a stable
     `worker` id (one per agent/process) so a worker can resume its own task.
+
+    `only` restricts the pool to a single task id — used by `harn run --task`
+    (the studio UI's per-task Launch button) so the loop works ONLY that task
+    and stops once it's done/blocked/review, instead of picking up whatever is
+    highest priority next.
     """
     skip = exclude or set()
 
     def _pick(tasks: list[Task]) -> Task | None:
         by_id = {t.id: t for t in tasks}
         pending = [t for t in tasks
-                   if t.id not in skip and _eligible(t, by_id, worker)]
+                   if t.id not in skip and _eligible(t, by_id, worker)
+                   and (only is None or t.id == only)]
         if not pending:
             return None
         # Prefer this worker's own in-progress task, then priority order.
@@ -481,6 +502,7 @@ def create_task(
     task_id: str | None = None,
     id_prefix: str = "PRJ",
     depends_on: list[str] | None = None,
+    workflow: str | None = None,
 ) -> Task:
     """Create a new task JSON file and return the Task object."""
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -499,6 +521,7 @@ def create_task(
         skills=list(skills or []),
         description=description or _DESCRIPTION_TEMPLATE.format(what=title),
         depends_on=list(depends_on or []),
+        workflow=(workflow or None),
     )
     _save(task)
     return task

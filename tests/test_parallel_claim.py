@@ -27,6 +27,18 @@ def test_dep_blocks_until_done(tmp_path):
     assert tasks.next_task(env).id == "B"
 
 
+def test_only_restricts_pool_to_one_task(tmp_path):
+    """`only` (harn run --task, the studio Launch button) ignores priority
+    ordering and works exactly the named task, even if a higher-priority one
+    is also runnable."""
+    env = _env(tmp_path)
+    tasks.create_task(env, "High prio", task_id="A", priority=1)
+    tasks.create_task(env, "Low prio", task_id="B", priority=99)
+    assert tasks.next_task(env).id == "A"          # normal pick: highest priority
+    assert tasks.next_task(env, only="B").id == "B"  # restricted: exactly B
+    assert tasks.next_task(env, only="nope") is None  # unknown id -> nothing runnable
+
+
 def test_independent_tasks_both_eligible(tmp_path):
     env = _env(tmp_path)
     tasks.create_task(env, "X", task_id="X", priority=5)

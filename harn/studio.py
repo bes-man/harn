@@ -12,14 +12,24 @@ without binding a socket.
 """
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+import re
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import attachments as attachments_mod
+from . import events as events_mod
+from . import runner as runner_mod
 from . import skills as skills_mod
+from . import tasks as tasks_mod
 from . import workflow as workflow_mod
+from . import workflows as workflows_mod
+from .config import Config, MODEL_STAGES
 
 
 # --------------------------------------------------------------------------- #
@@ -65,22 +75,92 @@ def apply_layout(env_dir: Path, payload: dict) -> dict:
 
 
 def state_payload(env_dir: Path) -> dict:
-    """Everything the editor needs: the parsed workflow nodes + every skill
-    (name, description, body) + saved canvas positions."""
+    """Everything the editor needs: the parsed workflow nodes (of the ACTIVE
+    workflow, mirrored in WORKFLOW.md) + every skill (name, description, body) +
+    saved canvas positions + the workflow switcher's presets and active name."""
     parsed = workflow_mod.parse(env_dir)
     sk = []
     for s in skills_mod.discover(env_dir):
         sk.append({"name": s.name, "description": s.description, "body": s.body()})
-    return {"workflow": parsed, "skills": sk, "layout": layout_payload(env_dir)}
+    return {"workflow": parsed, "skills": sk, "layout": layout_payload(env_dir),
+            "workflows": workflows_mod.list_workflows(env_dir),
+            "active": workflows_mod.active_name(env_dir)}
 
 
 def apply_workflow(env_dir: Path, payload: dict) -> dict:
-    """Persist edited workflow nodes back to WORKFLOW.md."""
-    workflow_mod.save_parsed(env_dir, {
+    """Persist edited workflow nodes into the ACTIVE workflow preset (and mirror
+    it into WORKFLOW.md so every agent reads it)."""
+    name = workflows_mod.save_active(env_dir, {
         "preamble": payload.get("preamble", ""),
         "nodes": payload.get("nodes", []),
     })
-    return {"ok": True}
+    return {"ok": True, "active": name}
+
+
+def list_workflows_payload(env_dir: Path) -> dict:
+    return {"workflows": workflows_mod.list_workflows(env_dir),
+            "active": workflows_mod.active_name(env_dir)}
+
+
+def activate_workflow(env_dir: Path, payload: dict) -> dict:
+    """Switch the active workflow → re-render WORKFLOW.md → reload returns its
+    nodes onto the canvas."""
+    name = workflows_mod.activate(env_dir, (payload.get("name") or "").strip())
+    return {"ok": True, "active": name}
+
+
+def create_workflow(env_dir: Path, payload: dict) -> dict:
+    """New named preset, seeded from the current default's steps."""
+    try:
+        m = workflows_mod.create(
+            env_dir,
+            name=(payload.get("name") or "").strip(),
+            title=(payload.get("title") or "").strip(),
+            description=(payload.get("description") or "").strip(),
+            version=str(payload.get("version") or "1").strip(),
+            copy_from=(payload.get("copy_from") or "").strip() or None,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    # Activate it immediately so the canvas opens on the new preset.
+    workflows_mod.activate(env_dir, m["name"])
+    return {"ok": True, "workflow": m, "active": m["name"]}
+
+
+def save_workflow_meta(env_dir: Path, payload: dict) -> dict:
+    """Rename / re-describe / re-version a preset (title, description, version)."""
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing workflow name"}
+    m = workflows_mod.save_meta(
+        env_dir, name,
+        title=payload.get("title"),
+        description=payload.get("description"),
+        version=payload.get("version"),
+        new_name=payload.get("new_name"),
+    )
+    return {"ok": True, "workflow": m, "active": workflows_mod.active_name(env_dir)}
+
+
+def delete_workflow(env_dir: Path, payload: dict) -> dict:
+    """Delete a named preset (the default can't be deleted)."""
+    name = (payload.get("name") or "").strip()
+    if not workflows_mod.delete(env_dir, name):
+        return {"ok": False, "error": "cannot delete (default or unknown)"}
+    return {"ok": True, "active": workflows_mod.active_name(env_dir)}
+
+
+def tools_catalog_payload(env_dir: Path) -> dict:
+    """Tool descriptions for the Tools tab: each tool's real docstring (the
+    same text an agent sees via `tools/list` — never drifts out of sync with
+    what a tool actually does) plus, where one exists, a longer human-facing
+    note (what/why/when) from tool_notes.py. The note is UI-only — it never
+    touches the agent-facing docstring, so the agent's fixed context budget
+    is unaffected by how much explanation a human browsing the UI needs."""
+    from . import mcp_server, tool_notes
+    catalog = mcp_server.tool_catalog()
+    return {"tools": {name: tool_notes.merged(name, doc)
+                      for name, doc in catalog.items()}}
 
 
 def apply_skill(env_dir: Path, payload: dict) -> dict:
@@ -107,12 +187,313 @@ def delete_skill(env_dir: Path, payload: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Config toggles (semble / socraticode) — read + targeted harn.toml write
+# --------------------------------------------------------------------------- #
+def config_payload(env_dir: Path) -> dict:
+    """The toggles the header shows + the project path."""
+    cfg = Config.load(env_dir)
+    return {
+        "env": str(env_dir),
+        "project": cfg.project,
+        "toggles": {
+            "semble": cfg.code_search_semble,
+            "socraticcode": cfg.code_search_socraticcode,
+        },
+    }
+
+
+_BOOL = {"semble", "socraticcode"}
+
+
+def set_config_flag(env_dir: Path, payload: dict) -> dict:
+    """Flip a `[code_search]` flag in harn.toml in place (stdlib can't WRITE toml,
+    so we do a targeted regex edit — same approach harn uses elsewhere)."""
+    key = (payload.get("key") or "").strip()
+    if key not in _BOOL:
+        return {"ok": False, "error": f"unknown toggle {key!r}"}
+    val = bool(payload.get("value"))
+    toml = env_dir / "harn.toml"
+    text = toml.read_text(encoding="utf-8") if toml.exists() else ""
+    line = f"{key} = {'true' if val else 'false'}"
+    if re.search(rf"(?m)^\s*{key}\s*=.*$", text):
+        text = re.sub(rf"(?m)^\s*{key}\s*=.*$", line, text)
+    elif re.search(r"(?m)^\[code_search\]\s*$", text):
+        text = re.sub(r"(?m)^\[code_search\]\s*$", f"[code_search]\n{line}", text)
+    else:
+        text = (text.rstrip() + "\n\n[code_search]\n" + line + "\n") if text else \
+            f"[code_search]\n{line}\n"
+    toml.parent.mkdir(parents=True, exist_ok=True)
+    toml.write_text(text, encoding="utf-8")
+    return {"ok": True, "key": key, "value": val}
+
+
+# --------------------------------------------------------------------------- #
+# Per-stage model/effort/temperature overrides (harn.toml's [models.<stage>])
+# --------------------------------------------------------------------------- #
+def models_payload(env_dir: Path) -> dict:
+    """Current per-stage overrides + which agents in this project's chain
+    support effort/temperature at all (best-effort CLI convention — see
+    Adapter.EFFORT_FLAG/TEMPERATURE_FLAG), so the UI can flag fields that may
+    be a no-op for the agent(s) actually configured."""
+    from .adapters import get_adapter
+    cfg = Config.load(env_dir)
+    caps = {}
+    for name in cfg.agent_chain:
+        try:
+            a = get_adapter(name)
+        except ValueError:
+            continue
+        caps[name] = {"model": bool(a.MODEL_FLAG), "effort": bool(a.EFFORT_FLAG),
+                     "temperature": bool(a.TEMPERATURE_FLAG)}
+    return {"stages": list(MODEL_STAGES), "values": cfg.stage_models,
+            "agent_chain": cfg.agent_chain, "capabilities": caps}
+
+
+def _toml_escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def save_models(env_dir: Path, payload: dict) -> dict:
+    """Rewrite every `[models.<stage>]` table in harn.toml from the submitted
+    values (stdlib can't write TOML, so this owns and regenerates just those
+    tables — same targeted-rewrite approach as set_config_flag). A stage with
+    no fields set is simply omitted (falls back to no override)."""
+    values = payload.get("values") or {}
+    toml_path = env_dir / "harn.toml"
+    text = toml_path.read_text(encoding="utf-8") if toml_path.exists() else ""
+    for stage in MODEL_STAGES:
+        text = re.sub(
+            rf"(?m)^\[models\.{re.escape(stage)}\]\n(?:(?!\[)[^\n]*\n?)*", "", text)
+    text = text.rstrip("\n")
+    blocks = []
+    for stage in MODEL_STAGES:
+        v = values.get(stage) or {}
+        lines = [f"[models.{stage}]"]
+        for key in ("model", "effort", "temperature"):
+            val = str(v.get(key) or "").strip()
+            if val:
+                lines.append(f'{key} = "{_toml_escape(val)}"')
+        if len(lines) > 1:
+            blocks.append("\n".join(lines))
+    if blocks:
+        text = (text + "\n\n" if text else "") + "\n\n".join(blocks) + "\n"
+    else:
+        text = text + "\n" if text else ""
+    toml_path.parent.mkdir(parents=True, exist_ok=True)
+    toml_path.write_text(text, encoding="utf-8")
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Live progress + per-stage stats (from events.jsonl) for the flow animation
+# --------------------------------------------------------------------------- #
+# Map a workflow node (by keywords in its title) to the pipeline stage that
+# emits events. Nodes that match no stage stay neutral (grey) during a run.
+_STAGE_KEYWORDS = [
+    ("plan",      ("pre-task", "plan", "clarif")),
+    ("ui_verify", ("ui verify", "ui-verify", "browser")),
+    ("verify",    ("verify",)),
+    ("execute",   ("implement", "execute", "build", "code")),
+    ("test",      ("test",)),
+    ("oracle",    ("oracle",)),
+    ("reconcile", ("reconcile",)),
+]
+
+
+def _node_stage(title: str) -> str | None:
+    t = title.lower()
+    for stage, kws in _STAGE_KEYWORDS:
+        if any(k in t for k in kws):
+            return stage
+    return None
+
+
+def progress_payload(env_dir: Path) -> dict:
+    """Per-node status + per-stage stats for the LATEST run, from events.jsonl.
+
+    status per stage: 'active' (running), 'done' (finished, run still going),
+    'complete' (run ended ok), else 'pending'. Stats: time/tokens/cost per stage
+    + run totals — the raw material for the on-canvas stats block and $-estimate.
+    """
+    evs = events_mod.read(env_dir)
+    if not evs:
+        return {"run": None, "stages": {}, "totals": {}, "active": None, "ended": False}
+    last_run = None
+    for e in evs:
+        if e.get("event") == "run_start":
+            last_run = e.get("run_id")
+    run = [e for e in evs if e.get("run_id") == last_run] if last_run else evs
+    stages: dict[str, dict] = {}
+    active = None
+    ended = False
+    end_phase = None
+    for e in run:
+        ev, st = e.get("event"), e.get("stage")
+        if ev == "stage_start" and st:
+            stages.setdefault(st, {})["status"] = "active"
+            active = st
+        elif ev == "stage_end" and st:
+            s = stages.setdefault(st, {})
+            s["status"] = "done"
+            s["dur_ms"] = (s.get("dur_ms") or 0) + (e.get("dur_ms") or 0)
+            s["tok_in"] = (s.get("tok_in") or 0) + (e.get("tok_in") or 0)
+            s["tok_out"] = (s.get("tok_out") or 0) + (e.get("tok_out") or 0)
+            if e.get("cost_usd") is not None:
+                s["cost_usd"] = round((s.get("cost_usd") or 0) + e["cost_usd"], 6)
+            if e.get("verdict"):
+                s["verdict"] = e["verdict"]
+            if active == st:
+                active = None
+        elif ev == "run_end":
+            ended = True
+            end_phase = e.get("phase")
+    # an ok-ended run paints its finished stages green ('complete')
+    if ended and end_phase in ("DONE", "REVIEW", "READY"):
+        for s in stages.values():
+            if s.get("status") == "done":
+                s["status"] = "complete"
+    totals = {
+        "dur_ms": sum(s.get("dur_ms", 0) for s in stages.values()),
+        "tok_in": sum(s.get("tok_in", 0) for s in stages.values()),
+        "tok_out": sum(s.get("tok_out", 0) for s in stages.values()),
+        "cost_usd": round(sum(s.get("cost_usd", 0) for s in stages.values()), 6),
+    }
+    return {"run": last_run, "stages": stages, "totals": totals,
+            "active": active, "ended": ended}
+
+
+# --------------------------------------------------------------------------- #
+# Board — tasks + per-task workflow assignment + launch/stop a background run
+# --------------------------------------------------------------------------- #
+def _context_reads_by_task(env_dir: Path) -> dict[str, list[dict]]:
+    """{task_id: [{kind, name, ts}, …]} — what actually got pulled into context
+    per task (read_skill/read_service/read_prd/read_guidance calls the agent
+    itself made), vs. the task's `skills` field which is only a HINT of what's
+    available. One pass over events.jsonl regardless of task count."""
+    out: dict[str, list[dict]] = {}
+    for e in events_mod.read(env_dir):
+        if e.get("event") != "context_read":
+            continue
+        tid = e.get("task_id")
+        if not tid:
+            continue
+        out.setdefault(tid, []).append(
+            {"kind": e.get("kind"), "name": e.get("name"), "ts": e.get("ts")})
+    return out
+
+
+def board_payload(env_dir: Path) -> dict:
+    """Every task (full detail: status, workflow, scratchpad, decisions,
+    review_log, context actually loaded — how the board shows a task's context
+    growing) + whether a UI-launched run is currently active, + its log tail."""
+    reads = _context_reads_by_task(env_dir)
+    ts = []
+    for t in tasks_mod.load_tasks(env_dir):
+        d = tasks_mod.to_dict(t)
+        d["context_reads"] = reads.get(t.id, [])
+        d["attachments"] = attachments_mod.list_files(env_dir, t.id)
+        ts.append(d)
+    run = runner_mod.active(env_dir)
+    payload = {"tasks": ts, "run": run}
+    if run:
+        payload["run_log"] = runner_mod.log_tail(env_dir, 40)
+    return payload
+
+
+def set_task_workflow(env_dir: Path, payload: dict) -> dict:
+    """Assign (or clear) a task's workflow preset. Empty -> project default."""
+    task_id = (payload.get("task_id") or "").strip()
+    t = tasks_mod.find(env_dir, task_id)
+    if t is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    name = (payload.get("workflow") or "").strip()
+    slug = workflows_mod._slug(name) if name else None
+    if slug and not any(m["name"] == slug for m in workflows_mod.list_workflows(env_dir)):
+        return {"ok": False, "error": f"unknown workflow '{name}'"}
+    t.workflow = slug
+    tasks_mod._save(t)
+    return {"ok": True, "task_id": t.id, "workflow": t.workflow}
+
+
+def launch_task(env_dir: Path, payload: dict) -> dict:
+    """Start a background `harn run --task <id>` for one task (see runner.py —
+    single-runner-at-a-time; refuses if a run is already active)."""
+    task_id = (payload.get("task_id") or "").strip()
+    if tasks_mod.find(env_dir, task_id) is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    return runner_mod.launch(env_dir.parent, env_dir, task_id,
+                             auto=bool(payload.get("auto")))
+
+
+def stop_task(env_dir: Path, payload: dict) -> dict:
+    """Stop the active UI-launched run (best-effort SIGTERM)."""
+    return runner_mod.stop(env_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Attachments — per-task files (design references, generated images, …)
+# --------------------------------------------------------------------------- #
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024   # local admin tool; generous but not unbounded
+
+
+def upload_attachment(env_dir: Path, payload: dict) -> dict:
+    """Save a base64-encoded file to a task's attachments (from the Board's
+    Upload button). Same storage the agent's save_attachment MCP tool writes
+    to — either side can attach, both sides see everything."""
+    task_id = (payload.get("task_id") or "").strip()
+    filename = (payload.get("filename") or "").strip()
+    if tasks_mod.find(env_dir, task_id) is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if not filename:
+        return {"ok": False, "error": "missing filename"}
+    try:
+        data = base64.b64decode(payload.get("content_b64") or "", validate=True)
+    except Exception:
+        return {"ok": False, "error": "content_b64 is not valid base64"}
+    if len(data) > _MAX_ATTACHMENT_BYTES:
+        mb = _MAX_ATTACHMENT_BYTES // (1024 * 1024)
+        return {"ok": False, "error": f"file too large (max {mb}MB)"}
+    p = attachments_mod.save(env_dir, task_id, filename, data)
+    return {"ok": True, "name": p.name}
+
+
+def delete_attachment(env_dir: Path, payload: dict) -> dict:
+    """Remove one attachment from a task."""
+    task_id = (payload.get("task_id") or "").strip()
+    filename = (payload.get("filename") or "").strip()
+    if not attachments_mod.delete(env_dir, task_id, filename):
+        return {"ok": False, "error": "not found"}
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
 # HTTP layer
 # --------------------------------------------------------------------------- #
-def _make_handler(env_dir: Path):
+def _looks_like_env(p: Path) -> bool:
+    """A directory we'll serve: a harn_env (has harn.toml or the expected subdirs)."""
+    return p.is_dir() and ((p / "harn.toml").exists() or (p / "tasks").is_dir()
+                           or (p / "skills").is_dir())
+
+
+def _make_handler(default_env: Path):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_a):  # quiet
             pass
+
+        # The env for THIS request: from ?env=<abs path> (multi-project), else
+        # the default the server was launched in. Validated so we don't serve
+        # arbitrary folders.
+        def _env(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            raw = (q.get("env") or [None])[0]
+            if not raw:
+                return default_env
+            p = Path(raw).expanduser().resolve()
+            return p if _looks_like_env(p) else None
+
+        def _query(self, key: str) -> str:
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return (q.get(key) or [""])[0]
 
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
@@ -135,22 +516,74 @@ def _make_handler(env_dir: Path):
                 return {}
 
         def do_GET(self):
-            if self.path == "/" or self.path.startswith("/index"):
-                self._send(200, _HTML.encode("utf-8"), "text/html; charset=utf-8")
-            elif self.path == "/api/state":
-                self._json(state_payload(env_dir))
+            route = urllib.parse.urlsplit(self.path).path
+            if route in ("/", "/index", "/index.html"):
+                html = _HTML.replace("__DEFAULT_ENV__", str(default_env))
+                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            env = self._env()
+            if env is None:
+                self._json({"error": "invalid or missing env"}, 400); return
+            if route == "/api/state":
+                self._json(state_payload(env))
+            elif route == "/api/config":
+                self._json(config_payload(env))
+            elif route == "/api/progress":
+                self._json(progress_payload(env))
+            elif route == "/api/workflows":
+                self._json(list_workflows_payload(env))
+            elif route == "/api/tools":
+                self._json(tools_catalog_payload(env))
+            elif route == "/api/board":
+                self._json(board_payload(env))
+            elif route == "/api/models":
+                self._json(models_payload(env))
+            elif route == "/api/attachments/file":
+                task_id, name = self._query("task"), self._query("name")
+                data = attachments_mod.read_bytes(env, task_id, name)
+                if data is None:
+                    self._send(404, b"not found", "text/plain"); return
+                ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                self._send(200, data, ctype)
             else:
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
-            if self.path == "/api/workflow":
-                self._json(apply_workflow(env_dir, self._read_json()))
-            elif self.path == "/api/skill":
-                self._json(apply_skill(env_dir, self._read_json()))
-            elif self.path == "/api/skill/delete":
-                self._json(delete_skill(env_dir, self._read_json()))
-            elif self.path == "/api/layout":
-                self._json(apply_layout(env_dir, self._read_json()))
+            route = urllib.parse.urlsplit(self.path).path
+            env = self._env()
+            if env is None:
+                self._json({"error": "invalid or missing env"}, 400); return
+            body = self._read_json()
+            if route == "/api/workflow":
+                self._json(apply_workflow(env, body))
+            elif route == "/api/workflows/activate":
+                self._json(activate_workflow(env, body))
+            elif route == "/api/workflows/create":
+                self._json(create_workflow(env, body))
+            elif route == "/api/workflows/meta":
+                self._json(save_workflow_meta(env, body))
+            elif route == "/api/workflows/delete":
+                self._json(delete_workflow(env, body))
+            elif route == "/api/skill":
+                self._json(apply_skill(env, body))
+            elif route == "/api/skill/delete":
+                self._json(delete_skill(env, body))
+            elif route == "/api/layout":
+                self._json(apply_layout(env, body))
+            elif route == "/api/config":
+                self._json(set_config_flag(env, body))
+            elif route == "/api/tasks/workflow":
+                self._json(set_task_workflow(env, body))
+            elif route == "/api/tasks/launch":
+                self._json(launch_task(env, body))
+            elif route == "/api/tasks/stop":
+                self._json(stop_task(env, body))
+            elif route == "/api/attachments/upload":
+                self._json(upload_attachment(env, body))
+            elif route == "/api/attachments/delete":
+                self._json(delete_attachment(env, body))
+            elif route == "/api/models":
+                self._json(save_models(env, body))
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -159,11 +592,13 @@ def _make_handler(env_dir: Path):
 
 def serve(env_dir: Path, *, host: str = "127.0.0.1", port: int = 9999,
           open_browser: bool = True) -> None:
-    """Block serving the studio until Ctrl-C."""
+    """Block serving the studio until Ctrl-C. `env_dir` is the DEFAULT project;
+    other projects open via ?env=<path> (multi-project, one server)."""
     workflow_mod.write(env_dir)  # ensure WORKFLOW.md exists
     httpd = ThreadingHTTPServer((host, port), _make_handler(env_dir))
     url = f"http://{host}:{port}"
     print(f"[harn] studio at {url}  (Ctrl-C to stop)")
+    print(f"[harn] default project: {env_dir}  ·  open others with ?env=<path>")
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
@@ -188,6 +623,7 @@ _HTML = r"""<!DOCTYPE html>
     --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --line:#2a2f3a;
     --text:#e6e9ef; --muted:#9aa3b2; --accent:#7c8cff; --accent2:#3ad6a0;
     --chip:#262b36; --chipOn:#2b3a5e; --insp-w:400px;
+    --danger:#ff6b6b; --warn:#e8b93a;
   }
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
@@ -203,6 +639,62 @@ _HTML = r"""<!DOCTYPE html>
   button.primary{background:var(--accent);border-color:var(--accent);color:#0b0d12;font-weight:600}
   .tabs{display:flex;gap:6px}
   .tabs button.active{border-color:var(--accent);color:var(--accent)}
+  .wfbar{display:flex;align-items:center;gap:6px}
+  .wfbar select{font:inherit;padding:6px 30px 6px 9px;max-width:200px;width:auto}
+  .wfdesc{font-size:11px;color:var(--muted);max-width:200px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  button.ghost{padding:6px 8px;font-size:12px;line-height:1}
+  /* one consistent minimal trash icon for every delete affordance in the app */
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;padding:0;border:1px solid var(--line);
+    background:var(--panel2);border-radius:8px;cursor:pointer;color:var(--muted)}
+  .icon-btn svg{width:15px;height:15px}
+  .icon-btn:hover{border-color:var(--danger);color:var(--danger)}
+  .icon-btn:disabled{opacity:.35;cursor:not-allowed}
+  .icon-btn:disabled:hover{border-color:var(--line);color:var(--muted)}
+  .status.dirty{color:var(--warn);font-weight:600}
+  .toolDoc{white-space:pre-wrap;font-size:12.5px;line-height:1.5;color:var(--text);
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+  /* ---- board tab ---- */
+  .runbanner{display:flex;align-items:center;gap:10px;background:var(--panel2);
+    border:1px solid var(--accent);border-radius:8px;padding:8px 10px;margin-bottom:12px;font-size:12.5px}
+  .runbanner button{margin-left:auto}
+  .boardgroup{margin-bottom:16px}
+  .bglabel{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;
+    margin:0 0 6px;padding:0 6px}
+  .taskrow.sel{background:var(--panel2);border-left:2px solid var(--accent)}
+  .taskrow.running{border-left:2px solid var(--accent2)}
+  .live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent2);
+    margin-left:6px;animation:blink 1s ease-in-out infinite}
+  .statusbadge{font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid;text-transform:uppercase;letter-spacing:.4px}
+  .taskTitle{font-size:14px;font-weight:600;margin-bottom:4px}
+  .pipeline{display:flex;flex-wrap:wrap;gap:6px}
+  .pdot{font-size:11px;padding:4px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .pdot.dot-pending{opacity:.5}
+  .pdot.dot-done{border-color:#caa83a;color:#caa83a}
+  .pdot.dot-complete{border-color:var(--accent2);color:var(--accent2)}
+  .pdot.dot-active{border-color:var(--accent);color:var(--accent);animation:blink 1s ease-in-out infinite}
+  .runlog{max-height:200px;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  .attgrid{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
+  .attcard{position:relative;width:96px;background:var(--panel2);border:1px solid var(--line);
+    border-radius:8px;padding:6px;text-align:center}
+  .attthumb{width:100%;height:64px;object-fit:cover;border-radius:6px;cursor:pointer;
+    background:var(--panel);display:block}
+  .attfile{display:flex;align-items:center;justify-content:center;font-size:28px}
+  .attname{font-size:10.5px;color:var(--text);margin-top:5px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .attmeta{font-size:10px;color:var(--muted)}
+  .attcard .attdel{position:absolute;top:3px;right:3px;width:20px;height:20px;
+    background:rgba(15,17,21,.85);opacity:0;transition:opacity .15s}
+  .attcard .attdel svg{width:11px;height:11px}
+  .attcard:hover .attdel{opacity:1}
+  .modelstbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  .modelstbl th{text-align:left;color:var(--muted);font-weight:600;font-size:11px;
+    text-transform:uppercase;letter-spacing:.4px;padding:6px 10px;border-bottom:1px solid var(--line)}
+  .modelstbl td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  .modelstbl input[type=text]{padding:6px 8px;font-size:12.5px}
+  .modelstbl .nm{font-weight:600}
+  .modelstbl .ds{color:var(--muted);font-size:11px;margin-top:2px;max-width:220px}
   .status{color:var(--muted);font-size:12px;min-width:120px;text-align:right}
   main{display:grid;grid-template-columns:1fr 6px var(--insp-w);height:calc(100vh - 53px)}
   .canvas{position:relative;overflow:auto;background:
@@ -211,8 +703,9 @@ _HTML = r"""<!DOCTYPE html>
   .surface{position:relative;width:2000px;height:1500px;transform-origin:0 0}
   .listview{display:none;padding:18px 26px;max-width:760px}
   .listview h2{color:var(--muted);font-size:13px;letter-spacing:.6px;margin:0 0 10px}
-  .zoom{position:absolute;right:14px;bottom:10px;display:flex;align-items:center;gap:2px;
-    background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:2px;z-index:9}
+  .zoom{position:fixed;right:calc(var(--insp-w) + 22px);bottom:16px;display:flex;
+    align-items:center;gap:2px;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:2px;z-index:20;box-shadow:0 2px 10px rgba(0,0,0,.35)}
   .zoom button{padding:2px 9px;border:none;background:transparent}
   .zoom span{font-size:11px;color:var(--muted);min-width:42px;text-align:center;cursor:pointer}
   svg.edges{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
@@ -246,9 +739,13 @@ _HTML = r"""<!DOCTYPE html>
   .insp h2{font-size:13px;margin:0 0 4px;color:var(--muted);text-transform:uppercase;
     letter-spacing:.6px;font-weight:600}
   label{display:block;font-size:12px;color:var(--muted);margin:14px 0 5px}
-  input[type=text],textarea{width:100%;background:var(--panel2);color:var(--text);
-    border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit}
+  input[type=text],textarea,select{width:100%;background:var(--panel2);color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;
+    appearance:none;-webkit-appearance:none}
   textarea{resize:vertical;min-height:90px;font-size:13px}
+  select{cursor:pointer;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa3b2' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+    background-repeat:no-repeat;background-position:right 10px center;background-size:14px;padding-right:32px}
+  select:hover,select:focus{border-color:var(--accent);outline:none}
   .skillgrid{display:flex;flex-wrap:wrap;gap:6px}
   .tog{font-size:12px;padding:4px 9px;border-radius:8px;cursor:pointer;
     background:var(--chip);border:1px solid var(--line);color:var(--muted);user-select:none}
@@ -284,15 +781,57 @@ _HTML = r"""<!DOCTYPE html>
   .mdview{cursor:text;border-radius:8px;padding:9px 11px;border:1px solid transparent;min-height:42px}
   .mdview:hover{border-color:var(--line);background:var(--panel2)}
   .mdview.empty{color:var(--muted)}
+  /* header project + toggles */
+  .proj{font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
+    max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+  .toggles{display:flex;gap:12px;align-items:center;margin-left:6px}
+  .sw{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
+  .sw input{display:none}
+  .sw>span{width:30px;height:17px;border-radius:999px;background:var(--chip);
+    border:1px solid var(--line);position:relative;transition:.15s}
+  .sw>span::after{content:"";position:absolute;top:1px;left:1px;width:13px;height:13px;
+    border-radius:50%;background:var(--muted);transition:.15s}
+  .sw input:checked+span{background:var(--accent2);border-color:var(--accent2)}
+  .sw input:checked+span::after{left:14px;background:#0b0d12}
+  /* flow run animation: pending(grey) · active(blink blue) · done(yellow) · complete(green) */
+  .node.st-pending{opacity:.6}
+  .node.st-done{border-color:#caa83a;box-shadow:0 0 0 1px #caa83a55}
+  .node.st-complete{border-color:var(--accent2);box-shadow:0 0 0 1px #3ad6a055}
+  .node.st-active{border-color:var(--accent);animation:blink 1s ease-in-out infinite}
+  @keyframes blink{0%,100%{box-shadow:0 0 0 1px var(--accent),0 0 0 0 #7c8cff00}
+    50%{box-shadow:0 0 0 2px var(--accent),0 0 16px 2px #7c8cff88}}
+  .node .stat{margin-top:7px;font-size:10.5px;color:var(--muted);
+    font-family:ui-monospace,Menlo,monospace;border-top:1px solid var(--line);padding-top:5px}
+  .runbox{position:absolute;left:14px;top:12px;z-index:9;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:12px;min-width:190px}
+  .runbox h4{margin:0 0 6px;font-size:11px;color:var(--muted);letter-spacing:.5px;font-weight:600}
+  .runbox .kv{display:flex;justify-content:space-between;gap:18px;padding:1px 0}
+  .runbox .kv b{font-weight:500;font-family:ui-monospace,Menlo,monospace}
+  .runbox .live{color:var(--accent2)}
 </style>
 </head>
 <body>
 <header>
   <span class="dot"></span><h1>harn studio</h1>
+  <span class="proj" id="proj" title="current project (env)"></span>
+  <div class="wfbar" id="wfbar" title="active workflow — the flow agents follow">
+    <select id="wfSel" onchange="switchWorkflow(this.value)"></select>
+    <span class="wfdesc" id="wfDesc"></span>
+    <button class="ghost" onclick="newWorkflow()" title="New workflow preset">＋</button>
+    <button class="ghost" onclick="editWorkflowMeta()" title="Edit name / description / version">✎</button>
+    <button class="icon-btn" id="wfDelBtn" onclick="deleteWorkflow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg></button>
+  </div>
   <div class="tabs">
     <button id="tabFlow" class="active" onclick="showTab('flow')">Flow</button>
     <button id="tabSkills" onclick="showTab('skills')">Skills</button>
     <button id="tabTools" onclick="showTab('tools')">Tools</button>
+    <button id="tabBoard" onclick="showTab('board')">Board</button>
+    <button id="tabModels" onclick="showTab('models')">Models</button>
+  </div>
+  <div class="toggles" id="toggles">
+    <label class="sw"><input type="checkbox" id="tgSemble" onchange="setToggle('semble',this.checked)"><span></span>semble</label>
+    <label class="sw"><input type="checkbox" id="tgSocratic" onchange="setToggle('socraticcode',this.checked)"><span></span>socraticode</label>
   </div>
   <span class="sp"></span>
   <span class="status" id="status">loading…</span>
@@ -307,7 +846,8 @@ _HTML = r"""<!DOCTYPE html>
       <svg class="edges" id="edges"></svg>
     </div>
     <div class="listview" id="listView"></div>
-    <div class="hint" id="hint">drag blocks · drag empty space to pan · pinch or ± to zoom</div>
+    <div class="runbox" id="runbox" style="display:none"></div>
+    <div class="hint" id="hint" style="display:none"></div>
     <div class="zoom" id="zoom"><button onclick="zoomBy(1/1.2)">−</button>
       <span id="zlbl" onclick="zoomReset()">100%</span>
       <button onclick="zoomBy(1.2)">＋</button></div>
@@ -317,18 +857,385 @@ _HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const $=s=>document.querySelector(s);
-let S={workflow:{preamble:"",nodes:[]},skills:[],layout:{}};
+// one consistent minimal trash icon, reused for every delete affordance.
+const TRASH_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '+
+  'stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline>'+
+  '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>'+
+  '<path d="M10 11v6"></path><path d="M14 11v6"></path>'+
+  '<path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>';
+let S={workflow:{preamble:"",nodes:[]},skills:[],layout:{},workflows:[],active:'default',toolDocs:{}};
 let L={};                 // title -> {x,y}
 let selNode=null, tab='flow', dirty=false, skillSel=-1, bodyMode='preview';
+let PROG={stages:{},totals:{},active:null,ended:false};
+
+/* multi-project: the env comes from ?env=<path>; a new tab with a different
+   ?env opens another project against the same server. */
+const DEFAULT_ENV="__DEFAULT_ENV__";
+const ENV=new URLSearchParams(location.search).get('env')||DEFAULT_ENV;
+if(!new URLSearchParams(location.search).get('env')){
+  const u=new URL(location); u.searchParams.set('env',ENV); history.replaceState(null,'',u);
+}
+function api(p){ return p+(p.includes('?')?'&':'?')+'env='+encodeURIComponent(ENV); }
 
 function setStatus(t){ $('#status').textContent=t; }
-function markDirty(){ dirty=true; setStatus('unsaved changes'); }
+function markDirty(){ dirty=true; setStatus('unsaved changes'); $('#status').classList.add('dirty'); }
+function clearDirty(){ dirty=false; $('#status').classList.remove('dirty'); }
+// Dirty is TRUE CONTENT DIFF, not "something was clicked" — toggling a step off
+// then back on (or any edit-then-undo) must NOT show "unsaved changes", since
+// the file on disk would round-trip to exactly what's already saved.
+let SAVED_SNAPSHOT=null;
+function snapshotWorkflow(){ SAVED_SNAPSHOT=JSON.stringify(S.workflow); }
+function checkDirty(){
+  if(JSON.stringify(S.workflow)===SAVED_SNAPSHOT) clearDirty(); else markDirty();
+}
 
+let TOOL_DOCS={};   // name -> full MCP docstring; fetched once, static per install
 async function load(){
-  const r=await fetch('/api/state'); S=await r.json();
+  const r=await fetch(api('/api/state')); S=await r.json();
   L=Object.assign({}, S.layout||{});
+  snapshotWorkflow(); clearDirty();
   setStatus(S.skills.length+' skills · '+S.workflow.nodes.filter(n=>n.kind==='step').length+' steps');
-  render();
+  if(!Object.keys(TOOL_DOCS).length){
+    try{ TOOL_DOCS=(await (await fetch(api('/api/tools'))).json()).tools||{}; }catch(e){}
+  }
+  renderWorkflows(); render(); loadConfig(); pollProgress();
+  setInterval(()=>{ pollProgress(); if(tab==='board') pollBoard(); }, 1500);
+}
+function toolDoc(name){ return TOOL_DOCS[name] || '(custom / external tool — not a registered harn MCP tool)'; }
+/* ---------- workflow switcher (named presets) ---------- */
+function renderWorkflows(){
+  const sel=$('#wfSel'); if(!sel) return;
+  const list=S.workflows||[]; const active=S.active||'default';
+  sel.innerHTML='';
+  list.forEach(w=>{ const o=document.createElement('option');
+    o.value=w.name; o.textContent=w.title+(w.version?(' · v'+w.version):'');
+    if(w.name===active)o.selected=true; sel.appendChild(o); });
+  const cur=list.find(w=>w.name===active)||{};
+  $('#wfDesc').textContent=cur.description||'';
+  $('#wfDesc').title=cur.description||'';
+  const del=$('#wfDelBtn'); const isDefault=active==='default';
+  del.disabled=isDefault;
+  del.title=isDefault?"The default workflow can't be deleted.":'Delete this preset';
+}
+function activeWf(){ return (S.workflows||[]).find(w=>w.name===(S.active||'default'))||{}; }
+async function switchWorkflow(name){
+  if(dirty && !confirm('Unsaved flow edits will be lost. Switch workflow anyway?')){
+    renderWorkflows(); return; }
+  setStatus('switching…');
+  await fetch(api('/api/workflows/activate'),{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  clearDirty(); await load();
+}
+async function newWorkflow(){
+  const name=prompt('New workflow name (a-z, 0-9, -):'); if(!name)return;
+  const title=prompt('Title:',name)||name;
+  const description=prompt('Description (what this workflow is for):','')||'';
+  const version=prompt('Version:','1')||'1';
+  setStatus('creating…');
+  const r=await fetch(api('/api/workflows/create'),{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,title,description,version})});
+  const j=await r.json();
+  if(!j.ok){ setStatus('create failed'); alert(j.error||'failed'); return; }
+  clearDirty(); await load();
+}
+async function editWorkflowMeta(){
+  const w=activeWf();
+  const title=prompt('Title:',w.title||''); if(title===null)return;
+  const description=prompt('Description:',w.description||''); if(description===null)return;
+  const version=prompt('Version:',w.version||'1'); if(version===null)return;
+  let new_name=w.name;
+  if(w.name!=='default'){ const nn=prompt('Rename (slug, blank = keep):',w.name);
+    if(nn===null)return; new_name=nn.trim()||w.name; }
+  setStatus('saving…');
+  const r=await fetch(api('/api/workflows/meta'),{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:w.name,title,description,version,new_name})});
+  const j=await r.json();
+  if(!j.ok){ setStatus('save failed'); alert(j.error||'failed'); return; }
+  await load();
+}
+async function deleteWorkflow(){
+  const w=activeWf();
+  if(w.name==='default'){ alert("The default workflow can't be deleted."); return; }
+  if(!confirm('Delete workflow "'+w.title+'"? Tasks using it fall back to the default.'))return;
+  await fetch(api('/api/workflows/delete'),{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name:w.name})});
+  clearDirty(); await load();
+}
+/* ---------- header: project + code-search toggles ---------- */
+async function loadConfig(){
+  const c=await (await fetch(api('/api/config'))).json();
+  $('#proj').textContent=c.project? c.project+' · '+shortEnv(c.env) : shortEnv(c.env);
+  $('#tgSemble').checked=!!(c.toggles&&c.toggles.semble);
+  $('#tgSocratic').checked=!!(c.toggles&&c.toggles.socraticcode);
+}
+function shortEnv(p){ p=p||ENV; const parts=p.split('/'); return parts.slice(-2).join('/'); }
+async function setToggle(key,val){
+  await fetch(api('/api/config'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key,value:val})});
+}
+/* ---------- live run animation (events.jsonl) ---------- */
+const STAGE_KW=[['plan',['pre-task','plan','clarif']],['ui_verify',['ui verify','ui-verify','browser']],
+  ['verify',['verify']],['execute',['implement','execute','build','code']],['test',['test']],
+  ['oracle',['oracle']],['reconcile',['reconcile']]];
+function nodeStage(title){ const t=(title||'').toLowerCase();
+  for(const [s,kws] of STAGE_KW){ if(kws.some(k=>t.includes(k))) return s; } return null; }
+async function pollProgress(){
+  try{ PROG=await (await fetch(api('/api/progress'))).json(); }catch(e){ return; }
+  if(tab==='flow'){ applyProgress(); renderRunbox(); }
+}
+
+/* ---------- board tab: tasks + per-task workflow + launch/observe a run ---------- */
+let BOARD={tasks:[],run:null,run_log:''}, boardSel=null;
+const BOARD_ORDER=['todo','in_progress','review','changes_requested','done'];
+const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your review',
+  changes_requested:'Changes requested',done:'Done'};
+const PIPE_STAGES=[['plan','Plan'],['execute','Implement'],['test','Test'],['verify','Verify'],
+  ['ui_verify','UI verify'],['oracle','Oracle'],['reconcile','Reconcile']];
+
+async function pollBoard(){
+  try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
+  if(tab!=='board') return;
+  renderBoard();
+  if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)) renderTaskDetail();
+  else{ boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>'; }
+}
+function selectTask(id){ boardSel=id; renderBoard(); renderTaskDetail(); }
+function renderBoard(){
+  const v=$('#listView');
+  const groups={}; (BOARD.tasks||[]).forEach(t=>(groups[t.status]=groups[t.status]||[]).push(t));
+  let html='<h2>BOARD</h2>';
+  if(BOARD.run){
+    const rt=(BOARD.tasks||[]).find(t=>t.id===BOARD.run.task_id);
+    html+=`<div class="runbanner">▶ running <b>${esc(BOARD.run.task_id)}</b>`+
+      `${rt?': '+esc(rt.title):''} (pid ${BOARD.run.pid}${BOARD.run.auto?' · auto':''})`+
+      `<button class="ghost" onclick="stopRun()">■ Stop</button></div>`;
+  }
+  BOARD_ORDER.forEach(s=>{
+    const list=(groups[s]||[]).slice().sort((a,b)=>a.priority-b.priority);
+    if(!list.length) return;
+    html+=`<div class="boardgroup"><div class="bglabel">${BOARD_LABEL[s]||s} · ${list.length}</div>`;
+    list.forEach(t=>{
+      const running=BOARD.run&&BOARD.run.task_id===t.id;
+      html+=`<div class="skillrow taskrow ${boardSel===t.id?'sel':''} ${running?'running':''}" onclick="selectTask('${esc(t.id)}')">`+
+        `<div style="width:100%"><div class="nm">${esc(t.id)}: ${esc(t.title)}${running?'<span class="live-dot" title="running"></span>':''}</div>`+
+        `<div class="ds">${esc(t.workflow||'default workflow')} · priority ${t.priority}${t.claimed_by?' · '+esc(t.claimed_by):''}</div></div></div>`;
+    });
+    html+='</div>';
+  });
+  if(!(BOARD.tasks||[]).length) html+='<div class="empty">No tasks yet — create one from an agent session (create_task).</div>';
+  v.innerHTML=html;
+}
+function renderPipelineDots(t){
+  const running=BOARD.run&&BOARD.run.task_id===t.id;
+  if(!running) return '<span class="mut">not running — Launch to see live stages</span>';
+  return PIPE_STAGES.map(([key,label])=>{
+    const info=(PROG.stages||{})[key];
+    const cls=info?(info.status==='active'?'dot-active':info.status==='complete'?'dot-complete':'dot-done'):'dot-pending';
+    return `<span class="pdot ${cls}">${esc(label)}</span>`;
+  }).join('');
+}
+function renderTaskDetail(){
+  const t=(BOARD.tasks||[]).find(x=>x.id===boardSel);
+  if(!t){ $('#insp').innerHTML='<div class="empty">Select a task.</div>'; return; }
+  const running=BOARD.run&&BOARD.run.task_id===t.id;
+  const busy=!!BOARD.run;   // some run (maybe a different task) is active
+  const wfOpts=(S.workflows||[]).map(w=>
+    `<option value="${esc(w.name)}" ${(t.workflow||'default')===w.name?'selected':''}>${esc(w.title)}</option>`).join('');
+  const statusColor={todo:'var(--muted)',in_progress:'var(--accent)',review:'var(--accent2)',
+    changes_requested:'var(--warn)',done:'var(--accent2)'}[t.status]||'var(--muted)';
+  const reviewLog=(t.review_log||[]).map(e=>
+    `${e.ts||''} ${e.event}${e.by?' by '+e.by:e.agent?' ('+e.agent+')':''}${e.summary?': '+e.summary:''}${e.comment?': '+e.comment:''}${e.notes?' — '+e.notes:''}`
+  ).join('\n') || '(none yet)';
+  const decisions=(t.decisions||[]).map(d=>
+    `<span class="chip" title="${esc(d.rationale||'')}">${esc(d.decision)}</span>`).join('') || '<span class="mut">none yet</span>';
+  const attHtml=(t.attachments||[]).length
+    ? `<div class="attgrid">${t.attachments.map(a=>{
+        const url=api('/api/attachments/file?task='+encodeURIComponent(t.id)+'&name='+encodeURIComponent(a.name));
+        const thumb=a.kind==='image'
+          ? `<img src="${url}" class="attthumb" onclick="window.open('${url}','_blank')" title="Open full size"/>`
+          : `<div class="attthumb attfile" onclick="window.open('${url}','_blank')" title="Download">📄</div>`;
+        return `<div class="attcard">${thumb}
+          <div class="attname" title="${esc(a.name)}">${esc(a.name)}</div>
+          <div class="attmeta">${fmtBytes(a.size)}</div>
+          <button class="icon-btn attdel" onclick="deleteAttachment('${esc(t.id)}','${esc(a.name)}')" title="Delete">${TRASH_SVG}</button>
+        </div>`;
+      }).join('')}</div>`
+    : '<span class="mut">no files attached — drop a design reference, screenshot, or anything the agent should see</span>';
+  const KIND_LABEL={skill:'Skills',service:'Services',prd:'PRDs',guidance:'Guidance'};
+  const readsByKind={};
+  (t.context_reads||[]).forEach(r=>{ (readsByKind[r.kind]=readsByKind[r.kind]||[]).push(r); });
+  const contextHtml=Object.keys(readsByKind).length
+    ? Object.entries(readsByKind).map(([kind,items])=>
+        `<div style="margin-bottom:6px"><span class="mut" style="font-size:11px">${esc(KIND_LABEL[kind]||kind)}:</span> `+
+        items.map(r=>`<span class="chip" title="loaded ${esc(r.ts||'')}">${esc(r.name)}</span>`).join(' ')+`</div>`
+      ).join('')
+    : '<span class="mut">nothing pulled into context yet — skill NAMES are always in the prompt, but a body only enters context when the agent calls read_skill/read_service/read_prd/read_guidance</span>';
+  $('#insp').innerHTML=`
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">${esc(t.id)}</h2>
+      <span class="statusbadge" style="color:${statusColor};border-color:${statusColor}">${esc(t.status)}</span>
+    </div>
+    <div class="taskTitle">${esc(t.title)}</div>
+    <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
+    <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
+    <div class="row" style="margin-top:12px;gap:8px">
+      ${running
+        ? `<button class="primary" onclick="stopRun()" style="background:var(--danger);border-color:var(--danger)">■ Stop</button>`
+        : `<button class="primary" onclick="launchTask('${esc(t.id)}',false)" ${busy?'disabled':''} title="${busy?'Another run is active':'Run this task under its workflow'}">▶ Launch</button>
+           <button onclick="launchTask('${esc(t.id)}',true)" ${busy?'disabled':''} title="Autonomous: no human-in-the-loop, harn_env .md files untouched">▶ Launch (auto)</button>`}
+    </div>
+    <label style="margin-top:14px">Description</label>
+    <div class="toolDoc">${esc(t.description||'(none)')}</div>
+    <label style="display:flex;justify-content:space-between;align-items:center">
+      <span>Attachments <span class="mut">(design references, screenshots — visible to the agent too)</span></span>
+      <button class="ghost" onclick="pickAttachment('${esc(t.id)}')" style="padding:3px 9px;font-size:11px">＋ Upload</button>
+    </label>
+    ${attHtml}
+    <input type="file" id="attInput" style="display:none" onchange="uploadPickedFile('${esc(t.id)}',this)"/>
+    <label>Pipeline <span class="mut">(live while running)</span></label>
+    <div class="pipeline">${renderPipelineDots(t)}</div>
+    <label>Context loaded <span class="mut">(what actually entered the agent's context — not just what was available)</span></label>
+    <div class="toolDoc">${contextHtml}</div>
+    <label>Context growing <span class="mut">(scratchpad the agent carries forward)</span></label>
+    <div class="toolDoc">${esc(t.scratchpad||'(empty)')}</div>
+    <label>Decisions <span class="mut">(claims the oracle verifies)</span></label>
+    <div class="skillgrid">${decisions}</div>
+    <label>Review log</label>
+    <div class="toolDoc" style="max-height:160px;overflow:auto">${esc(reviewLog)}</div>
+    ${running?`<label>Run log <span class="mut">(live stdout/stderr tail)</span></label><div class="toolDoc runlog">${esc(BOARD.run_log||'(starting…)')}</div>`:''}
+  `;
+}
+async function assignWorkflow(taskId,name){
+  await fetch(api('/api/tasks/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({task_id:taskId,workflow:name==='default'?'':name})});
+  await pollBoard();
+}
+async function launchTask(taskId,auto){
+  if(!confirm((auto?'Launch (autonomous) ':'Launch ')+taskId+' now? An agent will start making changes in the background.'))return;
+  const r=await post_('/api/tasks/launch',{task_id:taskId,auto});
+  if(!r.ok){ alert(r.error||'launch failed'); return; }
+  await pollBoard();
+}
+async function stopRun(){
+  if(!confirm('Stop the active run? The task stays where it is and can be resumed later.'))return;
+  await post_('/api/tasks/stop',{});
+  await pollBoard();
+}
+async function post_(p,b){
+  const r=await fetch(api(p),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  return r.json();
+}
+/* ---------- models tab: per-stage model/effort/temperature overrides ---------- */
+let MODELS={stages:[],values:{},agent_chain:[],capabilities:{}};
+const STAGE_LABEL={plan:'Plan',execute:'Execute',verify:'Verify',ui_verify:'UI verify',
+  oracle:'Oracle',reconcile:'Reconcile'};
+const STAGE_HINT={
+  plan:'Clarification/funnel turn before any code is written.',
+  execute:'The main implementation turn.',
+  verify:'Checks the work against acceptance criteria.',
+  ui_verify:'Drives the live app via Playwright to confirm the UI.',
+  oracle:'Independent correctness review, fresh context.',
+  reconcile:'Captures learnings into skills/services + changelog.'};
+async function loadModels(){
+  try{ MODELS=await (await fetch(api('/api/models'))).json(); }catch(e){ return; }
+  renderModels();
+}
+function renderModels(){
+  const v=$('#listView');
+  const caps=Object.values(MODELS.capabilities||{});
+  const anyEffort=caps.some(c=>c.effort), anyTemp=caps.some(c=>c.temperature);
+  let html='<h2>MODELS <span class="mut" style="text-transform:none;letter-spacing:0">'+
+    '— per-stage overrides for harn run\'s real agent turns</span></h2>';
+  html+='<div class="mut" style="margin-bottom:14px;font-size:12px;line-height:1.7">'+
+    'Applies ONLY to <b>harn run</b> (headless) — chat-mode agents (Claude Code, Cursor) '+
+    'use whatever model is set in their OWN client; harn\'s MCP layer can\'t switch it for '+
+    'them, only ‘test’ stage runs no agent turn (it runs your test command).<br/>'+
+    'Agent chain: <b>'+((MODELS.agent_chain||[]).map(esc).join(' → ')||'(none configured)')+'</b>'+
+    (anyEffort?'':' · <span style="color:var(--warn)">effort unconfirmed/unsupported for this chain — may be a no-op, check harn/adapters/*.py</span>')+
+    (anyTemp?'':' · <span style="color:var(--warn)">temperature unconfirmed/unsupported for this chain — may be a no-op</span>')+
+    '</div>';
+  html+='<table class="modelstbl"><thead><tr><th>Stage</th><th>Model</th><th>Effort</th><th>Temperature</th></tr></thead><tbody>';
+  MODELS.stages.forEach(s=>{
+    const v_=MODELS.values[s]||{};
+    html+=`<tr><td><div class="nm">${esc(STAGE_LABEL[s]||s)}</div><div class="ds">${esc(STAGE_HINT[s]||'')}</div></td>`+
+      `<td><input type="text" value="${esc(v_.model||'')}" placeholder="e.g. opus" oninput="setModelField('${s}','model',this.value)"/></td>`+
+      `<td><input type="text" value="${esc(v_.effort||'')}" placeholder="e.g. high" oninput="setModelField('${s}','effort',this.value)"/></td>`+
+      `<td><input type="text" value="${esc(v_.temperature||'')}" placeholder="e.g. 0.2" oninput="setModelField('${s}','temperature',this.value)"/></td></tr>`;
+  });
+  html+='</tbody></table>';
+  html+='<div class="row" style="margin-top:14px;gap:10px"><button class="primary" onclick="saveModelsUI()">Save models</button>'+
+    '<span class="status" id="mst"></span></div>';
+  v.innerHTML=html;
+  $('#insp').innerHTML='<div class="empty">Per-stage overrides for harn run. '+
+    'See harn/adapters/*.py for exactly which CLI flags each agent accepts.</div>';
+}
+function setModelField(stage,key,val){
+  MODELS.values[stage]=MODELS.values[stage]||{};
+  MODELS.values[stage][key]=val;
+}
+async function saveModelsUI(){
+  $('#mst').textContent='saving…';
+  const r=await post_('/api/models',{values:MODELS.values});
+  // No reload on success: MODELS.values already matches what was just
+  // persisted, and re-rendering the table would wipe the input focus AND
+  // this very "saved ✓" message before the user can see it.
+  $('#mst').textContent=r.ok?'saved ✓':'save failed';
+}
+/* ---------- attachments: upload / delete (design refs, screenshots, …) ---------- */
+function pickAttachment(taskId){ $('#attInput').click(); }
+async function uploadPickedFile(taskId,input){
+  const file=input.files&&input.files[0]; if(!file)return;
+  const dataUrl=await new Promise((res,rej)=>{
+    const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file);
+  });
+  const content_b64=dataUrl.split(',')[1]||'';
+  const r=await post_('/api/attachments/upload',{task_id:taskId,filename:file.name,content_b64});
+  if(!r.ok){ alert(r.error||'upload failed'); return; }
+  input.value='';
+  await pollBoard();
+}
+async function deleteAttachment(taskId,name){
+  if(!confirm('Delete "'+name+'"?'))return;
+  await post_('/api/attachments/delete',{task_id:taskId,filename:name});
+  await pollBoard();
+}
+function fmtDur(ms){ if(!ms) return '0s'; const s=Math.round(ms/1000); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
+function fmtBytes(n){ if(!n) return '0B'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB'; }
+function hasRun(){ return PROG.run && Object.keys(PROG.stages||{}).length>0; }
+function applyProgress(){
+  const st=PROG.stages||{};
+  const live=hasRun();   // only animate when a run actually has stages
+  document.querySelectorAll('.node').forEach(el=>{
+    el.classList.remove('st-active','st-done','st-complete','st-pending');
+    if(!live) return;
+    const n=S.workflow.nodes[+el.dataset.i]; if(!n||n.kind!=='step') return;
+    const stg=nodeStage(n.title); const info=stg&&st[stg];
+    let cls='st-pending';
+    if(info){ cls = info.status==='active'?'st-active': info.status==='complete'?'st-complete':'st-done'; }
+    el.classList.add(cls);
+    let line=el.querySelector('.stat');
+    if(info&&(info.dur_ms||info.tok_in||info.tok_out)){
+      const tok=(info.tok_in||0)+(info.tok_out||0);
+      const cost=info.cost_usd?` · $${info.cost_usd.toFixed(4)}`:'';
+      if(!line){ line=document.createElement('div'); line.className='stat'; el.appendChild(line); }
+      line.textContent=`${fmtDur(info.dur_ms)} · ${tok} tok${cost}`;
+    } else if(line){ line.remove(); }
+  });
+}
+function renderRunbox(){
+  const box=$('#runbox'), t=PROG.totals||{};
+  if(!hasRun()){ box.style.display='none'; return; }
+  box.style.display='';
+  const tok=(t.tok_in||0)+(t.tok_out||0);
+  const cost=t.cost_usd? '$'+t.cost_usd.toFixed(4) : '—';
+  const state=PROG.active? `<span class="live">▶ ${esc(PROG.active)}</span>` : (PROG.ended?'finished':'idle');
+  box.innerHTML=`<h4>RUN ${esc((PROG.run||'').slice(0,8))}</h4>
+    <div class="kv"><span>state</span><b>${state}</b></div>
+    <div class="kv"><span>time</span><b>${fmtDur(t.dur_ms)}</b></div>
+    <div class="kv"><span>tokens</span><b>${tok}</b></div>
+    <div class="kv"><span>cost</span><b>${cost}</b></div>`;
 }
 function skillNames(){ return S.skills.map(s=>s.name); }
 function allTools(){ const s=new Set(); S.workflow.nodes.forEach(n=>(n.tools||[]).forEach(t=>s.add(t))); return [...s].sort(); }
@@ -343,7 +1250,6 @@ function uniqueTitle(base){ let t=base,i=2; const has=x=>S.workflow.nodes.some(n
 /* ---------- flow canvas ---------- */
 function posFor(n,i){ return L[n.title] || {x:120, y:40+i*170}; }
 function renderFlow(){
-  $('#hint').style.display='';
   const surf=$('#surface');
   [...surf.querySelectorAll('.node')].forEach(e=>e.remove());
   const nums=numbers();
@@ -363,6 +1269,7 @@ function renderFlow(){
     surf.appendChild(el);
   });
   fitSurface(); redrawEdges();
+  applyProgress(); renderRunbox();
   renderInsp();
 }
 function fitSurface(){
@@ -394,22 +1301,22 @@ function resortByPosition(){
   });
 }
 function autoArrange(){
-  resortByPosition();
+  resortByPosition();   // may reorder S.workflow.nodes -> checkDirty catches that
   S.workflow.nodes.forEach((n,i)=>{ L[n.title]={x:120,y:40+i*170}; });
-  renderFlow(); saveLayout(); markDirty();
+  renderFlow(); saveLayout(); checkDirty();
 }
 function addStep(){
   let my=40; document.querySelectorAll('.node').forEach(e=>my=Math.max(my,e.offsetTop+e.offsetHeight));
   const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true};
   L[n.title]={x:120,y:my+50};
-  S.workflow.nodes.push(n); selNode=n; bodyMode='write'; markDirty(); renderFlow(); saveLayout();
+  S.workflow.nodes.push(n); selNode=n; bodyMode='write'; checkDirty(); renderFlow(); saveLayout();
 }
-function toggleEnabled(i){ const n=S.workflow.nodes[i]; n.enabled=n.enabled===false; markDirty(); renderFlow(); }
+function toggleEnabled(i){ const n=S.workflow.nodes[i]; n.enabled=n.enabled===false; checkDirty(); renderFlow(); }
 function deleteNode(){
   if(!selNode) return;
   const i=S.workflow.nodes.indexOf(selNode); if(i<0) return;
   delete L[selNode.title]; S.workflow.nodes.splice(i,1); selNode=null;
-  markDirty(); renderFlow(); saveLayout();
+  checkDirty(); renderFlow(); saveLayout();
 }
 
 /* ---------- drag nodes + pan canvas ---------- */
@@ -446,7 +1353,7 @@ window.addEventListener('pointermove',e=>{
 window.addEventListener('pointerup',()=>{
   if(drag){
     drag.el.classList.remove('drag');
-    if(drag.moved){ resortByPosition(); renderFlow(); saveLayout(); markDirty(); } // reorder → renumber
+    if(drag.moved){ resortByPosition(); renderFlow(); saveLayout(); checkDirty(); } // reorder → renumber
     drag=null;
   }
   if(pan){ $('#canvas').style.cursor=''; pan=null; }
@@ -454,7 +1361,7 @@ window.addEventListener('pointerup',()=>{
 function highlight(){ document.querySelectorAll('.node').forEach(e=>
   e.classList.toggle('sel', S.workflow.nodes[+e.dataset.i]===selNode)); }
 async function saveLayout(){
-  await fetch('/api/layout',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch(api('/api/layout'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(L)});
 }
 
@@ -512,7 +1419,7 @@ function mdToHtml(src){
 }
 /* one body editor at a time (the selected node OR skill) — click to edit, blur to render */
 function getBody(){ return tab==='flow' ? (selNode?selNode.body||'':'') : (S.skills[skillSel]?S.skills[skillSel].body||'':''); }
-function setBody(v){ if(tab==='flow'){ if(selNode){selNode.body=v; markDirty();} } else if(S.skills[skillSel]){ S.skills[skillSel].body=v; } }
+function setBody(v){ if(tab==='flow'){ if(selNode){selNode.body=v; checkDirty();} } else if(S.skills[skillSel]){ S.skills[skillSel].body=v; } }
 function reInsp(){ tab==='flow'?renderInsp():renderSkillEditor(); }
 function bodyHtml(minH){ minH=minH||140;
   if(bodyMode==='write')
@@ -537,13 +1444,13 @@ function renderInsp(){
   const reqLinks=(n.required||[]).map(name=>`<a class="link" onclick="editSkill('${esc(name)}')">edit ${esc(name)} »</a>`).join(' · ');
   const toolTogs=allTools().map(t=>{
     const on=(n.tools||[]).includes(t);
-    return `<span class="tog ${on?'on':''}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
+    return `<span class="tog ${on?'on':''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
   $('#insp').innerHTML=`
     <h2>${isStep?'Step':'Note'}</h2>
     <div class="row" style="justify-content:space-between">
       <label style="margin:0">${isStep?'<input type="checkbox" '+(n.enabled!==false?'checked':'')+' onchange="setEnabled(this.checked)"/> enabled':''}</label>
-      <a class="link" style="color:var(--danger)" onclick="deleteNode()">delete »</a>
+      <button class="icon-btn" onclick="deleteNode()" title="Delete this step">${TRASH_SVG}</button>
     </div>
     <label>Title</label>
     <input type="text" value="${esc(n.title)}" oninput="upd('title',this.value)"/>
@@ -561,43 +1468,49 @@ function renderInsp(){
 }
 function upd(k,v){
   if(!selNode) return; const old=selNode.title;
-  selNode[k]=v; markDirty();
+  selNode[k]=v; checkDirty();
   if(k==='title'){ if(L[old]){ L[v]=L[old]; if(v!==old) delete L[old]; } renderFlow(); }
 }
-function setEnabled(on){ if(!selNode)return; selNode.enabled=on; markDirty(); renderFlow(); }
+function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); renderFlow(); }
 function toggleReq(name){
   if(!selNode)return; selNode.required=selNode.required||[];
   const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
-  markDirty(); renderFlow();
+  checkDirty(); renderFlow();
 }
 function toggleTool(name){
   if(!selNode)return; selNode.tools=selNode.tools||[];
   const k=selNode.tools.indexOf(name); if(k>=0)selNode.tools.splice(k,1); else selNode.tools.push(name);
-  markDirty(); renderFlow();
+  checkDirty(); renderFlow();
 }
 function addTool(v){ v=(v||'').trim(); if(!v||!selNode)return;
   selNode.tools=selNode.tools||[]; if(!selNode.tools.includes(v))selNode.tools.push(v);
-  markDirty(); renderFlow(); }
+  checkDirty(); renderFlow(); }
 async function saveFlow(){
   setStatus('saving…'); resortByPosition();
-  const r=await fetch('/api/workflow',{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch(api('/api/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(S.workflow)});
-  const j=await r.json(); dirty=false; setStatus(j.ok?'saved ✓':'save failed'); renderFlow();
+  const j=await r.json();
+  if(j.ok){ snapshotWorkflow(); clearDirty(); setStatus('saved ✓'); } else { setStatus('save failed'); }
+  renderFlow();
 }
 
 /* ---------- tabs + list views ---------- */
 function showTab(t){ tab=t; bodyMode='preview';
-  ['flow','skills','tools'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
+  ['flow','skills','tools','board','models'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
   $('#surface').style.display = t==='flow'?'':'none';
   $('#listView').style.display = t==='flow'?'none':'block';
-  $('#hint').style.display = t==='flow'?'':'none';
   $('#zoom').style.display = t==='flow'?'':'none';
+  $('#runbox').style.display = t==='flow'&&hasRun()?'':'none';
   $('#canvas').classList.toggle('list',t!=='flow');
   $('#saveBtn').style.display=t==='flow'?'':'none';
   $('#arrangeBtn').style.display=t==='flow'?'':'none';
   $('#addBtn').style.display=t==='flow'?'':'none';
   $('#addSkillBtn').style.display=t==='skills'?'':'none';
-  if(t==='flow')renderFlow(); else if(t==='skills')renderSkills(); else renderTools();
+  if(t==='flow')renderFlow();
+  else if(t==='skills')renderSkills();
+  else if(t==='tools')renderTools();
+  else if(t==='models')loadModels();
+  else{ pollBoard(); }
 }
 
 /* ---------- skills tab ---------- */
@@ -613,6 +1526,15 @@ function renderSkills(){
 }
 function editSkill(name){ showTab('skills'); skillSel=S.skills.findIndex(s=>s.name===name);
   renderSkills(); renderSkillEditor(); }
+function goToNode(title){
+  showTab('flow');
+  selNode=S.workflow.nodes.find(n=>n.title===title)||selNode;
+  highlight(); renderInsp();
+  const el=document.querySelector('.node.sel');
+  if(el){ const c=$('#canvas');
+    c.scrollLeft=el.offsetLeft*Z - c.clientWidth/2 + el.offsetWidth*Z/2;
+    c.scrollTop =el.offsetTop*Z  - c.clientHeight/2 + el.offsetHeight*Z/2; }
+}
 function addSkill(){
   let base='new-skill',n=base,i=2; while(S.skills.some(s=>s.name===n)){ n=base+'-'+i;i++; }
   S.skills.push({name:n,description:'',body:'# '+n+'\n\n'}); skillSel=S.skills.length-1;
@@ -623,7 +1545,7 @@ function renderSkillEditor(){
   $('#insp').innerHTML=`
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">Skill</h2>
-      <a class="link" style="color:var(--danger)" onclick="deleteSkill(${skillSel})">delete »</a>
+      <button class="icon-btn" onclick="deleteSkill(${skillSel})" title="Delete this skill">${TRASH_SVG}</button>
     </div>
     <label>Name <span class="mut">(slug)</span></label>
     <input type="text" value="${esc(s.name)}" oninput="S.skills[${skillSel}].name=this.value.trim().toLowerCase().replace(/\s+/g,'-')"/>
@@ -634,22 +1556,26 @@ function renderSkillEditor(){
     <div class="row" style="margin-top:12px">
       <button class="primary" onclick="saveSkill(${skillSel})">Save skill</button>
       <span class="status" id="sst"></span>
-    </div>`;
+    </div>
+    ${(()=>{ const users=S.workflow.nodes.filter(n=>(n.required||[]).includes(s.name));
+      return `<label>Used by ${users.length} step(s)</label>
+    <div class="skillgrid">${users.map(u=>`<span class="chip" style="cursor:pointer" onclick="goToNode('${esc(u.title)}')">${esc(u.title)}</span>`).join('')||'<span class="mut">none</span>'}</div>`; })()}`;
 }
 async function saveSkill(i){
   const s=S.skills[i]; if(!s.name){ $('#sst').textContent='name required'; return; }
   $('#sst').textContent='saving…';
-  const r=await fetch('/api/skill',{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch(api('/api/skill'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name:s.name,description:s.description,body:s.body})});
   const j=await r.json(); renderSkills();
   const st=$('#sst'); if(st) st.textContent=j.ok?'saved ✓':'failed';
 }
 async function deleteSkill(i){
   const s=S.skills[i]; if(!confirm('Delete skill "'+s.name+'"?'))return;
-  await fetch('/api/skill/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch(api('/api/skill/delete'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name:s.name})});
   // also strip it from every step's required
-  S.workflow.nodes.forEach(n=>{ if(n.required){const k=n.required.indexOf(s.name);if(k>=0){n.required.splice(k,1);dirty=true;}} });
+  S.workflow.nodes.forEach(n=>{ if(n.required){const k=n.required.indexOf(s.name);if(k>=0)n.required.splice(k,1);} });
+  checkDirty();
   S.skills.splice(i,1); skillSel=Math.min(skillSel,S.skills.length-1);
   $('#insp').innerHTML='<div class="empty">Skill deleted.</div>'; renderSkills();
 }
@@ -660,32 +1586,37 @@ function renderTools(){
   const v=$('#listView'); const tools=allTools();
   v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— used across steps; Save flow to persist</span></h2>';
   tools.forEach(t=>{ const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(t));
-    const r=document.createElement('div');r.className='skillrow';
+    const doc=toolDoc(t); const first=doc.split('\n')[0];
+    const r=document.createElement('div');r.className='skillrow';r.title=doc;
     r.onclick=()=>{toolSel=t;renderToolEditor();};
-    r.innerHTML=`<div><div class="nm">${esc(t)}</div><div class="ds">${users.length} step(s): ${esc(users.map(u=>u.title).join(', '))}</div></div>`;
+    r.innerHTML=`<div style="width:100%"><div class="nm">${esc(t)} <span class="mut" style="font-weight:400">· ${users.length} step(s)</span></div>`+
+      `<div class="ds">${esc(first)}</div></div>`;
     v.appendChild(r); });
   if(!tools.length) v.innerHTML+='<div class="empty">No tools yet — add tools on a step (Flow tab).</div>';
   if(toolSel&&tools.includes(toolSel)) renderToolEditor(); else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
 }
 function renderToolEditor(){
   const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(toolSel));
+  const doc=toolDoc(toolSel);
   $('#insp').innerHTML=`
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">Tool</h2>
-      <a class="link" style="color:var(--danger)" onclick="deleteTool('${esc(toolSel)}')">remove from all »</a>
+      <button class="icon-btn" onclick="deleteTool('${esc(toolSel)}')" title="Remove this tool from every step">${TRASH_SVG}</button>
     </div>
     <label>Name <span class="mut">(rename across all steps)</span></label>
     <input type="text" value="${esc(toolSel)}" onchange="renameTool('${esc(toolSel)}',this.value)"/>
+    <label>What it does · why it's needed · when to use it</label>
+    <div class="toolDoc">${esc(doc)}</div>
     <label>Used by ${users.length} step(s)</label>
-    <div class="skillgrid">${users.map(u=>`<span class="chip">${esc(u.title)}</span>`).join('')||'<span class="mut">none</span>'}</div>
+    <div class="skillgrid">${users.map(u=>`<span class="chip" style="cursor:pointer" onclick="goToNode('${esc(u.title)}')">${esc(u.title)}</span>`).join('')||'<span class="mut">none</span>'}</div>
     <div class="mut" style="margin-top:14px">Tools are part of the workflow — click <b>Save flow</b> on the Flow tab to persist renames/removals.</div>`;
 }
 function renameTool(oldn,newn){ newn=(newn||'').trim(); if(!newn||newn===oldn){renderTools();return;}
   S.workflow.nodes.forEach(n=>{ if(n.tools){ const k=n.tools.indexOf(oldn); if(k>=0)n.tools[k]=newn; } });
-  toolSel=newn; markDirty(); renderTools(); }
+  toolSel=newn; checkDirty(); renderTools(); }
 function deleteTool(t){ if(!confirm('Remove tool "'+t+'" from all steps?'))return;
   S.workflow.nodes.forEach(n=>{ if(n.tools){ const k=n.tools.indexOf(t); if(k>=0)n.tools.splice(k,1); } });
-  toolSel=null; markDirty(); renderTools(); }
+  toolSel=null; checkDirty(); renderTools(); }
 
 /* ---------- resizable inspector ---------- */
 let rs=null;

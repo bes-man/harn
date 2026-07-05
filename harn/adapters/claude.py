@@ -20,16 +20,23 @@ class ClaudeAdapter(Adapter):
 
     name = "claude"
     binary = "claude"
+    # Claude Code's `-p` mode has no sampling temperature to set (it's fixed for
+    # tool-use reliability); "effort" isn't a plain CLI flag either (extended
+    # thinking is a model/API concept, not exposed this way headless) — both
+    # unconfirmed, so left as the base class's best-effort default. `--model`
+    # is real and documented for the Claude Code CLI.
 
-    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800) -> AgentResult:
+    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
+                model: str | None = None, effort: str | None = None,
+                temperature: str | None = None) -> AgentResult:
         if not self.available():
             return AgentResult(
                 ok=False,
                 text="claude CLI not found on PATH. Install claude first.",
             )
-        r = self._exec(
-            [self.binary, "-p", prompt, "--output-format", "json"], cwd, timeout
-        )
+        argv = ([self.binary, "-p", prompt, "--output-format", "json"]
+                + self._model_args(model, effort, temperature))
+        r = self._exec(argv, cwd, timeout)
         if r.timed_out:
             return AgentResult(ok=False, text=r.stderr)
         return self._parse(r.ok, r.stdout, r.stderr)

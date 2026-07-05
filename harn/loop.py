@@ -21,7 +21,7 @@ from typing import Callable
 from pathlib import Path
 
 from . import browser, design as design_mod, events, gitutil, progress, \
-    prd as prd_mod, semble_bridge, skills, state, tasks
+    prd as prd_mod, semble_bridge, skills, state, tasks, workflows
 from .adapters import Adapter, get_adapter
 from .config import Config
 from .feedback import run_feedback
@@ -765,9 +765,16 @@ def _accumulate(totals: dict, costs: dict, task_id: str, r) -> None:
         costs[task_id] = costs.get(task_id, 0.0) + r.cost_usd
 
 
+def _stage_overrides(cfg: Config, stage: str) -> dict:
+    """This stage's {model, effort, temperature} kwargs for adapter.run_turn,
+    from harn.toml's `[models.<stage>]` (Config.stage_models) — empty dict if
+    the stage has no override configured."""
+    return dict(cfg.stage_models.get(stage, {}))
+
+
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
               task_id: str, stage: str, tok_totals: dict, tok_costs: dict,
-              verdict: str | None = None):
+              cfg: Config, verdict: str | None = None):
     """Run one agent turn and emit a structured stage_start/stage_end pair.
 
     Centralising the run_turn call guarantees that EVERY completed agent cycle
@@ -780,7 +787,7 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
                 agent=adapter.name)
     t0 = time.time()
     try:
-        res = adapter.run_turn(prompt, project_root)
+        res = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, stage))
     except Exception as e:
         events.emit(env_dir, "error", task_id=task_id, stage=stage,
                     detail=str(e)[:300])
@@ -983,7 +990,7 @@ def _run_verify(adapter, env_dir, cfg, task, project_root, st, state_dir, auto,
     vres = _run_turn(adapter, env_dir,
                      _build_verify_prompt(env_dir, cfg, task, auto=auto),
                      project_root, task_id=task.id, stage="verify",
-                     tok_totals=tok_totals, tok_costs=tok_costs)
+                     tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
     print(vres.text[-1500:] if vres.text else "(verify: no output)")
     if not auto and vres.usage_str():
         progress.log(env_dir, f"{task.id}: verify used {vres.usage_str()}",
@@ -1036,7 +1043,7 @@ def _run_ui_verify(adapter, env_dir, cfg, task, project_root, st, state_dir,
         ures = _run_turn(adapter, env_dir,
                          _build_ui_verify_prompt(env_dir, cfg, task, shots_dir, auto=auto),
                          project_root, task_id=task.id, stage="ui_verify",
-                         tok_totals=tok_totals, tok_costs=tok_costs)
+                         tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
     finally:
         app.stop()
     print(ures.text[-1500:] if ures.text else "(ui verify: no output)")
@@ -1091,7 +1098,7 @@ def oracle_review(
                 agent=adapter.name)
     t0 = time.time()
     try:
-        ores = adapter.run_turn(prompt, project_root)
+        ores = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "oracle"))
     except Exception as e:  # never let the oracle crash the dispatcher
         progress.log(env_dir, f"{task.id}: oracle error: {e}", agent=adapter.name)
         events.emit(env_dir, "error", task_id=task.id, stage="oracle",
@@ -1197,7 +1204,7 @@ def _run_reconcile(
     print(f"[harn] Reconciling skills for '{task.id}'…")
     rres = _run_turn(adapter, env_dir, _build_reconcile_prompt(env_dir, cfg, task),
                      project_root, task_id=task.id, stage="reconcile",
-                     tok_totals=tok_totals, tok_costs=tok_costs)
+                     tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
     print(rres.text[-800:] if rres.text else "(reconcile: no output)")
     if rres.usage_str():
         progress.log(env_dir, f"{task.id}: reconcile used {rres.usage_str()}",
@@ -1254,7 +1261,7 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
         events.emit(env_dir, "stage_start", task_id=task.id, stage="reconcile",
                     agent=adapter.name)
         t0 = time.time()
-        rres = adapter.run_turn(prompt, project_root)
+        rres = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "reconcile"))
         events.emit(env_dir, "stage_end", task_id=task.id, stage="reconcile",
                     agent=adapter.name, dur_ms=int((time.time() - t0) * 1000),
                     tok_in=rres.input_tokens, tok_out=rres.output_tokens,
@@ -1286,13 +1293,19 @@ def _run_end(env_dir: Path, st: "state.State") -> str:
 
 
 def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
-        auto: bool = False) -> str:
+        auto: bool = False, only_task: str | None = None) -> str:
     """Run the loop until DONE, BLOCKED, REVIEW (CLI), or max_iterations.
 
     In `auto` mode there is no human: the agent decides ambiguities itself,
     harn runs a larger iteration budget, and NO harn_env `.md` files are mutated
     (no task statuses, no PROGRESS/ANSWERS, no review log) — code may change, the
     harness bookkeeping stays pristine. Not recommended for complex tasks.
+
+    `only_task` restricts the loop to a single task id (`harn run --task …`) —
+    used by the studio UI's per-task Launch button so a background run works
+    exactly the task the user picked, under the workflow they assigned it, and
+    stops once it leaves the runnable pool (done/blocked/review) rather than
+    picking up whatever else is next.
     """
     cfg = Config.load(env_dir)
     auto = auto or cfg.auto
@@ -1333,7 +1346,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
     plan_turns: dict[str, int] = {}  # funnel turns per task (capped)
     for _ in range(limit):
-        task = tasks.next_task(env_dir, exclude=handled)
+        task = tasks.next_task(env_dir, exclude=handled, only=only_task)
         if task is None:
             if auto:
                 st.transition(state.DONE)
@@ -1355,6 +1368,13 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
 
         if task.id != working_id:
             working_id, feedback_tail = task.id, ""
+            # Render the task's chosen workflow into WORKFLOW.md BEFORE any turn,
+            # so every agent (Claude/Codex/Cursor) reads the right flow from the
+            # one file they all read. Empty → the project default.
+            active_wf = workflows.activate(env_dir, task.workflow)
+            if task.workflow:
+                progress.log(env_dir, f"{task.id}: workflow → {active_wf}",
+                             agent=adapter.name)
 
         was_rework = task.status == tasks.CHANGES_REQUESTED
         is_new = not task.review_log      # never been touched → planning candidate
@@ -1385,7 +1405,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             pres = _run_turn(adapter, env_dir,
                              _build_planning_prompt(env_dir, cfg, task),
                              project_root, task_id=task.id, stage="plan",
-                             tok_totals=tok_totals, tok_costs=tok_costs)
+                             tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
             print(pres.text[-2000:] if pres.text else "(planning: no output)")
             if pres.usage_str():
                 progress.log(env_dir, f"{task.id}: planning used {pres.usage_str()}",
@@ -1430,7 +1450,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
         result = _run_turn(adapter, env_dir,
                            _build_prompt(env_dir, cfg, task, feedback_tail, auto=auto),
                            project_root, task_id=task.id, stage="execute",
-                           tok_totals=tok_totals, tok_costs=tok_costs)
+                           tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
         print(result.text[-2000:] if result.text else "(no output)")
         if not auto and result.usage_str():
             progress.log(env_dir, f"{task.id}: turn used {result.usage_str()}",

@@ -20,7 +20,14 @@ class AntigravityAdapter(Adapter):
 
     name = "antigravity"
     binary = "antigravity"
+    # `--model`/`--effort`/`--temperature` are the base class's best-effort
+    # convention, unconfirmed for this specific CLI build — override the
+    # *_FLAG class attrs above if your `antigravity` CLI uses different syntax.
 
-    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800) -> AgentResult:
+    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
+                model: str | None = None, effort: str | None = None,
+                temperature: str | None = None) -> AgentResult:
         # `antigravity exec` runs a single non-interactive turn and prints output.
-        return self._run_cli([self.binary, "exec", prompt], cwd, timeout)
+        argv = ([self.binary, "exec", prompt]
+                + self._model_args(model, effort, temperature))
+        return self._run_cli(argv, cwd, timeout)

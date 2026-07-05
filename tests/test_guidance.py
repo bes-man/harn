@@ -56,9 +56,13 @@ def test_full_mode_produces_verbose_agents(tmp_path):
 
 def test_fixed_overhead_under_target(tmp_path):
     """AGENTS.md + CLAUDE.md + tool docstrings should be well under the old
-    ~8.9k tokens. Budget 4600: workflow is now always-on (a WORKFLOW.md pointer
-    for every agent + read_workflow/save_workflow). WORKFLOW.md itself is
-    read-on-demand, so it costs 0 context per turn."""
+    ~8.9k tokens. Budget 4800: workflow is now always-on (a WORKFLOW.md pointer
+    for every agent + read_workflow/save_workflow), tasks can run under named
+    workflow presets (set_task_workflow + read_workflow's preset footer), and
+    tasks carry file attachments (save_attachment/list_attachments/
+    read_attachment). WORKFLOW.md itself is read-on-demand, so it costs 0
+    context per turn; the studio Tools tab's longer human-facing notes
+    (tool_notes.py) are UI-only and never touch this budget."""
     import inspect, re
     from harn import mcp_server
     _setup(tmp_path)
@@ -67,4 +71,4 @@ def test_fixed_overhead_under_target(tmp_path):
     src = inspect.getsource(mcp_server.build_server)
     docs = sum(len(d) for d in re.findall(r'"""(.*?)"""', src, re.DOTALL))
     total_tok = (agents + claude + docs) // 4
-    assert total_tok <= 4600, f"fixed overhead {total_tok} tok exceeds budget"
+    assert total_tok <= 4800, f"fixed overhead {total_tok} tok exceeds budget"

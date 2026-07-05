@@ -63,6 +63,27 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, v))
 
 
+# The real, separately-invoked agent turns in `harn run` — "test" runs the
+# configured test command, not an LLM turn, so it takes no model override.
+MODEL_STAGES = ("plan", "execute", "verify", "ui_verify", "oracle", "reconcile")
+
+
+def _parse_stage_models(models_raw: dict) -> dict:
+    out: dict = {}
+    for stage in MODEL_STAGES:
+        st = models_raw.get(stage) or {}
+        if not isinstance(st, dict):
+            continue
+        entry = {}
+        for key in ("model", "effort", "temperature"):
+            v = st.get(key)
+            if v is not None and str(v).strip():
+                entry[key] = str(v).strip()
+        if entry:
+            out[stage] = entry
+    return out
+
+
 _HIL_CHANNELS = {"chat", "telegram", "both"}
 
 
@@ -154,6 +175,15 @@ class Config:
     # Keep a release-notes-style changelog per task (record_change + reconcile
     # backstop), assembled into docs via `harn changelog` / generate_changelog.
     log_changes: bool = True
+    # Per-stage model overrides for `harn run`'s real, separately-invoked agent
+    # turns (plan/execute/verify/ui_verify/oracle/reconcile — NOT the WORKFLOW.md
+    # steps a chat agent follows within one turn, which harn can't force-switch
+    # models for). {stage: {"model": ..., "effort": ..., "temperature": ...}},
+    # only the keys actually set. From `[models.<stage>]` tables in harn.toml —
+    # see Adapter.MODEL_FLAG/EFFORT_FLAG/TEMPERATURE_FLAG for what each CLI
+    # actually accepts (provider-agnostic: same override, whichever CLI is
+    # currently active in the agent chain).
+    stage_models: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
     @property
@@ -215,5 +245,6 @@ class Config:
                 or data["notify"].get("chat_grace_minutes", 5)
             ),
             log_changes=bool(data.get("log", {}).get("changes", True)),
+            stage_models=_parse_stage_models(data.get("models", {}) or {}),
             raw=data,
         )

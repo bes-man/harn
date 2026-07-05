@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 from harn import workflow, skills, studio, scaffold, ENV_DIRNAME
@@ -178,6 +179,97 @@ def test_delete_skill_missing_is_ok(tmp_path):
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
     assert studio.delete_skill(env, {"name": "nope"})["ok"] is True   # idempotent
+
+
+def test_config_payload_reports_toggles(tmp_path):
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    c = studio.config_payload(env)
+    assert "semble" in c["toggles"] and "socraticcode" in c["toggles"]
+    assert c["env"].endswith(ENV_DIRNAME)
+
+
+def test_set_config_flag_round_trips(tmp_path):
+    from harn.config import Config
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    studio.set_config_flag(env, {"key": "semble", "value": False})
+    assert Config.load(env).code_search_semble is False
+    studio.set_config_flag(env, {"key": "semble", "value": True})
+    assert Config.load(env).code_search_semble is True
+    studio.set_config_flag(env, {"key": "socraticcode", "value": False})
+    assert Config.load(env).code_search_socraticcode is False
+
+
+def test_set_config_flag_rejects_unknown(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    assert studio.set_config_flag(env, {"key": "evil", "value": True})["ok"] is False
+
+
+def test_progress_payload_maps_stages(tmp_path):
+    from harn import events
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    events.new_run(env, kind="loop")
+    events.emit(env, "stage_start", task_id="T", stage="execute")
+    events.emit(env, "stage_end", task_id="T", stage="execute",
+                dur_ms=8000, tok_in=1000, tok_out=200, cost_usd=0.02)
+    events.emit(env, "stage_start", task_id="T", stage="verify")  # active, no end
+    p = studio.progress_payload(env)
+    assert p["stages"]["execute"]["status"] == "done"
+    assert p["stages"]["verify"]["status"] == "active"
+    assert p["active"] == "verify"
+    assert p["totals"]["tok_in"] == 1000 and p["totals"]["cost_usd"] == 0.02
+
+
+def test_progress_complete_when_run_ends_ok(tmp_path):
+    from harn import events
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    events.new_run(env, kind="loop")
+    events.emit(env, "stage_start", task_id="T", stage="execute")
+    events.emit(env, "stage_end", task_id="T", stage="execute", dur_ms=100)
+    events.emit(env, "run_end", phase="DONE")
+    p = studio.progress_payload(env)
+    assert p["stages"]["execute"]["status"] == "complete"
+    assert p["ended"] is True
+
+
+def test_node_stage_keyword_mapping():
+    assert studio._node_stage("Implement") == "execute"
+    assert studio._node_stage("Tests") == "test"
+    assert studio._node_stage("UI verify (only user-facing work)") == "ui_verify"
+    assert studio._node_stage("Verify") == "verify"
+    assert studio._node_stage("Reconcile — grow the knowledge base") == "reconcile"
+    assert studio._node_stage("Rules that bite") is None
+
+
+def test_server_rejects_bad_env(tmp_path):
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    from http.server import ThreadingHTTPServer
+    import threading
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), studio._make_handler(env))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        # default env (no ?env) works
+        assert json.loads(urllib.request.urlopen(base + "/api/state").read())["workflow"]
+        # explicit ?env to another valid project works
+        other = tmp_path / "other"; scaffold.setup(other)
+        oenv = other / ENV_DIRNAME
+        import urllib.parse as up
+        u = base + "/api/config?env=" + up.quote(str(oenv))
+        assert json.loads(urllib.request.urlopen(u).read())["env"].endswith(ENV_DIRNAME)
+        # a non-env path is rejected
+        bad = base + "/api/state?env=" + up.quote(str(tmp_path / "nope"))
+        try:
+            urllib.request.urlopen(bad); assert False, "should 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        httpd.shutdown(); httpd.server_close()
 
 
 def test_server_skill_delete_endpoint(tmp_path):

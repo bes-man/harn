@@ -276,7 +276,8 @@ def cmd_run(args) -> int:
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
-    loop.run(root, env_dir, max_iterations=args.max_iterations, auto=args.auto)
+    loop.run(root, env_dir, max_iterations=args.max_iterations, auto=args.auto,
+              only_task=args.task_id or None)
     return 0
 
 
@@ -403,7 +404,7 @@ def cmd_trace(args) -> int:
             bits.append(task)
         if stage:
             bits.append(stage)
-        for k in ("verdict", "outcome", "phase", "source"):
+        for k in ("verdict", "outcome", "phase", "source", "kind", "name"):
             if e.get(k):
                 bits.append(f"{k}={e[k]}")
         if e.get("dur_ms") is not None:
@@ -503,6 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="autonomous: decide without a human, more iterations, never touch "
              "harn_env .md files (not for complex tasks)",
     )
+    rp.add_argument("--task", dest="task_id", default=None,
+                    help="only work this task id, then stop (used by "
+                         "harn ui's per-task Launch button)")
     rp.set_defaults(func=cmd_run)
 
     ap = sub.add_parser("answer", help="answer a blocked question and resume")

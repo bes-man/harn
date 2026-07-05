@@ -47,12 +47,42 @@ class Adapter:
     name = "base"
     binary = ""
 
+    # Per-turn override flags, applied by `_model_args` below. Every adapter
+    # defaults to this near-universal CLI convention; if your installed CLI
+    # version uses different flags (or doesn't support one at all), override
+    # the relevant *_FLAG on the subclass, or set it to None to skip that
+    # override entirely for this agent. A flag your CLI doesn't recognize makes
+    # the process exit with a visible argument error (shows up in the run's
+    # log/trace) — never a silent wrong behavior, so this is a safe default to
+    # try even when unconfirmed for a given CLI version.
+    MODEL_FLAG: str | None = "--model"
+    EFFORT_FLAG: str | None = "--effort"
+    TEMPERATURE_FLAG: str | None = "--temperature"
+
     def available(self) -> bool:
         """Whether the underlying CLI/binary is installed and runnable."""
         return bool(self.binary) and shutil.which(self.binary) is not None
 
-    def run_turn(self, prompt: str, cwd: Path) -> AgentResult:
-        """Run one non-interactive turn with `prompt` in working dir `cwd`."""
+    def _model_args(self, model: str | None = None, effort: str | None = None,
+                    temperature: str | None = None) -> list[str]:
+        """CLI args for this turn's per-stage overrides (harn_env/harn.toml's
+        `[models.<stage>]`), empty for anything not set or not supported by
+        this adapter."""
+        args: list[str] = []
+        if model and self.MODEL_FLAG:
+            args += [self.MODEL_FLAG, model]
+        if effort and self.EFFORT_FLAG:
+            args += [self.EFFORT_FLAG, effort]
+        if temperature and self.TEMPERATURE_FLAG:
+            args += [self.TEMPERATURE_FLAG, str(temperature)]
+        return args
+
+    def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
+                model: str | None = None, effort: str | None = None,
+                temperature: str | None = None) -> AgentResult:
+        """Run one non-interactive turn with `prompt` in working dir `cwd`.
+        `model`/`effort`/`temperature` are this stage's optional overrides
+        (see harn.toml's `[models.<stage>]` / Config.stage_models)."""
         raise NotImplementedError
 
     def _exec(self, argv: Sequence[str], cwd: Path, timeout: int) -> _Exec:

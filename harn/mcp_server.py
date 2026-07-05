@@ -9,11 +9,13 @@ The server acts on a single harn_env, resolved from $HARN_ENV_DIR or ./harn_env.
 """
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+from . import attachments as attachments_mod
 from . import codebase as codebase_mod
 from . import design as design_mod
 from . import events as events_mod
@@ -49,6 +51,27 @@ def _log(msg: str) -> None:
         pass
 
 
+def _context_read(kind: str, name: str) -> None:
+    """Record that a skill/service/PRD/guidance body was actually pulled into
+    context, tagged to the currently claimed task (STATE.json's current_task).
+
+    Skill/tool NAMES live in every prompt (cheap index), but a body only enters
+    the agent's context when it explicitly calls one of these read_* tools —
+    that decision happens live inside the agent's own turn, invisible to harn
+    unless recorded here. This is the only way to later answer "what actually
+    ended up in this task's context" (`harn trace`, the studio board's Context
+    section) instead of just "what was AVAILABLE to load".
+    """
+    try:
+        env = _env_dir()
+        st = state_mod.State.load(env / "state")
+        if st.current_task:
+            events_mod.emit(env, "context_read", task_id=st.current_task,
+                            kind=kind, name=name)
+    except Exception:
+        pass
+
+
 def _ensure_watch_running(env_dir: Path) -> None:
     """Auto-start `harn watch` as a background daemon if not already running.
 
@@ -80,7 +103,7 @@ def _ensure_watch_running(env_dir: Path) -> None:
 
 
 def build_server():
-    from mcp.server.fastmcp import FastMCP  # imported lazily so core CLI has no hard dep
+    from mcp.server.fastmcp import FastMCP, Image  # lazy: core CLI has no hard dep
 
     mcp = FastMCP("harn")
 
@@ -106,6 +129,8 @@ def build_server():
         if not n:
             return 'provide the skill name, e.g. read_skill(name="ui")'
         body = skills_mod.read_skill(_env_dir(), n)
+        if body is not None:
+            _context_read("skill", n)
         return body if body is not None else f"(no skill named '{n}')"
 
     @mcp.tool()
@@ -130,6 +155,7 @@ def build_server():
         if body is None:
             return (f"(no guidance topic '{topic}'). Available:\n"
                     + guidance_mod.index(env))
+        _context_read("guidance", topic)
         return body
 
     @mcp.tool()
@@ -154,6 +180,7 @@ def build_server():
             return (f"(no service '{n}' registered) If it exists in the code, "
                     "explore it and register it via `save_service`. Template:\n\n"
                     + codebase_mod.TEMPLATE)
+        _context_read("service", n)
         return body
 
     @mcp.tool()
@@ -201,7 +228,23 @@ def build_server():
         if t is None:
             return "(no runnable tasks — all done, blocked by deps, or claimed)"
         _log(f"{t.id}: claimed by {wid} ({t.title})")
+        # Tag STATE.json's current_task unconditionally (not just the low-
+        # autonomy block below) — this is what `_context_read` tags read_skill/
+        # read_service/read_prd/read_guidance calls against, so "what actually
+        # ended up in this task's context" is traceable in chat mode too, not
+        # only in `harn run`'s own loop (which sets it per turn separately).
+        state_dir = env / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        st = state_mod.State.load(state_dir)
+        st.current_task = t.id
+        st.save(state_dir)
+        # Render this task's workflow into WORKFLOW.md so read_workflow (and
+        # file-reading agents) see the right flow. Empty → the project default.
+        from . import workflows as wfs
+        active_wf = wfs.activate(env, t.workflow)
         out = t.path.read_text(encoding="utf-8")
+        if t.workflow:
+            out += f"\n\n▶ Workflow: '{active_wf}' — re-read WORKFLOW.md now."
         out += ("\n\n▶ Run the pre-task protocol from AGENTS.md before any code: "
                 "AS IS → TO BE → skills (name them) → best practices → clarify.")
         # Surface the configured autonomy level so harn autonomy actually
@@ -288,6 +331,7 @@ def build_server():
         user_story: str = "",
         task_id: str = "",
         depends_on: list[str] | None = None,
+        workflow: str = "",
     ) -> str:
         """Author a task as JSON in harn_env/tasks/ (YOU write it, not the
         human; clarify with ask_user first if fuzzy).
@@ -298,7 +342,8 @@ def build_server():
         epic / user_story — optional tracker keys. task_id — empty → auto
         PRJ-NNN, else a tracker key. depends_on — ids that must be `done` first;
         leave empty so independent tasks run in PARALLEL (real ordering only,
-        not soft preference — use priority for that)."""
+        not soft preference — use priority for that). workflow — named preset
+        (read_workflow footer); empty → default."""
         from .config import Config
         cfg = Config.load(_env_dir())
         t = tasks_mod.create_task(
@@ -313,9 +358,11 @@ def build_server():
             task_id=task_id or None,
             id_prefix=cfg.project.upper(),
             depends_on=depends_on or None,
+            workflow=workflow or None,
         )
         dep = f" (after {', '.join(t.depends_on)})" if t.depends_on else ""
-        return f"Created task {t.id}: {t.path.name}{dep}"
+        wf = f" [workflow: {t.workflow}]" if t.workflow else ""
+        return f"Created task {t.id}: {t.path.name}{dep}{wf}"
 
     @mcp.tool()
     def update_task(
@@ -356,8 +403,10 @@ def build_server():
         distilled criteria, so you rarely re-read the PRD while implementing —
         which is why it isn't injected every turn."""
         p = prd_mod.find(_env_dir(), slug)
-        return p.raw.strip() if p else (f"(no PRD '{slug}'). Create "
-                                        f"harn_env/prd/{slug}.md")
+        if p is None:
+            return f"(no PRD '{slug}'). Create harn_env/prd/{slug}.md"
+        _context_read("prd", slug)
+        return p.raw.strip()
 
     @mcp.tool()
     def lock_spec(task_id: str, done_when: str, approach: str = "",
@@ -544,6 +593,45 @@ def build_server():
         return html if html is not None else f"(no design for '{task_id}')"
 
     @mcp.tool()
+    def save_attachment(task_id: str, filename: str, content_b64: str) -> str:
+        """Save a file (base64-encoded) to a task's attachments, e.g. a
+        reference image the human shared or one you generated. Never
+        overwrites — a name collision auto-suffixes. See read_attachment."""
+        t = tasks_mod.find(_env_dir(), task_id)
+        if t is None:
+            return f"(task '{task_id}' not found)"
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            return "content_b64 is not valid base64"
+        p = attachments_mod.save(_env_dir(), task_id, filename, data)
+        _log(f"{task_id}: attachment saved ({p.name}, {len(data)} bytes)")
+        return f"Saved as {p.name} ({len(data)} bytes). list_attachments('{task_id}') to see all."
+
+    @mcp.tool()
+    def list_attachments(task_id: str) -> str:
+        """List a task's saved files (name, size, image/file) — check before
+        generating or re-saving one with the same purpose."""
+        rows = attachments_mod.list_files(_env_dir(), task_id)
+        if not rows:
+            return f"(no attachments for '{task_id}')"
+        return "\n".join(f"- {r['name']} ({r['kind']}, {r['size']}B)" for r in rows)
+
+    @mcp.tool()
+    def read_attachment(task_id: str, filename: str):
+        """Return one attachment. Images come back as real image content (you
+        SEE it, e.g. a design reference) — other files as raw text."""
+        p = attachments_mod.path_for(_env_dir(), task_id, filename)
+        if p is None:
+            return f"(no attachment '{filename}' on '{task_id}')"
+        if attachments_mod.is_image(p.name):
+            return Image(path=str(p))
+        try:
+            return p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            return f"({p.name} is binary/unreadable as text, {p.stat().st_size}B)"
+
+    @mcp.tool()
     def run_tests() -> str:
         """Run the project's configured feedback command and return the tail."""
         cfg = Config.load(_env_dir())
@@ -622,10 +710,20 @@ def build_server():
     def read_workflow() -> str:
         """Return harn_env/WORKFLOW.md — the always-followed flow + required skills
         per step. Read at session start; load each step's required + relevant
-        skills (never all)."""
+        skills (never all). Footer lists named presets a task can run under."""
         from . import workflow as wf
-        p = _env_dir() / wf.FILENAME
-        return p.read_text(encoding="utf-8") if p.exists() else "(no WORKFLOW.md yet)"
+        from . import workflows as wfs
+        env = _env_dir()
+        p = env / wf.FILENAME
+        body = p.read_text(encoding="utf-8") if p.exists() else "(no WORKFLOW.md yet)"
+        rows = wfs.list_workflows(env)
+        if len(rows) > 1:   # only worth showing when presets beyond 'default' exist
+            active = wfs.active_name(env)
+            names = ", ".join((m["name"] + ("*" if m["name"] == active else ""))
+                              for m in rows)
+            body += (f"\n\n<!-- workflow presets (set_task_workflow): {names} "
+                     f"(*=active) -->")
+        return body
 
     @mcp.tool()
     def save_workflow(content: str) -> str:
@@ -638,7 +736,46 @@ def build_server():
         _log("workflow saved")
         return f"WORKFLOW.md saved ({len(content)} chars)."
 
+    @mcp.tool()
+    def set_task_workflow(task_id: str, workflow: str) -> str:
+        """Run a task under a named workflow preset; empty resets to the default.
+        Preset names are in read_workflow's footer / the studio UI."""
+        from . import workflows as wfs
+        env = _env_dir()
+        t = tasks_mod.find(env, task_id)
+        if t is None:
+            return f"(no task {task_id})"
+        slug = (workflow or "").strip().lower()
+        known = [m["name"] for m in wfs.list_workflows(env)]
+        if slug and wfs._slug(slug) not in known:
+            return (f"(no workflow '{workflow}' — have: {', '.join(known)}; "
+                    f"create new ones in the studio UI)")
+        t.workflow = wfs._slug(slug) if slug else None
+        tasks_mod._save(t)
+        _log(f"{t.id} workflow → {t.workflow or 'default'}")
+        return f"{t.id} will run under workflow: {t.workflow or 'default (WORKFLOW.md)'}"
+
     return mcp
+
+
+_catalog_cache: dict[str, str] | None = None
+
+
+def tool_catalog() -> dict[str, str]:
+    """name -> full docstring for every registered MCP tool.
+
+    The single source of truth for "what does this tool do, when do I use it" —
+    reused by the studio UI's Tools tab so descriptions never drift out of sync
+    with what the agent itself sees via `tools/list`. Cached (the tool set is
+    static for a given harn install); build once, reuse across studio requests.
+    """
+    global _catalog_cache
+    if _catalog_cache is None:
+        import asyncio
+        mcp = build_server()
+        tools = asyncio.run(mcp.list_tools())
+        _catalog_cache = {t.name: (t.description or "").strip() for t in tools}
+    return _catalog_cache
 
 
 def serve(http: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None:
