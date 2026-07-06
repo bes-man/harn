@@ -66,10 +66,39 @@ global fallback (Settings tab). This is a breaking change for any project
 already using `[models.<stage>]` — no migration shim, since Phase 1 ships
 before this feature has real-world adopters to break.
 
+### Per-task workflow snapshot — the task's own execution plan
+
+WORKFLOW.md / named presets are TEMPLATES. Each task gets its own copy — the
+analogue of superpowers' one-plan-per-feature:
+
+- **Snapshot at task creation**: `create_task` copies the chosen preset (or
+  the default workflow) into `harn_env/tasks/<task-id>.workflow.json` — the
+  same node structure the studio canvas edits. From that moment the task runs
+  ONLY its own copy; later edits to the preset affect only future tasks.
+- **Visible and editable in the UI**: reuses the SAME Flow canvas component
+  used for editing presets, just pointed at a different data source — opened
+  from the Board's task detail ("Edit this task's plan") instead of from the
+  Flow tab's workflow picker. Before the run: tune steps, agents, models,
+  skills for THIS task. During/after: the same canvas renders live per-step
+  progress (status dot per node, like today's whole-workflow progress view,
+  now per-task instead of per-active-run).
+- **Editable mid-flight + restart from any step**: the user can add detail to
+  a step's body, attach more skills, then Rerun from that step — the existing
+  git-checkpoint mechanism (keyed by step `Id:`) restores the working tree to
+  that step's start; steps after it re-run against the edited plan.
+- **Per-step ledger on the task**: `task.step_results[step_id] = {status,
+  started, ended, tokens, verdict}` — durable progress that survives
+  restarts/compaction (the superpowers `progress.md` role), rendered as the
+  live pipeline view in the UI.
+- **Agent-agnostic contract preserved**: chat agents still read WORKFLOW.md;
+  when a task is picked up, its SNAPSHOT (not the preset) is rendered into
+  WORKFLOW.md — same `activate` mechanism, new source. The headless engine
+  reads the snapshot JSON directly and never touches the global file.
+
 ### Execution engine (`harn/loop.py`)
 
 Replace the hardcoded `PIPELINE: list[Stage]` walk with a walk over the
-active WORKFLOW.md's parsed, `enabled` steps, in file order. For each step:
+task's workflow snapshot's `enabled` steps, in order. For each step:
 
 1. Build a **generic** prompt from the step's title + body + required skills
    + tools + accumulated task context (scratchpad, prior step results,
@@ -117,9 +146,16 @@ view. `harn explain` instead lists the active workflow's steps directly.
 ### Migration for existing projects
 
 A WORKFLOW.md without `Id:`/`Agent:` lines parses as before: every step gets
-an auto-generated `Id:` on first save (from studio or `save_workflow`), and no
-agent/model override (inherits the global default) — behaves exactly like
-today's single-agent default, just no longer gated to six names.
+an auto-generated `Id:` the moment it's first snapshotted into a task (or
+saved from studio), with no agent/model override (inherits the global
+default) — behaves exactly like today's single-agent default, just no longer
+gated to six names.
+
+**In-flight tasks** (created before this ships, with no `workflow_snapshot`
+field) keep running exactly as they do today — reading the live global
+WORKFLOW.md via `task.workflow` — until they reach a terminal status. The
+snapshot mechanism only applies to tasks created after the change; there is
+no forced backfill of a snapshot onto an already-running task.
 
 ## Testing
 
@@ -132,6 +168,10 @@ today's single-agent default, just no longer gated to six names.
   (test with e.g. 10+ steps, not just six).
 - `studio.py`: every step's inspector renders agent/model controls
   unconditionally; Run/Rerun works keyed by `Id:`.
+- Per-task snapshot: `create_task` copies the preset into the task; editing
+  the task's plan doesn't touch the preset (and vice versa); `step_results`
+  ledger records per-step outcomes; rerun-from-step-N restores the checkpoint
+  and re-runs subsequent steps against the EDITED plan.
 - Existing tests hardcoding the six-stage assumption (`test_stage_models.py`,
   most of `test_studio_models.py`, the `MODEL_STAGES`-based parts of
   `test_workflow.py`/`test_stage_checkpoints.py`/`test_run_stage.py`) are
