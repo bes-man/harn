@@ -29,7 +29,7 @@ from . import skills as skills_mod
 from . import tasks as tasks_mod
 from . import workflow as workflow_mod
 from . import workflows as workflows_mod
-from .config import Config, MODEL_STAGES
+from .config import Config
 
 
 # --------------------------------------------------------------------------- #
@@ -89,12 +89,14 @@ def state_payload(env_dir: Path) -> dict:
 
 def apply_workflow(env_dir: Path, payload: dict) -> dict:
     """Persist edited workflow nodes into the ACTIVE workflow preset (and mirror
-    it into WORKFLOW.md so every agent reads it)."""
+    it into WORKFLOW.md so every agent reads it). Echoes back the saved nodes
+    (ids now stamped) so the client can sync without a full page reload."""
     name = workflows_mod.save_active(env_dir, {
         "preamble": payload.get("preamble", ""),
         "nodes": payload.get("nodes", []),
     })
-    return {"ok": True, "active": name}
+    saved = workflows_mod.load(env_dir, name) or {}
+    return {"ok": True, "active": name, "workflow": saved}
 
 
 def list_workflows_payload(env_dir: Path) -> dict:
@@ -233,14 +235,18 @@ def set_config_flag(env_dir: Path, payload: dict) -> dict:
 def models_payload(env_dir: Path) -> dict:
     """Everything the UI needs to configure harn run's agents/models:
 
-    - `default_agent`/`default_model`: the `[harn]` defaults every stage uses
-      unless overridden — the answer to "when I use Cursor, harn run uses Cursor".
+    - `default_agent`/`default_model`: the `[harn]` defaults every step uses
+      unless overridden on the step itself — the answer to "when I use
+      Cursor, harn run uses Cursor".
     - `agents`: EVERY known agent (not just the chain) with its curated known
       models/efforts/temperatures and whether its CLI is installed here
-      (`available`), so both the Settings agent picker and the per-stage model
+      (`available`), so both the Settings agent picker and the per-step model
       dropdown can show real, agent-specific options.
-    - `values`: current per-stage `[models.<stage>]` overrides (agent + model +
-      effort + temperature).
+
+    Per-step overrides now live directly on each workflow node's
+    `agent`/`model`/`effort`/`temperature` fields (see harn/workflow.py),
+    saved via `/api/workflow` or `/api/task_plan` — there is no more
+    stage-keyed `[models.<stage>]` config in harn.toml.
     """
     from .adapters import get_adapter, _REGISTRY
     cfg = Config.load(env_dir)
@@ -252,48 +258,14 @@ def models_payload(env_dir: Path) -> dict:
                         "available": a.available(),
                         "models": list(a.MODELS), "efforts": list(a.EFFORTS),
                         "temperatures": list(a.TEMPERATURES)}
-    return {"stages": list(MODEL_STAGES), "values": cfg.stage_models,
-            "agent_chain": cfg.agent_chain,
+    return {"agent_chain": cfg.agent_chain,
             "default_agent": (cfg.agent_chain[0] if cfg.agent_chain else cfg.agent),
             "default_model": cfg.model,
-            "agents": agents,
-            # kept for back-compat with any older client field name
-            "capabilities": agents}
+            "agents": agents}
 
 
 def _toml_escape(v: str) -> str:
     return v.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def save_models(env_dir: Path, payload: dict) -> dict:
-    """Rewrite every `[models.<stage>]` table in harn.toml from the submitted
-    values (stdlib can't write TOML, so this owns and regenerates just those
-    tables — same targeted-rewrite approach as set_config_flag). A stage with
-    no fields set is simply omitted (falls back to no override)."""
-    values = payload.get("values") or {}
-    toml_path = env_dir / "harn.toml"
-    text = toml_path.read_text(encoding="utf-8") if toml_path.exists() else ""
-    for stage in MODEL_STAGES:
-        text = re.sub(
-            rf"(?m)^\[models\.{re.escape(stage)}\]\n(?:(?!\[)[^\n]*\n?)*", "", text)
-    text = text.rstrip("\n")
-    blocks = []
-    for stage in MODEL_STAGES:
-        v = values.get(stage) or {}
-        lines = [f"[models.{stage}]"]
-        for key in ("agent", "model", "effort", "temperature"):
-            val = str(v.get(key) or "").strip()
-            if val:
-                lines.append(f'{key} = "{_toml_escape(val)}"')
-        if len(lines) > 1:
-            blocks.append("\n".join(lines))
-    if blocks:
-        text = (text + "\n\n" if text else "") + "\n\n".join(blocks) + "\n"
-    else:
-        text = text + "\n" if text else ""
-    toml_path.parent.mkdir(parents=True, exist_ok=True)
-    toml_path.write_text(text, encoding="utf-8")
-    return {"ok": True}
 
 
 def save_defaults(env_dir: Path, payload: dict) -> dict:
@@ -454,6 +426,33 @@ def set_task_workflow(env_dir: Path, payload: dict) -> dict:
     t.workflow = slug
     tasks_mod._save(t)
     return {"ok": True, "task_id": t.id, "workflow": t.workflow}
+
+
+def task_plan_payload(env_dir: Path, task_id: str) -> dict:
+    """The task's OWN workflow plan (harn_env/tasks/<id>.workflow.json) for the
+    Board's "Edit this task's plan" button — the same Flow canvas component
+    used for presets, just pointed at a per-task snapshot instead."""
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    plan = workflows_mod.load_task_plan(env_dir, task_id) \
+        or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
+    if plan is None:
+        return {"ok": False, "error": "no plan"}
+    return {"ok": True, "plan": plan, "task_id": task_id}
+
+
+def save_task_plan_route(env_dir: Path, payload: dict) -> dict:
+    """Persist edits made while a task's plan (not a preset) is open in the
+    canvas — writes ONLY that task's snapshot file, never the preset. Echoes
+    back the saved plan (ids now stamped) so the client can sync in place."""
+    task_id = (payload.get("task_id") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    plan = payload.get("plan") or {}
+    workflows_mod.save_task_plan(env_dir, task_id, plan)
+    return {"ok": True, "plan": plan}
 
 
 def launch_task(env_dir: Path, payload: dict) -> dict:
@@ -627,6 +626,8 @@ def _make_handler(default_env: Path):
                 self._json(board_payload(env))
             elif route == "/api/models":
                 self._json(models_payload(env))
+            elif route == "/api/task_plan":
+                self._json(task_plan_payload(env, self._query("task") or ""))
             elif route == "/api/attachments/file":
                 task_id, name = self._query("task"), self._query("name")
                 data = attachments_mod.read_bytes(env, task_id, name)
@@ -677,8 +678,8 @@ def _make_handler(default_env: Path):
                 self._json(upload_attachment(env, body))
             elif route == "/api/attachments/delete":
                 self._json(delete_attachment(env, body))
-            elif route == "/api/models":
-                self._json(save_models(env, body))
+            elif route == "/api/task_plan":
+                self._json(save_task_plan_route(env, body))
             elif route == "/api/defaults":
                 self._json(save_defaults(env, body))
             else:
@@ -756,6 +757,11 @@ _HTML = r"""<!DOCTYPE html>
   .runbanner{display:flex;align-items:center;gap:10px;background:var(--panel2);
     border:1px solid var(--accent);border-radius:8px;padding:8px 10px;margin-bottom:12px;font-size:12.5px}
   .runbanner button{margin-left:auto}
+  /* ---- task-plan edit mode (Board -> Edit this task's plan) ---- */
+  .planbanner{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:20;
+    display:flex;align-items:center;gap:10px;background:var(--panel2);
+    border:1px solid var(--accent2);border-radius:8px;padding:7px 12px;font-size:12.5px}
+  .planbanner button{margin-left:4px}
   .boardgroup{margin-bottom:16px}
   .bglabel{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;
     margin:0 0 6px;padding:0 6px}
@@ -955,6 +961,7 @@ _HTML = r"""<!DOCTYPE html>
 </header>
 <main>
   <div class="canvas" id="canvas">
+    <div class="planbanner" id="planBanner" style="display:none"></div>
     <div class="surface" id="surface">
       <svg class="edges" id="edges"></svg>
     </div>
@@ -979,6 +986,10 @@ let S={workflow:{preamble:"",nodes:[]},skills:[],layout:{},workflows:[],active:'
 let L={};                 // title -> {x,y}
 let selNode=null, tab='flow', dirty=false, skillSel=-1, bodyMode='preview';
 let PROG={stages:{},totals:{},active:null,ended:false};
+// null = editing a workflow PRESET (the normal Flow tab). {taskId} = editing
+// one task's OWN plan snapshot instead (opened via the Board's "Edit this
+// task's plan" button) — same canvas component, different load/save target.
+let PLAN_MODE=null;
 
 /* multi-project: the env comes from ?env=<path>; a new tab with a different
    ?env opens another project against the same server. */
@@ -1090,21 +1101,6 @@ async function setToggle(key,val){
     body:JSON.stringify({key,value:val})});
 }
 /* ---------- live run animation (events.jsonl) ---------- */
-const STAGE_KW=[['plan',['pre-task','plan','clarif']],['ui_verify',['ui verify','ui-verify','browser']],
-  ['verify',['verify']],['execute',['implement','execute','build','code']],['test',['test']],
-  ['oracle',['oracle']],['reconcile',['reconcile']]];
-function nodeStage(title){ const t=(title||'').toLowerCase();
-  for(const [s,kws] of STAGE_KW){ if(kws.some(k=>t.includes(k))) return s; } return null; }
-// A step's ACTUAL mapping to one of harn run's real turns, for gating the
-// model override + Run/Rerun controls: explicit `n.stage` always wins (set via
-// the inspector's dropdown — survives renaming); 'none' is an explicit opt-out
-// (never falls back to guessing); undecided ("" / unset) falls back to a
-// best-effort title-keyword guess so the default template works out of the
-// box without every step needing to be assigned by hand.
-function effectiveStage(n){
-  if(n.stage==='none') return null;
-  return n.stage || nodeStage(n.title) || null;
-}
 async function pollProgress(){
   try{ PROG=await (await fetch(api('/api/progress'))).json(); }catch(e){ return; }
   if(tab==='flow'){
@@ -1121,8 +1117,6 @@ let BOARD={tasks:[],run:null,run_log:''}, boardSel=null;
 const BOARD_ORDER=['todo','in_progress','review','changes_requested','done'];
 const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your review',
   changes_requested:'Changes requested',done:'Done'};
-const PIPE_STAGES=[['plan','Plan'],['execute','Implement'],['test','Test'],['verify','Verify'],
-  ['ui_verify','UI verify'],['oracle','Oracle'],['reconcile','Reconcile']];
 
 async function pollBoard(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
@@ -1160,10 +1154,14 @@ function renderBoard(){
 function renderPipelineDots(t){
   const running=BOARD.run&&BOARD.run.task_id===t.id;
   if(!running) return '<span class="mut">not running — Launch to see live stages</span>';
-  return PIPE_STAGES.map(([key,label])=>{
-    const info=(PROG.stages||{})[key];
+  // Every step id seen so far in this run's events (PROG.stages is keyed by
+  // step id, not a fixed pipeline name — steps are now arbitrary per-task).
+  const ids=Object.keys(PROG.stages||{});
+  if(!ids.length) return '<span class="mut">starting…</span>';
+  return ids.map(id=>{
+    const info=(PROG.stages||{})[id];
     const cls=info?(info.status==='active'?'dot-active':info.status==='complete'?'dot-complete':'dot-done'):'dot-pending';
-    return `<span class="pdot ${cls}">${esc(label)}</span>`;
+    return `<span class="pdot ${cls}">${esc(id)}</span>`;
   }).join('');
 }
 function renderTaskDetail(){
@@ -1210,6 +1208,9 @@ function renderTaskDetail(){
     <div class="taskTitle">${esc(t.title)}</div>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" onclick="openTaskPlan('${esc(t.id)}')" title="Open this task's own copy of its plan — edits affect only this task">✎ Edit this task's plan</button>
+    </div>
     <div class="row" style="margin-top:12px;gap:8px">
       ${running
         ? `<button class="primary" onclick="stopRun()" style="background:var(--danger);border-color:var(--danger)">■ Stop</button>`
@@ -1257,74 +1258,65 @@ async function post_(p,b){
   const r=await fetch(api(p),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
   return r.json();
 }
-/* ---------- per-stage agent + model overrides (for harn run) ---------- */
-// The model/agent a real harn run STAGE uses. Steps map to a stage (see
-// effectiveStage); multiple steps mapping to the same stage share its config.
-// `default_agent`/`default_model` are the [harn] settings edited in Settings.
-let MODELS={stages:[],values:{},agent_chain:[],agents:{},default_agent:'',default_model:''};
-const STAGE_LABEL={plan:'Plan',execute:'Execute',verify:'Verify',ui_verify:'UI verify',
-  oracle:'Oracle',reconcile:'Reconcile'};
+/* ---------- per-step agent + model (for harn run) ---------- */
+// Every step now carries its OWN agent/model/effort/temperature fields
+// directly (see harn/workflow.py) — no more stage-keyed [models.<stage>]
+// indirection. `default_agent`/`default_model` are the [harn] settings
+// edited in Settings, used when a step leaves its fields blank.
+let MODELS={agent_chain:[],agents:{},default_agent:'',default_model:''};
 const AGENT_LABEL={claude:'Claude Code',codex:'Codex',cursor:'Cursor',
   qwen:'Qwen',antigravity:'Antigravity'};
 async function ensureModelsLoaded(){
-  if(MODELS.stages.length) return;
+  if(Object.keys(MODELS.agents||{}).length) return;
   try{ MODELS=await (await fetch(api('/api/models'))).json(); }catch(e){}
-}
-function setModelField(stage,key,val){
-  MODELS.values[stage]=MODELS.values[stage]||{};
-  if((val||'').trim()) MODELS.values[stage][key]=val; else delete MODELS.values[stage][key];
-}
-// Changing the stage's agent changes which models are valid — clear a now-
-// invalid model and re-render so the model dropdown reflects the new agent.
-function setStageAgent(stage,agentName){
-  setModelField(stage,'agent',agentName);
-  const valid=(agentCaps(stageAgent(stage)).models)||[];
-  const cur=(MODELS.values[stage]||{}).model;
-  if(cur && valid.length && !valid.includes(cur)) setModelField(stage,'model','');
-  renderInsp();
 }
 function allAgentNames(){ return Object.keys(MODELS.agents||{}); }
 function agentCaps(name){ return (MODELS.agents||{})[name]||{}; }
-// Which CLI actually runs this stage: its per-stage agent override, else the
-// [harn] default agent. That agent's curated values drive the model dropdown.
-function stageAgent(stage){
-  return (MODELS.values[stage]||{}).agent || MODELS.default_agent || '';
-}
-function modelChoices(stage){
-  const c=agentCaps(stageAgent(stage));
+// The choices for THIS step's model/effort/temperature dropdowns, driven by
+// whichever agent the step is set to run under (else the [harn] default).
+function stepChoices(n){
+  const c=agentCaps(n.agent||MODELS.default_agent||'');
   return {models:c.models||[], efforts:c.efforts||[], temperatures:c.temperatures||[]};
+}
+// Direct setter for a step's agent/model/effort/temperature field — replaces
+// the old stage-keyed setModelField/setStageAgent/saveStepModel plumbing.
+// Changing the agent can invalidate the current model, so it's cleared and
+// the inspector re-rendered (same guard the old setStageAgent had).
+function setStepField(field,val){
+  if(!selNode) return;
+  selNode[field]=(val||'').trim();
+  if(field==='agent'){
+    const valid=(agentCaps(selNode.agent||MODELS.default_agent||'').models)||[];
+    if(selNode.model && valid.length && !valid.includes(selNode.model)) selNode.model='';
+  }
+  checkDirty(); renderInsp();
 }
 // A <select> of known values + a "Custom…" escape hatch (curated lists go
 // stale as providers ship new models — this keeps typing-it-yourself always
-// possible instead of hard-blocking on the list).
-function selectOrCustom(stage,field,current,options){
+// possible instead of hard-blocking on the list). `keyid` is a DOM-safe id
+// (the step's own id) so multiple steps' custom inputs don't collide.
+function selectOrCustom(keyid,field,current,options){
   const known=options.includes(current);
   const isCustom=!!current && !known;
-  const sel=`<select onchange="onModelSelect('${stage}','${field}',this)">
+  const sel=`<select onchange="onModelSelect('${esc(keyid)}','${field}',this)">
     <option value="">(none)</option>
     ${options.map(o=>`<option value="${esc(o)}" ${current===o?'selected':''}>${esc(o)}</option>`).join('')}
     <option value="__custom__" ${isCustom?'selected':''}>Custom…</option>
   </select>
   <input type="text" placeholder="custom ${esc(field)}" value="${esc(isCustom?current:'')}"
-    style="margin-top:4px;${isCustom?'':'display:none'}" id="mc-${stage}-${field}"
-    oninput="setModelField('${stage}','${field}',this.value)"/>`;
+    style="margin-top:4px;${isCustom?'':'display:none'}" id="mc-${esc(keyid)}-${field}"
+    oninput="setStepField('${field}',this.value)"/>`;
   return sel;
 }
-function onModelSelect(stage,field,sel){
-  const inp=$('#mc-'+stage+'-'+field);
+function onModelSelect(keyid,field,sel){
+  const inp=$('#mc-'+keyid+'-'+field);
   if(sel.value==='__custom__'){
     if(inp){ inp.style.display=''; inp.value=''; inp.focus(); }
-    setModelField(stage,field,'');
+    setStepField(field,'');
   }else{
     if(inp) inp.style.display='none';
-    setModelField(stage,field,sel.value);
+    setStepField(field,sel.value);
   }
-}
-async function saveStepModel(stage){
-  const st=$('#mst-'+stage);
-  if(st) st.textContent='saving…';
-  const r=await post_('/api/models',{values:MODELS.values});
-  if(st) st.textContent=r.ok?'saved ✓':'save failed';
 }
 /* ---------- attachments: upload / delete (design refs, screenshots, …) ---------- */
 function pickAttachment(taskId){ $('#attInput').click(); }
@@ -1354,7 +1346,7 @@ function applyProgress(){
     el.classList.remove('st-active','st-done','st-complete','st-pending');
     if(!live) return;
     const n=S.workflow.nodes[+el.dataset.i]; if(!n||n.kind!=='step') return;
-    const stg=effectiveStage(n); const info=stg&&st[stg];
+    const info=n.id&&st[n.id];
     let cls='st-pending';
     if(info){ cls = info.status==='active'?'st-active': info.status==='complete'?'st-complete':'st-done'; }
     el.classList.add(cls);
@@ -1373,10 +1365,6 @@ function applyProgress(){
 // run again is a valid action regardless of where the task currently sits
 // (e.g. rerun 'verify' on a task already in review, before approving it).
 const RUNNABLE_STATUSES=['todo','in_progress','changes_requested'];
-// The real, separately-invoked agent turns eligible for per-step Run/Rerun —
-// mirrors harn.config.MODEL_STAGES. 'test' isn't here: it runs the configured
-// test command, not an agent turn, so there's nothing to (re)run via git.
-const RUN_STAGES=['plan','execute','verify','ui_verify','oracle','reconcile'];
 
 function flowTaskSel(){ return $('#flowTaskSel'); }
 // The picker lists EVERY task (not just runnable ones) so per-step Run/Rerun
@@ -1463,20 +1451,23 @@ async function rerunWholeWorkflow(){
 }
 
 /* ---------- per-step Run/Rerun (one real agent turn, in isolation) ---------- */
-async function runStep(stage){
-  const taskId=flowSelectedTaskId(); if(!taskId){ alert('No runnable task to run this step for.'); return; }
+// While editing a task's own plan (PLAN_MODE), Run/Rerun always target THAT
+// task; otherwise they target whichever task is picked in the terminal block.
+function runStepTaskId(){ return PLAN_MODE ? PLAN_MODE.taskId : flowSelectedTaskId(); }
+async function runStep(stepId){
+  const taskId=runStepTaskId(); if(!taskId){ alert('No runnable task to run this step for.'); return; }
   if(BOARD.run){ alert('A run is already active — stop it first.'); return; }
-  if(!confirm('Run just the "'+stage+'" step for '+taskId+' now?'))return;
-  const r=await post_('/api/tasks/run_stage',{task_id:taskId,stage,rerun:false});
+  if(!confirm('Run just this step for '+taskId+' now?'))return;
+  const r=await post_('/api/tasks/run_step',{task_id:taskId,step_id:stepId,rerun:false});
   if(!r.ok){ alert(r.error||'failed to start'); return; }
   await pollBoard(); renderFlow();
 }
-async function rerunStep(stage){
-  const taskId=flowSelectedTaskId(); if(!taskId){ alert('No runnable task to rerun this step for.'); return; }
+async function rerunStep(stepId){
+  const taskId=runStepTaskId(); if(!taskId){ alert('No runnable task to rerun this step for.'); return; }
   if(BOARD.run){ alert('A run is already active — stop it first.'); return; }
-  if(!confirm('Rerun the "'+stage+'" step for '+taskId+'? This restores the working '+
+  if(!confirm('Rerun this step for '+taskId+'? This restores the working '+
     'tree to right before that step\'s last attempt (git), discarding it, then runs it again.'))return;
-  const r=await post_('/api/tasks/run_stage',{task_id:taskId,stage,rerun:true});
+  const r=await post_('/api/tasks/run_step',{task_id:taskId,step_id:stepId,rerun:true});
   if(!r.ok){ alert(r.error||'failed to start'); return; }
   await pollBoard(); renderFlow();
 }
@@ -1497,15 +1488,14 @@ function renderFlow(){
   [...surf.querySelectorAll('.node')].forEach(e=>e.remove());
   const nums=numbers();
   const busy=!!BOARD.run;
-  const selTaskId=flowSelectedTaskId();
+  const selTaskId=runStepTaskId();
   const selTask=selTaskId&&(BOARD.tasks||[]).find(t=>t.id===selTaskId);
   let maxBottom=0;
   S.workflow.nodes.forEach((n,i)=>{
     const p=posFor(n,i); L[n.title]=p;
-    const stg=n.kind==='step'?effectiveStage(n):null;
-    const isRunStage=stg&&RUN_STAGES.includes(stg);
+    const isRunStep=n.kind==='step'&&!!n.id;
     const el=document.createElement('div');
-    el.className='node'+(n===selNode?' sel':'')+(n.enabled===false?' off':'')+(isRunStage?' has-run':'');
+    el.className='node'+(n===selNode?' sel':'')+(n.enabled===false?' off':'')+(isRunStep?' has-run':'');
     el.dataset.i=i;
     el.style.left=p.x+'px'; el.style.top=p.y+'px';
     const num = nums[i]!=null ? nums[i] : '•';
@@ -1514,11 +1504,11 @@ function renderFlow(){
     const onoff=n.kind==='step'
       ? `<div class="nbtn ${n.enabled!==false?'on':''}" title="enable/disable"
            onclick="toggleEnabled(${i});event.stopPropagation()">${n.enabled!==false?'●':'○'}</div>` : '';
-    const hasCheckpoint=isRunStage&&selTask&&selTask.stage_checkpoints&&selTask.stage_checkpoints[stg];
-    const stepBtns=isRunStage
+    const hasCheckpoint=isRunStep&&selTask&&selTask.stage_checkpoints&&selTask.stage_checkpoints[n.id];
+    const stepBtns=isRunStep
       ? `<div class="stepbtns" onclick="event.stopPropagation()">
-          <button class="stepbtn" ${busy||!selTaskId?'disabled':''} title="Run just this step (${esc(stg)}) for ${selTaskId?esc(selTaskId):'the selected task'}" onclick="runStep('${stg}')">▶</button>
-          <button class="stepbtn rerun" ${busy||!hasCheckpoint?'disabled':''} title="${hasCheckpoint?'Rerun this step — restores to right before its last attempt first':'No checkpoint yet — run this step once first'}" onclick="rerunStep('${stg}')">↻</button>
+          <button class="stepbtn" ${busy||!selTaskId?'disabled':''} title="Run just this step for ${selTaskId?esc(selTaskId):'the selected task'}" onclick="runStep('${esc(n.id)}');event.stopPropagation()">▶</button>
+          <button class="stepbtn rerun" ${busy||!hasCheckpoint?'disabled':''} title="${hasCheckpoint?'Rerun this step — restores to right before its last attempt first':'No checkpoint yet — run this step once first'}" onclick="rerunStep('${esc(n.id)}');event.stopPropagation()">↻</button>
         </div>`
       : '';
     el.innerHTML=`${stepBtns}${onoff}<div class="ttl"><span class="num">${esc(num)}</span><span>${esc(n.title)}</span></div>
@@ -1538,6 +1528,7 @@ function renderFlow(){
   fitSurface(); redrawEdges();
   applyProgress();
   renderInsp();
+  renderPlanBanner();
 }
 function fitSurface(){
   let mx=1200,my=900;
@@ -1574,7 +1565,8 @@ function autoArrange(){
 }
 function addStep(){
   let my=40; document.querySelectorAll('.node').forEach(e=>my=Math.max(my,e.offsetTop+e.offsetHeight));
-  const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true,stage:''};
+  const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true,
+    id:'',agent:'',model:'',effort:'',temperature:''};
   L[n.title]={x:120,y:my+50};
   S.workflow.nodes.push(n); selNode=n; bodyMode='write'; checkDirty(); renderFlow(); saveLayout();
 }
@@ -1714,57 +1706,35 @@ function renderInsp(){
     const on=(n.tools||[]).includes(t);
     return `<span class="tog ${on?'on':''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
-  const stg=isStep?effectiveStage(n):null;
-  const isRunStage=stg&&RUN_STAGES.includes(stg);
-  const autoGuess=isStep?nodeStage(n.title):null;
-  const stageDropdown=isStep?`
-    <label>Runs as <span class="mut">(which harn run stage — sets its agent/model + Run/Rerun below)</span></label>
-    <select onchange="setNodeStage(this.value)">
-      <option value="" ${!n.stage?'selected':''}>Auto${autoGuess?' → '+esc(STAGE_LABEL[autoGuess]||autoGuess):' (guess from title: nothing found)'}</option>
-      <option value="none" ${n.stage==='none'?'selected':''}>Not a harn run stage</option>
-      ${RUN_STAGES.map(s=>`<option value="${s}" ${n.stage===s?'selected':''}>${esc(STAGE_LABEL[s]||s)}</option>`).join('')}
-    </select>` : '';
-  // Shown on EVERY step: pick the AGENT + MODEL this step runs with under
-  // `harn run`. Only the six real headless stages are separately-invoked, so a
-  // step that maps to none of them shows the controls disabled with a one-click
-  // hint — the picker is visibly present everywhere, never silently missing.
+  // Shown on EVERY step: pick the AGENT + MODEL this step runs with, and
+  // Run/Rerun it in isolation — no more "which pipeline stage is this"
+  // gating; any step can be run on its own via loop.run_step (by id).
   const modelSection=isStep?(()=>{
     const runNote=`
       <div class="mut" style="font-size:11px;margin-top:6px;line-height:1.6">
         Applies to <b>harn run</b> (headless). Default agent/model set in
         <a class="link" onclick="showTab('settings')">Settings</a>; override here
-        per stage. In chat mode (Cursor/Claude Code) the agent is your own IDE —
+        per step. In chat mode (Cursor/Claude Code) the agent is your own IDE —
         harn can't switch it.
       </div>`;
-    if(!isRunStage){
-      const why = n.stage==='none'
-        ? 'This step is marked <b>None</b> — it runs inside another agent turn, so it has no agent/model of its own.'
-        : 'Assign a <b>pipeline stage</b> above to choose an agent + model for this step.';
-      return `
-      <label>Agent &amp; model for this step</label>
-      <div class="modelrow4">
-        <select disabled><option>—</option></select><select disabled><option>—</option></select>
-        <select disabled><option>—</option></select><select disabled><option>—</option></select>
-      </div>
-      <div class="mut" style="font-size:11px;margin-top:6px">${why}</div>`;
-    }
-    const v_=MODELS.values[stg]||{};
-    const ch=modelChoices(stg);
-    const effAgent=stageAgent(stg);
-    const agentOpts=`<option value="" ${!v_.agent?'selected':''}>Default: ${esc(AGENT_LABEL[MODELS.default_agent]||MODELS.default_agent||'(unset)')}</option>`
-      + allAgentNames().map(a=>`<option value="${esc(a)}" ${v_.agent===a?'selected':''}>${esc(AGENT_LABEL[a]||a)}${agentCaps(a).available?'':' (not installed)'}</option>`).join('');
-    return `
-    <label>Agent &amp; model <span class="mut">(for the "${esc(STAGE_LABEL[stg]||stg)}" stage)</span></label>
-    <div class="modelrow4">
-      <select onchange="setStageAgent('${stg}',this.value)" title="which CLI runs this stage">${agentOpts}</select>
-      <div>${selectOrCustom(stg,'model',v_.model||'',ch.models)}</div>
-      <div>${selectOrCustom(stg,'effort',v_.effort||'',ch.efforts)}</div>
-      <div>${selectOrCustom(stg,'temperature',v_.temperature||'',ch.temperatures)}</div>
-    </div>
+    const ch=stepChoices(n);
+    const agentOpts=`<option value="" ${!n.agent?'selected':''}>Default: ${esc(AGENT_LABEL[MODELS.default_agent]||MODELS.default_agent||'(unset)')}</option>`
+      + allAgentNames().map(a=>`<option value="${esc(a)}" ${n.agent===a?'selected':''}>${esc(AGENT_LABEL[a]||a)}${agentCaps(a).available?'':' (not installed)'}</option>`).join('');
+    const taskId=runStepTaskId();
+    const busy=!!BOARD.run;
+    const runBtns=n.id?`
     <div class="row" style="margin-top:8px;gap:10px">
-      <button onclick="saveStepModel('${stg}')">Save</button>
-      <span class="status" id="mst-${stg}"></span>
-    </div>${runNote}`;
+      <button ${busy||!taskId?'disabled':''} title="${taskId?'Run just this step for '+esc(taskId):'No task selected'}" onclick="runStep('${esc(n.id)}')">▶ Run step</button>
+      <button ${busy||!taskId?'disabled':''} title="${taskId?'Rerun this step for '+esc(taskId):'No task selected'}" onclick="rerunStep('${esc(n.id)}')">↻ Rerun step</button>
+    </div>` : '';
+    return `
+    <label>Agent &amp; model <span class="mut">for this step</span></label>
+    <div class="modelrow4">
+      <select onchange="setStepField('agent',this.value)" title="which CLI runs this step">${agentOpts}</select>
+      <div>${selectOrCustom(n.id||'new','model',n.model||'',ch.models)}</div>
+      <div>${selectOrCustom(n.id||'new','effort',n.effort||'',ch.efforts)}</div>
+      <div>${selectOrCustom(n.id||'new','temperature',n.temperature||'',ch.temperatures)}</div>
+    </div>${runBtns}${runNote}`;
   })():'';
   $('#insp').innerHTML=`
     <h2>${isStep?'Step':'Note'}</h2>
@@ -1784,7 +1754,6 @@ function renderInsp(){
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
-    ${stageDropdown}
     ${modelSection}`:''}
   `;
 }
@@ -1794,11 +1763,6 @@ function upd(k,v){
   if(k==='title'){ if(L[old]){ L[v]=L[old]; if(v!==old) delete L[old]; } renderFlow(); }
 }
 function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); renderFlow(); }
-function setNodeStage(val){
-  if(!selNode) return;
-  selNode.stage=val;   // '' = auto-detect, 'none' = explicit opt-out, else a real stage
-  checkDirty(); renderFlow();
-}
 function toggleReq(name){
   if(!selNode)return; selNode.required=selNode.required||[];
   const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
@@ -1814,15 +1778,59 @@ function addTool(v){ v=(v||'').trim(); if(!v||!selNode)return;
   checkDirty(); renderFlow(); }
 async function saveFlow(){
   setStatus('saving…'); resortByPosition();
-  const r=await fetch(api('/api/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(S.workflow)});
+  // Editing a task's own plan (PLAN_MODE) saves to that task's snapshot file
+  // ONLY — never the shared preset. Otherwise this is the normal preset save.
+  const r = PLAN_MODE
+    ? await fetch(api('/api/task_plan'),{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({task_id:PLAN_MODE.taskId, plan:S.workflow})})
+    : await fetch(api('/api/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(S.workflow)});
   const j=await r.json();
-  if(j.ok){ snapshotWorkflow(); clearDirty(); setStatus('saved ✓'); } else { setStatus('save failed'); }
+  if(j.ok){
+    // The backend stamps step ids on first save (ensure_ids) — sync them back
+    // into S.workflow so Run/Rerun + the model inspector work immediately,
+    // with no page reload needed.
+    if(j.workflow) S.workflow={preamble:j.workflow.preamble||'', nodes:j.workflow.nodes||[]};
+    else if(j.plan) S.workflow=j.plan;
+    snapshotWorkflow(); clearDirty(); setStatus('saved ✓');
+  } else { setStatus('save failed'); }
   renderFlow();
 }
 
+/* ---------- task-plan edit mode: Board -> "Edit this task's plan" ---------- */
+// Loads ONE task's own workflow snapshot into the SAME Flow canvas used for
+// preset editing. saveFlow() detects PLAN_MODE and posts to /api/task_plan
+// instead of /api/workflow, so preset files are never touched from here.
+async function openTaskPlan(taskId){
+  const r=await (await fetch(api('/api/task_plan?task='+encodeURIComponent(taskId)))).json();
+  if(!r.ok){ alert(r.error||'could not load this task\'s plan'); return; }
+  PLAN_MODE={taskId};
+  S.workflow=r.plan;
+  L=Object.assign({}, S.layout||{});
+  selNode=null;
+  showTab('flow');
+  snapshotWorkflow(); clearDirty();
+  renderPlanBanner();
+}
+function closeTaskPlan(){
+  PLAN_MODE=null;
+  $('#planBanner').style.display='none';
+}
+function renderPlanBanner(){
+  const b=$('#planBanner');
+  if(!PLAN_MODE){ b.style.display='none'; return; }
+  b.style.display='flex';
+  b.innerHTML=`<span>✎ editing plan of <b>${esc(PLAN_MODE.taskId)}</b> — changes affect only this task</span>
+    <button class="ghost" onclick="showTab('board')">Done</button>`;
+}
+
 /* ---------- tabs + list views ---------- */
-function showTab(t){ tab=t; bodyMode='preview';
+function showTab(t){
+  if(t!=='flow' && PLAN_MODE){
+    if(dirty && !confirm('Unsaved plan edits will be lost. Leave anyway?')){ return; }
+    closeTaskPlan();
+  }
+  tab=t; bodyMode='preview';
   ['flow','skills','tools','board','settings'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
   $('#surface').style.display = t==='flow'?'':'none';
   $('#listView').style.display = t==='flow'?'none':'block';

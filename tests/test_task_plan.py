@@ -70,3 +70,18 @@ def test_step_results_ledger_round_trips(tmp_path):
     tasks._save(t)
     fresh = tasks.find(env, t.id)
     assert fresh.step_results == {"step-aaaaaa": {"status": "ok", "tokens": 1234}}
+
+
+def test_task_plan_roundtrip_via_studio(tmp_path):
+    from harn import studio
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    payload = studio.task_plan_payload(env, t.id)
+    assert payload["ok"] and payload["plan"]["nodes"]
+    plan = payload["plan"]
+    step = next(n for n in plan["nodes"] if n["kind"] == "step")
+    step["model"] = "opus"
+    r = studio.save_task_plan_route(env, {"task_id": t.id, "plan": plan})
+    assert r["ok"] is True
+    assert next(n for n in workflows.load_task_plan(env, t.id)["nodes"]
+                if n["kind"] == "step")["model"] == "opus"

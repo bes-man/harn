@@ -224,6 +224,7 @@ def save_active(env_dir: Path, parsed: dict) -> str:
     wf = load(env_dir, name) or _norm(name, {})
     wf["preamble"] = parsed.get("preamble", wf.get("preamble", ""))
     wf["nodes"] = parsed.get("nodes", [])
+    workflow_mod.ensure_ids(wf)
     save(env_dir, wf)
     render(env_dir, wf)
     return name
