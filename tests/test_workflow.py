@@ -97,6 +97,84 @@ def test_refresh_updates_snapshot_keeps_steps(tmp_path):
     assert out.count(workflow._SNAP_START) == 1
 
 
+# --- explicit per-step Stage mapping (unlocks model + Run/Rerun in the UI) - #
+
+def test_parse_defaults_stage_to_empty(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    assert all(n["stage"] == "" for n in parsed["nodes"] if n["kind"] == "step")
+
+
+def test_stage_round_trips_through_compose(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["stage"] = "execute"
+    workflow.save_parsed(env, parsed)
+
+    reparsed = workflow.parse(env)
+    step2 = next(n for n in reparsed["nodes"] if n["title"] == "Implement")
+    assert step2["stage"] == "execute"
+    # never silently guessed for OTHER steps
+    other = next(n for n in reparsed["nodes"] if n["title"] == "Session start — orient")
+    assert other["stage"] == ""
+
+
+def test_compose_writes_stage_line(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["stage"] = "execute"
+    text = workflow.compose(env, parsed)
+    assert "Stage: execute" in text
+
+
+def test_invalid_stage_value_is_dropped_on_parse(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    p = env / "WORKFLOW.md"
+    p.write_text(p.read_text().replace(
+        "## 3. Implement", "## 3. Implement\nStage: not_a_real_stage"), encoding="utf-8")
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    assert step["stage"] == ""
+
+
+def test_stage_none_is_an_explicit_opt_out(tmp_path):
+    """"none" persists as an explicit opt-out, distinct from "" (undecided —
+    the UI falls back to guessing from the title)."""
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["stage"] = "none"
+    workflow.save_parsed(env, parsed)
+
+    text = (env / "WORKFLOW.md").read_text()
+    assert "Stage: none" in text
+    reparsed = workflow.parse(env)
+    assert next(n for n in reparsed["nodes"] if n["title"] == "Implement")["stage"] == "none"
+
+
+def test_renaming_step_does_not_move_the_stage_mapping(tmp_path):
+    """The whole point of an explicit Stage: line — a keyword-based guess would
+    break silently on rename; this must not."""
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["stage"] = "execute"
+    step["title"] = "Build the thing"
+    workflow.save_parsed(env, parsed)
+
+    reparsed = workflow.parse(env)
+    renamed = next(n for n in reparsed["nodes"] if n["title"] == "Build the thing")
+    assert renamed["stage"] == "execute"
+
+
 # --- setup / onboard wiring ------------------------------------------------ #
 
 def test_setup_writes_workflow_and_lists_it(tmp_path):

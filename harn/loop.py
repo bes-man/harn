@@ -23,7 +23,7 @@ from pathlib import Path
 from . import browser, design as design_mod, events, gitutil, progress, \
     prd as prd_mod, semble_bridge, skills, state, tasks, workflows
 from .adapters import Adapter, get_adapter
-from .config import Config
+from .config import Config, MODEL_STAGES
 from .feedback import run_feedback
 from .notify import notify
 from .telegram import TelegramHIL
@@ -767,9 +767,42 @@ def _accumulate(totals: dict, costs: dict, task_id: str, r) -> None:
 
 def _stage_overrides(cfg: Config, stage: str) -> dict:
     """This stage's {model, effort, temperature} kwargs for adapter.run_turn,
-    from harn.toml's `[models.<stage>]` (Config.stage_models) — empty dict if
-    the stage has no override configured."""
-    return dict(cfg.stage_models.get(stage, {}))
+    from harn.toml's `[models.<stage>]` (Config.stage_models). The per-stage
+    `agent` key is NOT a run_turn kwarg (it selects the CLI — see
+    _adapter_for_stage) so it's stripped here. A missing model falls back to
+    the global default (`[harn] model` / Config.model)."""
+    ov = {k: v for k, v in cfg.stage_models.get(stage, {}).items() if k != "agent"}
+    if not ov.get("model") and cfg.model:
+        ov["model"] = cfg.model
+    return ov
+
+
+def _adapter_for_stage(cfg: Config, stage: str, default: Adapter) -> Adapter:
+    """The adapter that runs this stage: its per-stage `agent` override
+    (harn.toml's `[models.<stage>] agent = "cursor"`) if set and known,
+    otherwise the run's default adapter. Provider-agnostic — lets e.g. plan
+    run on one CLI and execute on another."""
+    name = (cfg.stage_models.get(stage, {}) or {}).get("agent", "").strip()
+    if not name or name == default.name:
+        return default
+    try:
+        return get_adapter(name)
+    except ValueError:
+        return default
+
+
+def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> None:
+    """Snapshot the working tree right before this stage's turn runs (see
+    gitutil.checkpoint) so the studio UI's per-step Rerun control — or
+    `harn run --task ID --stage STAGE --rerun` — can restore EXACTLY this
+    starting point later, undoing only what that attempt changed.
+
+    Best-effort: no git repo means no checkpoint, never blocks the turn from
+    running (matches gitutil's whole degrade-gracefully philosophy)."""
+    ref = gitutil.checkpoint(project_root, task.id, stage)
+    if ref:
+        task.stage_checkpoints[stage] = ref
+        tasks._save(task)
 
 
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
@@ -783,6 +816,9 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     in so callers keep their running token tally. Re-raises after logging an
     `error` event so the loop's own handling is unchanged.
     """
+    # Per-stage agent override (provider-agnostic): a stage can run on a
+    # different CLI than the run's default — see _adapter_for_stage.
+    adapter = _adapter_for_stage(cfg, stage, adapter)
     events.emit(env_dir, "stage_start", task_id=task_id, stage=stage,
                 agent=adapter.name)
     t0 = time.time()
@@ -987,6 +1023,7 @@ def _run_verify(adapter, env_dir, cfg, task, project_root, st, state_dir, auto,
         progress.log(env_dir, f"{task.id}: verifying against acceptance criteria",
                      agent=adapter.name)
     print(f"[harn] Verifying '{task.id}'…")
+    _checkpoint_stage(project_root, task, "verify")
     vres = _run_turn(adapter, env_dir,
                      _build_verify_prompt(env_dir, cfg, task, auto=auto),
                      project_root, task_id=task.id, stage="verify",
@@ -1039,6 +1076,7 @@ def _run_ui_verify(adapter, env_dir, cfg, task, project_root, st, state_dir,
         progress.log(env_dir, f"{task.id}: verifying the live UI via Playwright",
                      agent=adapter.name)
     print(f"[harn] Browser-verifying '{task.id}' at {cfg.app_url}…")
+    _checkpoint_stage(project_root, task, "ui_verify")
     try:
         ures = _run_turn(adapter, env_dir,
                          _build_ui_verify_prompt(env_dir, cfg, task, shots_dir, auto=auto),
@@ -1091,11 +1129,15 @@ def oracle_review(
     Returns (verdict, detail, result) where verdict is PASS / FAIL / DEBT.
     """
     adapter = adapter or _pick_oracle_adapter(cfg)
+    # A per-stage `[models.oracle] agent` override wins over the oracle_agent
+    # default (most-specific setting takes precedence).
+    adapter = _adapter_for_stage(cfg, "oracle", adapter)
     progress.log(env_dir, f"{task.id}: oracle reviewing…", agent=adapter.name)
     diff = _git_diff(project_root)
     prompt = _build_oracle_prompt(env_dir, cfg, task, diff)
     events.emit(env_dir, "stage_start", task_id=task.id, stage="oracle",
                 agent=adapter.name)
+    _checkpoint_stage(project_root, task, "oracle")
     t0 = time.time()
     try:
         ores = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "oracle"))
@@ -1202,6 +1244,7 @@ def _run_reconcile(
     progress.log(env_dir, f"{task.id}: reconciling skills/standards",
                  agent=adapter.name)
     print(f"[harn] Reconciling skills for '{task.id}'…")
+    _checkpoint_stage(project_root, task, "reconcile")
     rres = _run_turn(adapter, env_dir, _build_reconcile_prompt(env_dir, cfg, task),
                      project_root, task_id=task.id, stage="reconcile",
                      tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
@@ -1249,7 +1292,7 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
     stamps a `reconciled` review_log marker so it runs once per task. The turn
     is told NOT to ask questions (no human in this headless path) — it captures
     only confident, factual learnings."""
-    adapter = adapter or _pick_adapter(cfg)
+    adapter = _adapter_for_stage(cfg, "reconcile", adapter or _pick_adapter(cfg))
     progress.log(env_dir, f"{task.id}: auto-reconciling (headless)…",
                  agent=adapter.name)
     prompt = (_build_reconcile_prompt(env_dir, cfg, task) +
@@ -1260,6 +1303,7 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
     try:
         events.emit(env_dir, "stage_start", task_id=task.id, stage="reconcile",
                     agent=adapter.name)
+        _checkpoint_stage(project_root, task, "reconcile")
         t0 = time.time()
         rres = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "reconcile"))
         events.emit(env_dir, "stage_end", task_id=task.id, stage="reconcile",
@@ -1282,6 +1326,92 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
     tasks._save(task)
     progress.log(env_dir, f"{task.id}: skills/standards reconciled", agent=adapter.name)
     return "ok"
+
+
+def run_stage(project_root: Path, env_dir: Path, task_id: str, stage: str,
+             *, rerun: bool = False) -> dict:
+    """Run (or rerun) exactly ONE real agent turn for one task, in isolation
+    from `run()`'s full multi-stage cycle.
+
+    This is the studio UI's per-step Run/Rerun controls (and
+    `harn run --task ID --stage STAGE [--rerun]`) — a deliberately SIMPLER,
+    one-shot contract than the main loop: no planning-funnel turn limits, no
+    auto-mode branching, no advancing to the next stage afterward. It exists
+    for a human to force one specific stage to run again, not to replace
+    `harn run`'s own state machine.
+
+    `rerun=True` first restores the working tree to this stage's git
+    checkpoint (`gitutil.checkpoint`, captured right before its last attempt),
+    so the retry starts from EXACTLY that state instead of layering a new
+    attempt's changes on top of a half-finished previous one. Every real stage
+    (see `_checkpoint_stage`) captures its own checkpoint as part of running,
+    whether invoked from here or from the main loop — so a stage run via
+    `run_stage` is itself checkpointed too, and can be rerun again.
+    """
+    if stage not in MODEL_STAGES:
+        return {"ok": False,
+                "error": f"unknown stage '{stage}' (expected one of {', '.join(MODEL_STAGES)})"}
+    cfg = Config.load(env_dir)
+    task = tasks.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task '{task_id}'"}
+
+    if rerun:
+        ref = task.stage_checkpoints.get(stage) or task.baseline_ref
+        if not ref:
+            return {"ok": False,
+                    "error": f"no checkpoint recorded for '{stage}' yet — run it once first"}
+        env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
+        res = gitutil.rollback_to(ref, project_root, apply=True, exclude=(env_rel + "/",))
+        if not res.ok:
+            return {"ok": False, "error": f"checkpoint restore failed: {res.message}"}
+        progress.log(env_dir, f"{task_id}: restored to '{stage}' checkpoint before rerunning")
+
+    adapter = _pick_oracle_adapter(cfg) if stage == "oracle" else _pick_adapter(cfg)
+    events.new_run(env_dir, kind="stage")
+    state_dir = env_dir / "state"
+    st = state.State.load(state_dir)
+    tok_totals: dict = {}
+    tok_costs: dict = {}
+
+    # plan/execute are inline in run()'s loop body (no reusable wrapper), so
+    # they checkpoint themselves here. verify/ui_verify/oracle/reconcile
+    # already checkpoint internally (_run_verify etc. — see _checkpoint_stage
+    # call sites) so run_stage doesn't duplicate that for them.
+    if stage == "plan":
+        _checkpoint_stage(project_root, task, "plan")
+        pres = _run_turn(adapter, env_dir, _build_planning_prompt(env_dir, cfg, task),
+                         project_root, task_id=task.id, stage="plan",
+                         tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+        return {"ok": pres.ok, "stage": stage, "text": (pres.text or "")[-2000:]}
+
+    if stage == "execute":
+        if not task.baseline_ref:
+            tasks.set_baseline(task, gitutil.head(project_root))
+        _checkpoint_stage(project_root, task, "execute")
+        res = _run_turn(adapter, env_dir, _build_prompt(env_dir, cfg, task, "", auto=False),
+                        project_root, task_id=task.id, stage="execute",
+                        tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+        return {"ok": res.ok, "stage": stage, "text": (res.text or "")[-2000:]}
+
+    if stage == "verify":
+        outcome = _run_verify(adapter, env_dir, cfg, task, project_root, st,
+                              state_dir, False, tok_totals, tok_costs)
+        return {"ok": True, "stage": stage, "outcome": outcome}
+
+    if stage == "ui_verify":
+        outcome = _run_ui_verify(adapter, env_dir, cfg, task, project_root, st,
+                                 state_dir, False, tok_totals, tok_costs)
+        return {"ok": True, "stage": stage, "outcome": outcome}
+
+    if stage == "oracle":
+        outcome = _run_oracle(adapter, env_dir, cfg, task, project_root, st,
+                              state_dir, tok_totals, tok_costs)
+        return {"ok": True, "stage": stage, "outcome": outcome}
+
+    outcome = _run_reconcile(adapter, env_dir, cfg, task, project_root, st,
+                             state_dir, tok_totals, tok_costs)
+    return {"ok": True, "stage": stage, "outcome": outcome}
 
 
 def _run_end(env_dir: Path, st: "state.State") -> str:
@@ -1402,6 +1532,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                          agent=adapter.name)
             print(f"[harn] Planning '{task.id}' ({task.title}) with {adapter.name}…")
 
+            _checkpoint_stage(project_root, task, "plan")
             pres = _run_turn(adapter, env_dir,
                              _build_planning_prompt(env_dir, cfg, task),
                              project_root, task_id=task.id, stage="plan",
@@ -1447,6 +1578,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             )
         print(f"[harn] Working task '{task.id}' ({task.title}) with {adapter.name}{mode}...")
 
+        _checkpoint_stage(project_root, task, "execute")
         result = _run_turn(adapter, env_dir,
                            _build_prompt(env_dir, cfg, task, feedback_tail, auto=auto),
                            project_root, task_id=task.id, stage="execute",
@@ -1612,6 +1744,8 @@ def rollback(project_root: Path, env_dir: Path, task_id: str, *, apply: bool = F
         task.scratchpad = ""
         task.decisions = []
         task.baseline_ref = ""
+        task.stage_checkpoints = {}
+        gitutil.clear_checkpoints(project_root, task_id)
         task.review_log.append(tasks.ReviewEntry(
             ts=tasks._now_iso(), event="rolled_back", by="user",
             comment=f"reverted to baseline; {res.message}",

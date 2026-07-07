@@ -276,6 +276,19 @@ def cmd_run(args) -> int:
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
+    if args.stage:
+        if not args.task_id:
+            print("[harn] --stage requires --task", file=sys.stderr)
+            return 2
+        r = loop.run_stage(root, env_dir, args.task_id, args.stage, rerun=args.rerun)
+        if not r["ok"]:
+            print(f"[harn] {r['error']}", file=sys.stderr)
+            return 1
+        print(f"[harn] '{args.task_id}' — {r['stage']}: "
+              f"{r.get('outcome') or ('ok' if r['ok'] else 'failed')}")
+        if r.get("text"):
+            print(r["text"][-1500:])
+        return 0
     loop.run(root, env_dir, max_iterations=args.max_iterations, auto=args.auto,
               only_task=args.task_id or None)
     return 0
@@ -507,6 +520,15 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--task", dest="task_id", default=None,
                     help="only work this task id, then stop (used by "
                          "harn ui's per-task Launch button)")
+    rp.add_argument("--stage", default=None,
+                    help="run ONLY this one stage (plan/execute/verify/"
+                         "ui_verify/oracle/reconcile) for --task, then stop — "
+                         "not the full loop (used by harn ui's per-step "
+                         "Run/Rerun controls)")
+    rp.add_argument("--rerun", action="store_true",
+                    help="with --stage: first restore the working tree to "
+                         "that stage's git checkpoint, discarding its last "
+                         "attempt, before running it again")
     rp.set_defaults(func=cmd_run)
 
     ap = sub.add_parser("answer", help="answer a blocked question and resume")

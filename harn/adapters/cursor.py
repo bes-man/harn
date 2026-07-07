@@ -19,6 +19,7 @@ class CursorAdapter(Adapter):
     # convention, unconfirmed for this specific CLI build — override the
     # *_FLAG class attrs above if your `cursor-agent` version uses different
     # syntax (e.g. a short `-m` form).
+    MODELS = ("composer-1", "sonnet-4.5", "opus-4.5", "gpt-5.1", "gemini-3-pro")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,

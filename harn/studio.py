@@ -231,22 +231,34 @@ def set_config_flag(env_dir: Path, payload: dict) -> dict:
 # Per-stage model/effort/temperature overrides (harn.toml's [models.<stage>])
 # --------------------------------------------------------------------------- #
 def models_payload(env_dir: Path) -> dict:
-    """Current per-stage overrides + which agents in this project's chain
-    support effort/temperature at all (best-effort CLI convention — see
-    Adapter.EFFORT_FLAG/TEMPERATURE_FLAG), so the UI can flag fields that may
-    be a no-op for the agent(s) actually configured."""
-    from .adapters import get_adapter
+    """Everything the UI needs to configure harn run's agents/models:
+
+    - `default_agent`/`default_model`: the `[harn]` defaults every stage uses
+      unless overridden — the answer to "when I use Cursor, harn run uses Cursor".
+    - `agents`: EVERY known agent (not just the chain) with its curated known
+      models/efforts/temperatures and whether its CLI is installed here
+      (`available`), so both the Settings agent picker and the per-stage model
+      dropdown can show real, agent-specific options.
+    - `values`: current per-stage `[models.<stage>]` overrides (agent + model +
+      effort + temperature).
+    """
+    from .adapters import get_adapter, _REGISTRY
     cfg = Config.load(env_dir)
-    caps = {}
-    for name in cfg.agent_chain:
-        try:
-            a = get_adapter(name)
-        except ValueError:
-            continue
-        caps[name] = {"model": bool(a.MODEL_FLAG), "effort": bool(a.EFFORT_FLAG),
-                     "temperature": bool(a.TEMPERATURE_FLAG)}
+    agents = {}
+    for name in _REGISTRY:
+        a = get_adapter(name)
+        agents[name] = {"model": bool(a.MODEL_FLAG), "effort": bool(a.EFFORT_FLAG),
+                        "temperature": bool(a.TEMPERATURE_FLAG),
+                        "available": a.available(),
+                        "models": list(a.MODELS), "efforts": list(a.EFFORTS),
+                        "temperatures": list(a.TEMPERATURES)}
     return {"stages": list(MODEL_STAGES), "values": cfg.stage_models,
-            "agent_chain": cfg.agent_chain, "capabilities": caps}
+            "agent_chain": cfg.agent_chain,
+            "default_agent": (cfg.agent_chain[0] if cfg.agent_chain else cfg.agent),
+            "default_model": cfg.model,
+            "agents": agents,
+            # kept for back-compat with any older client field name
+            "capabilities": agents}
 
 
 def _toml_escape(v: str) -> str:
@@ -269,7 +281,7 @@ def save_models(env_dir: Path, payload: dict) -> dict:
     for stage in MODEL_STAGES:
         v = values.get(stage) or {}
         lines = [f"[models.{stage}]"]
-        for key in ("model", "effort", "temperature"):
+        for key in ("agent", "model", "effort", "temperature"):
             val = str(v.get(key) or "").strip()
             if val:
                 lines.append(f'{key} = "{_toml_escape(val)}"')
@@ -282,6 +294,35 @@ def save_models(env_dir: Path, payload: dict) -> dict:
     toml_path.parent.mkdir(parents=True, exist_ok=True)
     toml_path.write_text(text, encoding="utf-8")
     return {"ok": True}
+
+
+def save_defaults(env_dir: Path, payload: dict) -> dict:
+    """Write the harn run defaults — `[harn] agent` (which CLI drives every
+    stage) and `[harn] model` (default model) — via a targeted in-place edit of
+    the `[harn]` table (stdlib can't write TOML). This is the setting that makes
+    `harn run` use Cursor/Codex/Claude/… as you choose."""
+    from .adapters import _REGISTRY
+    agent = str(payload.get("agent") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if agent and agent not in _REGISTRY:
+        return {"ok": False, "error": f"unknown agent {agent!r}"}
+    toml_path = env_dir / "harn.toml"
+    text = toml_path.read_text(encoding="utf-8") if toml_path.exists() else ""
+
+    def _set(text: str, key: str, value: str) -> str:
+        line = f'{key} = "{_toml_escape(value)}"'
+        if re.search(rf"(?m)^\s*{key}\s*=.*$", text):
+            return re.sub(rf"(?m)^\s*{key}\s*=.*$", line, text, count=1)
+        if re.search(r"(?m)^\[harn\]\s*$", text):
+            return re.sub(r"(?m)^\[harn\]\s*$", f"[harn]\n{line}", text, count=1)
+        return (f"[harn]\n{line}\n" + ("\n" + text if text else ""))
+
+    if agent:
+        text = _set(text, "agent", agent)
+    text = _set(text, "model", model)   # allow clearing to ""
+    toml_path.parent.mkdir(parents=True, exist_ok=True)
+    toml_path.write_text(text, encoding="utf-8")
+    return {"ok": True, "agent": agent, "model": model}
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +469,41 @@ def launch_task(env_dir: Path, payload: dict) -> dict:
 def stop_task(env_dir: Path, payload: dict) -> dict:
     """Stop the active UI-launched run (best-effort SIGTERM)."""
     return runner_mod.stop(env_dir)
+
+
+def launch_stage(env_dir: Path, payload: dict) -> dict:
+    """Start (or rerun) exactly ONE pipeline stage for one task in the
+    background — the Flow tab's per-step Run/Rerun controls. `rerun=True`
+    first restores the working tree to that stage's git checkpoint (see
+    gitutil.checkpoint / loop.run_stage), discarding its last attempt."""
+    task_id = (payload.get("task_id") or "").strip()
+    stage = (payload.get("stage") or "").strip()
+    if stage not in MODEL_STAGES:
+        return {"ok": False, "error": f"unknown stage '{stage}'"}
+    if tasks_mod.find(env_dir, task_id) is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    return runner_mod.launch(env_dir.parent, env_dir, task_id,
+                             stage=stage, rerun=bool(payload.get("rerun")))
+
+
+def rerun_workflow(env_dir: Path, payload: dict) -> dict:
+    """Rerun a task's WHOLE workflow from scratch: restore the working tree to
+    its very first git baseline (undoing every stage's changes, not just one),
+    reopen it to `todo` (clears scratchpad/decisions/stage checkpoints too —
+    see loop.rollback's reopen=True), then launch the full loop again."""
+    task_id = (payload.get("task_id") or "").strip()
+    t = tasks_mod.find(env_dir, task_id)
+    if t is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if not t.baseline_ref:
+        return {"ok": False, "error": "no baseline recorded yet — this task "
+                "hasn't started its first attempt"}
+    from . import loop as loop_mod
+    res = loop_mod.rollback(env_dir.parent, env_dir, task_id, apply=True, reopen=True)
+    if not res.ok:
+        return {"ok": False, "error": res.message}
+    return runner_mod.launch(env_dir.parent, env_dir, task_id,
+                             auto=bool(payload.get("auto")))
 
 
 # --------------------------------------------------------------------------- #
@@ -578,12 +654,18 @@ def _make_handler(default_env: Path):
                 self._json(launch_task(env, body))
             elif route == "/api/tasks/stop":
                 self._json(stop_task(env, body))
+            elif route == "/api/tasks/run_stage":
+                self._json(launch_stage(env, body))
+            elif route == "/api/tasks/rerun_workflow":
+                self._json(rerun_workflow(env, body))
             elif route == "/api/attachments/upload":
                 self._json(upload_attachment(env, body))
             elif route == "/api/attachments/delete":
                 self._json(delete_attachment(env, body))
             elif route == "/api/models":
                 self._json(save_models(env, body))
+            elif route == "/api/defaults":
+                self._json(save_defaults(env, body))
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -688,13 +770,14 @@ _HTML = r"""<!DOCTYPE html>
     background:rgba(15,17,21,.85);opacity:0;transition:opacity .15s}
   .attcard .attdel svg{width:11px;height:11px}
   .attcard:hover .attdel{opacity:1}
-  .modelstbl{width:100%;border-collapse:collapse;font-size:12.5px}
-  .modelstbl th{text-align:left;color:var(--muted);font-weight:600;font-size:11px;
-    text-transform:uppercase;letter-spacing:.4px;padding:6px 10px;border-bottom:1px solid var(--line)}
-  .modelstbl td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-  .modelstbl input[type=text]{padding:6px 8px;font-size:12.5px}
-  .modelstbl .nm{font-weight:600}
-  .modelstbl .ds{color:var(--muted);font-size:11px;margin-top:2px;max-width:220px}
+  .modelrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+  .modelrow4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+  .modelrow input[type=text],.modelrow select,
+  .modelrow4 input[type=text],.modelrow4 select{padding:6px 8px;font-size:12px}
+  /* Settings panel (default agent + model for harn run) */
+  .settings{max-width:560px}
+  .settings .field{margin:14px 0}
+  .settings label{display:block;margin-bottom:5px}
   .status{color:var(--muted);font-size:12px;min-width:120px;text-align:right}
   main{display:grid;grid-template-columns:1fr 6px var(--insp-w);height:calc(100vh - 53px)}
   .canvas{position:relative;overflow:auto;background:
@@ -724,6 +807,10 @@ _HTML = r"""<!DOCTYPE html>
   .nbtn:hover{border-color:var(--accent);color:var(--text)}
   .nbtn.on{color:var(--accent2);border-color:#2f5a48}
   .node .ttl{font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:8px;padding-right:24px}
+  /* stepbtns (▶/↻) sit further left of the enable/disable toggle, right:34
+     onward, ~48px wide — the title needs enough reserved padding to never sit
+     under them, on every wrapped line, not just the first. */
+  .node.has-run .ttl{padding-right:90px}
   .node .num{width:22px;height:22px;border-radius:6px;background:var(--panel2);
     border:1px solid var(--line);display:flex;align-items:center;justify-content:center;
     font-size:11px;color:var(--muted);flex:0 0 auto}
@@ -803,12 +890,23 @@ _HTML = r"""<!DOCTYPE html>
     50%{box-shadow:0 0 0 2px var(--accent),0 0 16px 2px #7c8cff88}}
   .node .stat{margin-top:7px;font-size:10.5px;color:var(--muted);
     font-family:ui-monospace,Menlo,monospace;border-top:1px solid var(--line);padding-top:5px}
-  .runbox{position:absolute;left:14px;top:12px;z-index:9;background:var(--panel);
-    border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:12px;min-width:190px}
-  .runbox h4{margin:0 0 6px;font-size:11px;color:var(--muted);letter-spacing:.5px;font-weight:600}
-  .runbox .kv{display:flex;justify-content:space-between;gap:18px;padding:1px 0}
-  .runbox .kv b{font-weight:500;font-family:ui-monospace,Menlo,monospace}
-  .runbox .live{color:var(--accent2)}
+  /* terminal "Run workflow" block — the last node in the flow, not draggable */
+  .node.terminal{cursor:default;width:280px;border-color:var(--accent);
+    background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%)}
+  .node.terminal:hover{border-color:var(--accent)}
+  .node.terminal .kv{display:flex;justify-content:space-between;gap:14px;padding:2px 0;font-size:12px}
+  .node.terminal .kv b{font-weight:500;font-family:ui-monospace,Menlo,monospace}
+  .node.terminal .live{color:var(--accent2)}
+  .node.terminal button{width:100%;margin-top:8px}
+  .node.terminal select{margin-top:8px}
+  /* per-step run/rerun controls, left of the existing enable/disable toggle */
+  .stepbtns{position:absolute;top:8px;right:34px;display:flex;gap:4px;z-index:2}
+  .stepbtn{width:22px;height:22px;border-radius:6px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--muted);display:flex;align-items:center;
+    justify-content:center;font-size:11px;cursor:pointer}
+  .stepbtn:hover{border-color:var(--accent);color:var(--text)}
+  .stepbtn:disabled{opacity:.3;cursor:not-allowed}
+  .stepbtn.rerun{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -827,7 +925,7 @@ _HTML = r"""<!DOCTYPE html>
     <button id="tabSkills" onclick="showTab('skills')">Skills</button>
     <button id="tabTools" onclick="showTab('tools')">Tools</button>
     <button id="tabBoard" onclick="showTab('board')">Board</button>
-    <button id="tabModels" onclick="showTab('models')">Models</button>
+    <button id="tabSettings" onclick="showTab('settings')">Settings</button>
   </div>
   <div class="toggles" id="toggles">
     <label class="sw"><input type="checkbox" id="tgSemble" onchange="setToggle('semble',this.checked)"><span></span>semble</label>
@@ -846,7 +944,6 @@ _HTML = r"""<!DOCTYPE html>
       <svg class="edges" id="edges"></svg>
     </div>
     <div class="listview" id="listView"></div>
-    <div class="runbox" id="runbox" style="display:none"></div>
     <div class="hint" id="hint" style="display:none"></div>
     <div class="zoom" id="zoom"><button onclick="zoomBy(1/1.2)">−</button>
       <span id="zlbl" onclick="zoomReset()">100%</span>
@@ -898,8 +995,10 @@ async function load(){
   if(!Object.keys(TOOL_DOCS).length){
     try{ TOOL_DOCS=(await (await fetch(api('/api/tools'))).json()).tools||{}; }catch(e){}
   }
+  try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){}
+  await ensureModelsLoaded();
   renderWorkflows(); render(); loadConfig(); pollProgress();
-  setInterval(()=>{ pollProgress(); if(tab==='board') pollBoard(); }, 1500);
+  setInterval(()=>{ pollProgress(); pollBoard(); }, 1500);
 }
 function toolDoc(name){ return TOOL_DOCS[name] || '(custom / external tool — not a registered harn MCP tool)'; }
 /* ---------- workflow switcher (named presets) ---------- */
@@ -981,9 +1080,25 @@ const STAGE_KW=[['plan',['pre-task','plan','clarif']],['ui_verify',['ui verify',
   ['oracle',['oracle']],['reconcile',['reconcile']]];
 function nodeStage(title){ const t=(title||'').toLowerCase();
   for(const [s,kws] of STAGE_KW){ if(kws.some(k=>t.includes(k))) return s; } return null; }
+// A step's ACTUAL mapping to one of harn run's real turns, for gating the
+// model override + Run/Rerun controls: explicit `n.stage` always wins (set via
+// the inspector's dropdown — survives renaming); 'none' is an explicit opt-out
+// (never falls back to guessing); undecided ("" / unset) falls back to a
+// best-effort title-keyword guess so the default template works out of the
+// box without every step needing to be assigned by hand.
+function effectiveStage(n){
+  if(n.stage==='none') return null;
+  return n.stage || nodeStage(n.title) || null;
+}
 async function pollProgress(){
   try{ PROG=await (await fetch(api('/api/progress'))).json(); }catch(e){ return; }
-  if(tab==='flow'){ applyProgress(); renderRunbox(); }
+  if(tab==='flow'){
+    applyProgress();
+    // Update the terminal block in place (not a full renderFlow rebuild) so
+    // polling every 1.5s never disrupts a drag or steals focus elsewhere.
+    const term=document.querySelector('.node.terminal');
+    if(term) renderFlowTerminal(term);
+  }
 }
 
 /* ---------- board tab: tasks + per-task workflow + launch/observe a run ---------- */
@@ -1127,61 +1242,74 @@ async function post_(p,b){
   const r=await fetch(api(p),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
   return r.json();
 }
-/* ---------- models tab: per-stage model/effort/temperature overrides ---------- */
-let MODELS={stages:[],values:{},agent_chain:[],capabilities:{}};
+/* ---------- per-stage agent + model overrides (for harn run) ---------- */
+// The model/agent a real harn run STAGE uses. Steps map to a stage (see
+// effectiveStage); multiple steps mapping to the same stage share its config.
+// `default_agent`/`default_model` are the [harn] settings edited in Settings.
+let MODELS={stages:[],values:{},agent_chain:[],agents:{},default_agent:'',default_model:''};
 const STAGE_LABEL={plan:'Plan',execute:'Execute',verify:'Verify',ui_verify:'UI verify',
   oracle:'Oracle',reconcile:'Reconcile'};
-const STAGE_HINT={
-  plan:'Clarification/funnel turn before any code is written.',
-  execute:'The main implementation turn.',
-  verify:'Checks the work against acceptance criteria.',
-  ui_verify:'Drives the live app via Playwright to confirm the UI.',
-  oracle:'Independent correctness review, fresh context.',
-  reconcile:'Captures learnings into skills/services + changelog.'};
-async function loadModels(){
-  try{ MODELS=await (await fetch(api('/api/models'))).json(); }catch(e){ return; }
-  renderModels();
-}
-function renderModels(){
-  const v=$('#listView');
-  const caps=Object.values(MODELS.capabilities||{});
-  const anyEffort=caps.some(c=>c.effort), anyTemp=caps.some(c=>c.temperature);
-  let html='<h2>MODELS <span class="mut" style="text-transform:none;letter-spacing:0">'+
-    '— per-stage overrides for harn run\'s real agent turns</span></h2>';
-  html+='<div class="mut" style="margin-bottom:14px;font-size:12px;line-height:1.7">'+
-    'Applies ONLY to <b>harn run</b> (headless) — chat-mode agents (Claude Code, Cursor) '+
-    'use whatever model is set in their OWN client; harn\'s MCP layer can\'t switch it for '+
-    'them, only ‘test’ stage runs no agent turn (it runs your test command).<br/>'+
-    'Agent chain: <b>'+((MODELS.agent_chain||[]).map(esc).join(' → ')||'(none configured)')+'</b>'+
-    (anyEffort?'':' · <span style="color:var(--warn)">effort unconfirmed/unsupported for this chain — may be a no-op, check harn/adapters/*.py</span>')+
-    (anyTemp?'':' · <span style="color:var(--warn)">temperature unconfirmed/unsupported for this chain — may be a no-op</span>')+
-    '</div>';
-  html+='<table class="modelstbl"><thead><tr><th>Stage</th><th>Model</th><th>Effort</th><th>Temperature</th></tr></thead><tbody>';
-  MODELS.stages.forEach(s=>{
-    const v_=MODELS.values[s]||{};
-    html+=`<tr><td><div class="nm">${esc(STAGE_LABEL[s]||s)}</div><div class="ds">${esc(STAGE_HINT[s]||'')}</div></td>`+
-      `<td><input type="text" value="${esc(v_.model||'')}" placeholder="e.g. opus" oninput="setModelField('${s}','model',this.value)"/></td>`+
-      `<td><input type="text" value="${esc(v_.effort||'')}" placeholder="e.g. high" oninput="setModelField('${s}','effort',this.value)"/></td>`+
-      `<td><input type="text" value="${esc(v_.temperature||'')}" placeholder="e.g. 0.2" oninput="setModelField('${s}','temperature',this.value)"/></td></tr>`;
-  });
-  html+='</tbody></table>';
-  html+='<div class="row" style="margin-top:14px;gap:10px"><button class="primary" onclick="saveModelsUI()">Save models</button>'+
-    '<span class="status" id="mst"></span></div>';
-  v.innerHTML=html;
-  $('#insp').innerHTML='<div class="empty">Per-stage overrides for harn run. '+
-    'See harn/adapters/*.py for exactly which CLI flags each agent accepts.</div>';
+const AGENT_LABEL={claude:'Claude Code',codex:'Codex',cursor:'Cursor',
+  qwen:'Qwen',antigravity:'Antigravity'};
+async function ensureModelsLoaded(){
+  if(MODELS.stages.length) return;
+  try{ MODELS=await (await fetch(api('/api/models'))).json(); }catch(e){}
 }
 function setModelField(stage,key,val){
   MODELS.values[stage]=MODELS.values[stage]||{};
-  MODELS.values[stage][key]=val;
+  if((val||'').trim()) MODELS.values[stage][key]=val; else delete MODELS.values[stage][key];
 }
-async function saveModelsUI(){
-  $('#mst').textContent='saving…';
+// Changing the stage's agent changes which models are valid — clear a now-
+// invalid model and re-render so the model dropdown reflects the new agent.
+function setStageAgent(stage,agentName){
+  setModelField(stage,'agent',agentName);
+  const valid=(agentCaps(stageAgent(stage)).models)||[];
+  const cur=(MODELS.values[stage]||{}).model;
+  if(cur && valid.length && !valid.includes(cur)) setModelField(stage,'model','');
+  renderInsp();
+}
+function allAgentNames(){ return Object.keys(MODELS.agents||{}); }
+function agentCaps(name){ return (MODELS.agents||{})[name]||{}; }
+// Which CLI actually runs this stage: its per-stage agent override, else the
+// [harn] default agent. That agent's curated values drive the model dropdown.
+function stageAgent(stage){
+  return (MODELS.values[stage]||{}).agent || MODELS.default_agent || '';
+}
+function modelChoices(stage){
+  const c=agentCaps(stageAgent(stage));
+  return {models:c.models||[], efforts:c.efforts||[], temperatures:c.temperatures||[]};
+}
+// A <select> of known values + a "Custom…" escape hatch (curated lists go
+// stale as providers ship new models — this keeps typing-it-yourself always
+// possible instead of hard-blocking on the list).
+function selectOrCustom(stage,field,current,options){
+  const known=options.includes(current);
+  const isCustom=!!current && !known;
+  const sel=`<select onchange="onModelSelect('${stage}','${field}',this)">
+    <option value="">(none)</option>
+    ${options.map(o=>`<option value="${esc(o)}" ${current===o?'selected':''}>${esc(o)}</option>`).join('')}
+    <option value="__custom__" ${isCustom?'selected':''}>Custom…</option>
+  </select>
+  <input type="text" placeholder="custom ${esc(field)}" value="${esc(isCustom?current:'')}"
+    style="margin-top:4px;${isCustom?'':'display:none'}" id="mc-${stage}-${field}"
+    oninput="setModelField('${stage}','${field}',this.value)"/>`;
+  return sel;
+}
+function onModelSelect(stage,field,sel){
+  const inp=$('#mc-'+stage+'-'+field);
+  if(sel.value==='__custom__'){
+    if(inp){ inp.style.display=''; inp.value=''; inp.focus(); }
+    setModelField(stage,field,'');
+  }else{
+    if(inp) inp.style.display='none';
+    setModelField(stage,field,sel.value);
+  }
+}
+async function saveStepModel(stage){
+  const st=$('#mst-'+stage);
+  if(st) st.textContent='saving…';
   const r=await post_('/api/models',{values:MODELS.values});
-  // No reload on success: MODELS.values already matches what was just
-  // persisted, and re-rendering the table would wipe the input focus AND
-  // this very "saved ✓" message before the user can see it.
-  $('#mst').textContent=r.ok?'saved ✓':'save failed';
+  if(st) st.textContent=r.ok?'saved ✓':'save failed';
 }
 /* ---------- attachments: upload / delete (design refs, screenshots, …) ---------- */
 function pickAttachment(taskId){ $('#attInput').click(); }
@@ -1211,7 +1339,7 @@ function applyProgress(){
     el.classList.remove('st-active','st-done','st-complete','st-pending');
     if(!live) return;
     const n=S.workflow.nodes[+el.dataset.i]; if(!n||n.kind!=='step') return;
-    const stg=nodeStage(n.title); const info=stg&&st[stg];
+    const stg=effectiveStage(n); const info=stg&&st[stg];
     let cls='st-pending';
     if(info){ cls = info.status==='active'?'st-active': info.status==='complete'?'st-complete':'st-done'; }
     el.classList.add(cls);
@@ -1224,18 +1352,118 @@ function applyProgress(){
     } else if(line){ line.remove(); }
   });
 }
-function renderRunbox(){
-  const box=$('#runbox'), t=PROG.totals||{};
-  if(!hasRun()){ box.style.display='none'; return; }
-  box.style.display='';
-  const tok=(t.tok_in||0)+(t.tok_out||0);
-  const cost=t.cost_usd? '$'+t.cost_usd.toFixed(4) : '—';
-  const state=PROG.active? `<span class="live">▶ ${esc(PROG.active)}</span>` : (PROG.ended?'finished':'idle');
-  box.innerHTML=`<h4>RUN ${esc((PROG.run||'').slice(0,8))}</h4>
-    <div class="kv"><span>state</span><b>${state}</b></div>
-    <div class="kv"><span>time</span><b>${fmtDur(t.dur_ms)}</b></div>
-    <div class="kv"><span>tokens</span><b>${tok}</b></div>
-    <div class="kv"><span>cost</span><b>${cost}</b></div>`;
+// `harn run` (the whole workflow) only picks up tasks in these statuses
+// (tasks.next_task's needs_agent) — 'review'/'done' won't move further.
+// Per-step Run/Rerun has NO such restriction: forcing one specific step to
+// run again is a valid action regardless of where the task currently sits
+// (e.g. rerun 'verify' on a task already in review, before approving it).
+const RUNNABLE_STATUSES=['todo','in_progress','changes_requested'];
+// The real, separately-invoked agent turns eligible for per-step Run/Rerun —
+// mirrors harn.config.MODEL_STAGES. 'test' isn't here: it runs the configured
+// test command, not an agent turn, so there's nothing to (re)run via git.
+const RUN_STAGES=['plan','execute','verify','ui_verify','oracle','reconcile'];
+
+function flowTaskSel(){ return $('#flowTaskSel'); }
+// The picker lists EVERY task (not just runnable ones) so per-step Run/Rerun
+// stays reachable after a task moves to review/done.
+function flowAllTasks(){ return BOARD.tasks||[]; }
+function flowSelectedTaskId(){
+  const sel=flowTaskSel();
+  if(sel&&sel.value&&flowAllTasks().some(t=>t.id===sel.value)) return sel.value;
+  const runnable=flowAllTasks().find(t=>RUNNABLE_STATUSES.includes(t.status));
+  const first=runnable||flowAllTasks()[0];
+  return first?first.id:null;
+}
+function flowSelectedTask(){ const id=flowSelectedTaskId(); return id&&(BOARD.tasks||[]).find(t=>t.id===id); }
+
+/* ---------- terminal "Run workflow" block — last node in the flow ---------- */
+function renderFlowTerminal(el){
+  const runningWhole=BOARD.run&&!BOARD.run.stage;
+  const runningStage=BOARD.run&&BOARD.run.stage;
+  if(runningWhole){
+    const t=PROG.totals||{};
+    const runningTask=(BOARD.tasks||[]).find(x=>x.id===BOARD.run.task_id);
+    const tok=(t.tok_in||0)+(t.tok_out||0);
+    const cost=t.cost_usd? '$'+t.cost_usd.toFixed(4) : '—';
+    const stage=PROG.active? `<span class="live">▶ ${esc(PROG.active)}</span>` : 'starting…';
+    el.innerHTML=`<div class="ttl"><span>▶ RUNNING WORKFLOW</span></div>
+      <div class="kv"><span>task</span><b>${esc(BOARD.run.task_id)}</b></div>
+      ${runningTask?`<div class="kv"><span>title</span><b style="font-weight:400;font-family:inherit">${esc(runningTask.title)}</b></div>`:''}
+      <div class="kv"><span>stage</span><b>${stage}</b></div>
+      <div class="kv"><span>time</span><b>${fmtDur(t.dur_ms)}</b></div>
+      <div class="kv"><span>tokens</span><b>${tok}</b></div>
+      <div class="kv"><span>cost</span><b>${cost}</b></div>
+      <button class="ghost" onclick="stopRun()">■ Stop</button>`;
+    return;
+  }
+  if(runningStage){
+    const runningTask=(BOARD.tasks||[]).find(x=>x.id===BOARD.run.task_id);
+    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
+      <div class="mut" style="font-size:11.5px">A single step is running${BOARD.run.rerun?' (rerun)':''}: `+
+      `<b>${esc(BOARD.run.stage)}</b> for <b>${esc(BOARD.run.task_id)}</b>`+
+      `${runningTask?' — '+esc(runningTask.title):''}.</div>
+      <button class="ghost" onclick="stopRun()">■ Stop</button>`;
+    return;
+  }
+  const all=flowAllTasks();
+  if(!all.length){
+    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
+      <div class="mut" style="font-size:11.5px">No tasks yet — create one, then come back here to launch it.</div>`;
+    return;
+  }
+  const selId=flowSelectedTaskId();
+  const opts=all.map(x=>`<option value="${esc(x.id)}" ${x.id===selId?'selected':''}>${esc(x.id)}: ${esc(x.title)} (${esc(x.status)})</option>`).join('');
+  const task=flowSelectedTask();
+  const hasBaseline=task&&task.baseline_ref;
+  const isRunnable=task&&RUNNABLE_STATUSES.includes(task.status);
+  el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
+    <div class="mut" style="font-size:11px">Runs the active workflow (<b>${esc(S.active||'default')}</b>) end-to-end against the task you pick.</div>
+    <select id="flowTaskSel" onchange="renderFlow()">${opts}</select>
+    <button class="primary" onclick="runWholeWorkflow()" ${isRunnable?'':'disabled'}
+      title="${isRunnable?'':'This task is '+esc(task?task.status:'')+' — not runnable. Rerun from scratch to reopen it.'}">▶ Run</button>
+    ${hasBaseline?`<button class="ghost" onclick="rerunWholeWorkflow()" title="Restore to before this task's very first attempt and reopen it, then run it again">↻ Rerun from scratch</button>`:''}`;
+}
+async function runWholeWorkflow(){
+  const taskId=flowSelectedTaskId(); if(!taskId)return;
+  const activeName=S.active||'default';
+  if(!confirm('Run '+taskId+' under workflow "'+activeName+'" now? An agent will '+
+    'start making changes in the background.'))return;
+  const task=(BOARD.tasks||[]).find(x=>x.id===taskId);
+  if(task && (task.workflow||'default')!==activeName){
+    await post_('/api/tasks/workflow',
+      {task_id:taskId, workflow:activeName==='default'?'':activeName});
+  }
+  const r=await post_('/api/tasks/launch',{task_id:taskId,auto:false});
+  if(!r.ok){ alert(r.error||'launch failed'); return; }
+  await pollBoard(); renderFlow();
+}
+async function rerunWholeWorkflow(){
+  const taskId=flowSelectedTaskId(); if(!taskId)return;
+  if(!confirm('Rerun '+taskId+' FROM SCRATCH? This restores the working tree to '+
+    'before its very first attempt (git) and clears its progress notes, then '+
+    'starts the whole workflow again.'))return;
+  const r=await post_('/api/tasks/rerun_workflow',{task_id:taskId});
+  if(!r.ok){ alert(r.error||'rerun failed'); return; }
+  await pollBoard(); renderFlow();
+}
+
+/* ---------- per-step Run/Rerun (one real agent turn, in isolation) ---------- */
+async function runStep(stage){
+  const taskId=flowSelectedTaskId(); if(!taskId){ alert('No runnable task to run this step for.'); return; }
+  if(BOARD.run){ alert('A run is already active — stop it first.'); return; }
+  if(!confirm('Run just the "'+stage+'" step for '+taskId+' now?'))return;
+  const r=await post_('/api/tasks/run_stage',{task_id:taskId,stage,rerun:false});
+  if(!r.ok){ alert(r.error||'failed to start'); return; }
+  await pollBoard(); renderFlow();
+}
+async function rerunStep(stage){
+  const taskId=flowSelectedTaskId(); if(!taskId){ alert('No runnable task to rerun this step for.'); return; }
+  if(BOARD.run){ alert('A run is already active — stop it first.'); return; }
+  if(!confirm('Rerun the "'+stage+'" step for '+taskId+'? This restores the working '+
+    'tree to right before that step\'s last attempt (git), discarding it, then runs it again.'))return;
+  const r=await post_('/api/tasks/run_stage',{task_id:taskId,stage,rerun:true});
+  if(!r.ok){ alert(r.error||'failed to start'); return; }
+  await pollBoard(); renderFlow();
 }
 function skillNames(){ return S.skills.map(s=>s.name); }
 function allTools(){ const s=new Set(); S.workflow.nodes.forEach(n=>(n.tools||[]).forEach(t=>s.add(t))); return [...s].sort(); }
@@ -1253,10 +1481,17 @@ function renderFlow(){
   const surf=$('#surface');
   [...surf.querySelectorAll('.node')].forEach(e=>e.remove());
   const nums=numbers();
+  const busy=!!BOARD.run;
+  const selTaskId=flowSelectedTaskId();
+  const selTask=selTaskId&&(BOARD.tasks||[]).find(t=>t.id===selTaskId);
+  let maxBottom=0;
   S.workflow.nodes.forEach((n,i)=>{
     const p=posFor(n,i); L[n.title]=p;
+    const stg=n.kind==='step'?effectiveStage(n):null;
+    const isRunStage=stg&&RUN_STAGES.includes(stg);
     const el=document.createElement('div');
-    el.className='node'+(n===selNode?' sel':'')+(n.enabled===false?' off':''); el.dataset.i=i;
+    el.className='node'+(n===selNode?' sel':'')+(n.enabled===false?' off':'')+(isRunStage?' has-run':'');
+    el.dataset.i=i;
     el.style.left=p.x+'px'; el.style.top=p.y+'px';
     const num = nums[i]!=null ? nums[i] : '•';
     const reqChips=(n.required||[]).map(s=>`<span class="chip req">${esc(s)}</span>`).join('');
@@ -1264,12 +1499,29 @@ function renderFlow(){
     const onoff=n.kind==='step'
       ? `<div class="nbtn ${n.enabled!==false?'on':''}" title="enable/disable"
            onclick="toggleEnabled(${i});event.stopPropagation()">${n.enabled!==false?'●':'○'}</div>` : '';
-    el.innerHTML=`${onoff}<div class="ttl"><span class="num">${esc(num)}</span><span>${esc(n.title)}</span></div>
+    const hasCheckpoint=isRunStage&&selTask&&selTask.stage_checkpoints&&selTask.stage_checkpoints[stg];
+    const stepBtns=isRunStage
+      ? `<div class="stepbtns" onclick="event.stopPropagation()">
+          <button class="stepbtn" ${busy||!selTaskId?'disabled':''} title="Run just this step (${esc(stg)}) for ${selTaskId?esc(selTaskId):'the selected task'}" onclick="runStep('${stg}')">▶</button>
+          <button class="stepbtn rerun" ${busy||!hasCheckpoint?'disabled':''} title="${hasCheckpoint?'Rerun this step — restores to right before its last attempt first':'No checkpoint yet — run this step once first'}" onclick="rerunStep('${stg}')">↻</button>
+        </div>`
+      : '';
+    el.innerHTML=`${stepBtns}${onoff}<div class="ttl"><span class="num">${esc(num)}</span><span>${esc(n.title)}</span></div>
       <div class="chips">${reqChips|| (n.kind==='step'?'<span class="chip">no required skills</span>':'')}</div>${tools}`;
     surf.appendChild(el);
+    maxBottom=Math.max(maxBottom, p.y+140);
   });
+  // Terminal "Run workflow" block — always last, connected via the same edge
+  // line, never draggable (excluded from the drag/select pointerdown handler
+  // by its 'terminal' class, and given an out-of-range data-i so progress/
+  // edge code that indexes S.workflow.nodes[i] just skips it harmlessly).
+  const term=document.createElement('div');
+  term.className='node terminal'; term.dataset.i=S.workflow.nodes.length;
+  term.style.left='120px'; term.style.top=(maxBottom+40)+'px';
+  renderFlowTerminal(term);
+  surf.appendChild(term);
   fitSurface(); redrawEdges();
-  applyProgress(); renderRunbox();
+  applyProgress();
   renderInsp();
 }
 function fitSurface(){
@@ -1307,7 +1559,7 @@ function autoArrange(){
 }
 function addStep(){
   let my=40; document.querySelectorAll('.node').forEach(e=>my=Math.max(my,e.offsetTop+e.offsetHeight));
-  const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true};
+  const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true,stage:''};
   L[n.title]={x:120,y:my+50};
   S.workflow.nodes.push(n); selNode=n; bodyMode='write'; checkDirty(); renderFlow(); saveLayout();
 }
@@ -1322,8 +1574,9 @@ function deleteNode(){
 /* ---------- drag nodes + pan canvas ---------- */
 let drag=null, pan=null;
 $('#surface').addEventListener('pointerdown',e=>{
-  if(e.target.closest('.nbtn,button,input,textarea,a,.tog')) return;
+  if(e.target.closest('.nbtn,button,input,textarea,a,.tog,select')) return;
   const node=e.target.closest('.node');
+  if(node&&node.classList.contains('terminal')) return;   // not a workflow step — never draggable/selectable
   if(node){
     const i=+node.dataset.i; selNode=S.workflow.nodes[i]; bodyMode='preview'; highlight(); renderInsp();
     drag={el:node,title:selNode.title,sx:e.clientX,sy:e.clientY,
@@ -1446,6 +1699,58 @@ function renderInsp(){
     const on=(n.tools||[]).includes(t);
     return `<span class="tog ${on?'on':''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
+  const stg=isStep?effectiveStage(n):null;
+  const isRunStage=stg&&RUN_STAGES.includes(stg);
+  const autoGuess=isStep?nodeStage(n.title):null;
+  const stageDropdown=isStep?`
+    <label>Runs as <span class="mut">(which harn run stage — sets its agent/model + Run/Rerun below)</span></label>
+    <select onchange="setNodeStage(this.value)">
+      <option value="" ${!n.stage?'selected':''}>Auto${autoGuess?' → '+esc(STAGE_LABEL[autoGuess]||autoGuess):' (guess from title: nothing found)'}</option>
+      <option value="none" ${n.stage==='none'?'selected':''}>Not a harn run stage</option>
+      ${RUN_STAGES.map(s=>`<option value="${s}" ${n.stage===s?'selected':''}>${esc(STAGE_LABEL[s]||s)}</option>`).join('')}
+    </select>` : '';
+  // Shown on EVERY step: pick the AGENT + MODEL this step runs with under
+  // `harn run`. Only the six real headless stages are separately-invoked, so a
+  // step that maps to none of them shows the controls disabled with a one-click
+  // hint — the picker is visibly present everywhere, never silently missing.
+  const modelSection=isStep?(()=>{
+    const runNote=`
+      <div class="mut" style="font-size:11px;margin-top:6px;line-height:1.6">
+        Applies to <b>harn run</b> (headless). Default agent/model set in
+        <a class="link" onclick="showTab('settings')">Settings</a>; override here
+        per stage. In chat mode (Cursor/Claude Code) the agent is your own IDE —
+        harn can't switch it.
+      </div>`;
+    if(!isRunStage){
+      const why = n.stage==='none'
+        ? 'This step is marked <b>None</b> — it runs inside another agent turn, so it has no agent/model of its own.'
+        : 'Assign a <b>pipeline stage</b> above to choose an agent + model for this step.';
+      return `
+      <label>Agent &amp; model for this step</label>
+      <div class="modelrow4">
+        <select disabled><option>—</option></select><select disabled><option>—</option></select>
+        <select disabled><option>—</option></select><select disabled><option>—</option></select>
+      </div>
+      <div class="mut" style="font-size:11px;margin-top:6px">${why}</div>`;
+    }
+    const v_=MODELS.values[stg]||{};
+    const ch=modelChoices(stg);
+    const effAgent=stageAgent(stg);
+    const agentOpts=`<option value="" ${!v_.agent?'selected':''}>Default: ${esc(AGENT_LABEL[MODELS.default_agent]||MODELS.default_agent||'(unset)')}</option>`
+      + allAgentNames().map(a=>`<option value="${esc(a)}" ${v_.agent===a?'selected':''}>${esc(AGENT_LABEL[a]||a)}${agentCaps(a).available?'':' (not installed)'}</option>`).join('');
+    return `
+    <label>Agent &amp; model <span class="mut">(for the "${esc(STAGE_LABEL[stg]||stg)}" stage)</span></label>
+    <div class="modelrow4">
+      <select onchange="setStageAgent('${stg}',this.value)" title="which CLI runs this stage">${agentOpts}</select>
+      <div>${selectOrCustom(stg,'model',v_.model||'',ch.models)}</div>
+      <div>${selectOrCustom(stg,'effort',v_.effort||'',ch.efforts)}</div>
+      <div>${selectOrCustom(stg,'temperature',v_.temperature||'',ch.temperatures)}</div>
+    </div>
+    <div class="row" style="margin-top:8px;gap:10px">
+      <button onclick="saveStepModel('${stg}')">Save</button>
+      <span class="status" id="mst-${stg}"></span>
+    </div>${runNote}`;
+  })():'';
   $('#insp').innerHTML=`
     <h2>${isStep?'Step':'Note'}</h2>
     <div class="row" style="justify-content:space-between">
@@ -1463,7 +1768,9 @@ function renderInsp(){
     <label>Tools at this step <span class="mut">(click to toggle · add below)</span></label>
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
-      onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>`:''}
+      onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
+    ${stageDropdown}
+    ${modelSection}`:''}
   `;
 }
 function upd(k,v){
@@ -1472,6 +1779,11 @@ function upd(k,v){
   if(k==='title'){ if(L[old]){ L[v]=L[old]; if(v!==old) delete L[old]; } renderFlow(); }
 }
 function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); renderFlow(); }
+function setNodeStage(val){
+  if(!selNode) return;
+  selNode.stage=val;   // '' = auto-detect, 'none' = explicit opt-out, else a real stage
+  checkDirty(); renderFlow();
+}
 function toggleReq(name){
   if(!selNode)return; selNode.required=selNode.required||[];
   const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
@@ -1496,11 +1808,10 @@ async function saveFlow(){
 
 /* ---------- tabs + list views ---------- */
 function showTab(t){ tab=t; bodyMode='preview';
-  ['flow','skills','tools','board','models'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
+  ['flow','skills','tools','board','settings'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
   $('#surface').style.display = t==='flow'?'':'none';
   $('#listView').style.display = t==='flow'?'none':'block';
   $('#zoom').style.display = t==='flow'?'':'none';
-  $('#runbox').style.display = t==='flow'&&hasRun()?'':'none';
   $('#canvas').classList.toggle('list',t!=='flow');
   $('#saveBtn').style.display=t==='flow'?'':'none';
   $('#arrangeBtn').style.display=t==='flow'?'':'none';
@@ -1509,8 +1820,77 @@ function showTab(t){ tab=t; bodyMode='preview';
   if(t==='flow')renderFlow();
   else if(t==='skills')renderSkills();
   else if(t==='tools')renderTools();
-  else if(t==='models')loadModels();
+  else if(t==='settings')renderSettings();
   else{ pollBoard(); }
+}
+
+/* ---------- settings tab: default agent + model for harn run ---------- */
+async function renderSettings(){
+  await ensureModelsLoaded();
+  const v=$('#listView');
+  const da=MODELS.default_agent||'', dm=MODELS.default_model||'';
+  const agentOpts=allAgentNames().map(a=>{
+    const c=agentCaps(a);
+    return `<option value="${esc(a)}" ${da===a?'selected':''}>${esc(AGENT_LABEL[a]||a)}${c.available?' ✓ installed':' — not installed'}</option>`;
+  }).join('');
+  const dmModels=(agentCaps(da).models)||[];
+  v.innerHTML=`<div class="settings">
+    <h2>SETTINGS — harn run</h2>
+    <p class="mut" style="font-size:12px;line-height:1.6">
+      Which agent CLI drives <b>harn run</b> (headless), and the default model.
+      This is what makes harn run connect Cursor / Codex / Claude / … as you
+      choose. Each pipeline stage can override this in its step on the Flow tab.
+    </p>
+    <div class="field">
+      <label>Default agent <span class="mut">(the CLI harn run launches)</span></label>
+      <select id="setAgent" onchange="onDefaultAgentChange(this.value)">${agentOpts||'<option>(none)</option>'}</select>
+    </div>
+    <div class="field">
+      <label>Default model <span class="mut">(applied to every stage without its own override; blank = the CLI's own default)</span></label>
+      <div id="setModelWrap">${settingsModelSelect(dm,dmModels)}</div>
+    </div>
+    <div class="row" style="margin-top:14px;gap:10px">
+      <button class="primary" onclick="saveDefaults()">Save settings</button>
+      <span class="status" id="setStatus"></span>
+    </div>
+    <p class="mut" style="font-size:11px;margin-top:16px;line-height:1.6">
+      Note: in <b>chat mode</b> (you working inside Cursor or Claude Code) the
+      agent and model are whatever your IDE session uses — harn can't switch
+      them. These defaults govern <b>harn run</b> only.
+    </p>
+  </div>`;
+  $('#insp').innerHTML='<div class="empty">harn run defaults. Per-stage overrides live on each Flow step.</div>';
+}
+function settingsModelSelect(current,options){
+  const isCustom=!!current && !options.includes(current);
+  return `<select id="setModel" onchange="onDefaultModelSelect(this)">
+      <option value="">(CLI default)</option>
+      ${options.map(o=>`<option value="${esc(o)}" ${current===o?'selected':''}>${esc(o)}</option>`).join('')}
+      <option value="__custom__" ${isCustom?'selected':''}>Custom…</option>
+    </select>
+    <input type="text" id="setModelCustom" placeholder="custom model" value="${esc(isCustom?current:'')}"
+      style="margin-top:5px;${isCustom?'':'display:none'}"/>`;
+}
+function onDefaultAgentChange(agentName){
+  MODELS.default_agent=agentName;
+  // model options depend on the agent — re-render just the model field
+  const wrap=$('#setModelWrap');
+  if(wrap) wrap.innerHTML=settingsModelSelect('', (agentCaps(agentName).models)||[]);
+}
+function onDefaultModelSelect(sel){
+  const inp=$('#setModelCustom');
+  if(sel.value==='__custom__'){ if(inp){inp.style.display='';inp.value='';inp.focus();} }
+  else if(inp){ inp.style.display='none'; }
+}
+async function saveDefaults(){
+  const agent=$('#setAgent')?$('#setAgent').value:'';
+  const msel=$('#setModel')?$('#setModel').value:'';
+  const model = msel==='__custom__' ? ($('#setModelCustom')?$('#setModelCustom').value.trim():'') : msel;
+  $('#setStatus').textContent='saving…';
+  const r=await post_('/api/defaults',{agent,model});
+  if(r.ok){ MODELS.default_agent=r.agent||agent; MODELS.default_model=r.model||model;
+    $('#setStatus').textContent='saved ✓'; }
+  else $('#setStatus').textContent=r.error||'save failed';
 }
 
 /* ---------- skills tab ---------- */

@@ -173,6 +173,13 @@ class Task:
     # workflow into WORKFLOW.md when the task is picked up, so every agent
     # (Claude/Codex/Cursor) reads the right flow from the one file they all read.
     workflow: str | None = None
+    # Per-stage git checkpoints ({stage: commit-ish ref}) — a `git stash
+    # create` snapshot of the working tree taken right before that stage's
+    # last attempt (see gitutil.checkpoint). "Rerun this stage" restores here
+    # first, so the retry starts from EXACTLY that point instead of layering
+    # a new attempt on top of a half-finished previous one. Distinct from
+    # `baseline_ref` (the task's very first checkpoint, for a full rerun).
+    stage_checkpoints: dict = field(default_factory=dict)
 
     @property
     def done(self) -> bool:
@@ -254,6 +261,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         claimed_at=d.get("claimed_at") or "",
         spec_locked=bool(d.get("spec_locked", False)),
         workflow=d.get("workflow") or None,
+        stage_checkpoints=dict(d.get("stage_checkpoints") or {}),
     )
 
 
@@ -280,6 +288,7 @@ def _to_dict(task: Task) -> dict:
         "claimed_at":  task.claimed_at,
         "spec_locked": task.spec_locked,
         "workflow":    task.workflow,
+        "stage_checkpoints": task.stage_checkpoints,
     }
 
 

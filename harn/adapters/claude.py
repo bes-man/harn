@@ -25,6 +25,10 @@ class ClaudeAdapter(Adapter):
     # thinking is a model/API concept, not exposed this way headless) — both
     # unconfirmed, so left as the base class's best-effort default. `--model`
     # is real and documented for the Claude Code CLI.
+    MODELS = ("opus", "sonnet", "haiku", "opusplan",
+              "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001")
+    EFFORTS = ()          # no confirmed --effort flag for `claude -p` (see above)
+    TEMPERATURES = ()     # no sampling temperature exposed (see above)
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,

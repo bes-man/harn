@@ -69,6 +69,71 @@ def test_stage_overrides_is_a_copy_not_the_original():
     assert cfg.stage_models["execute"]["model"] == "sonnet"
 
 
+def test_stage_overrides_strips_agent_key():
+    # `agent` selects the CLI, not a run_turn kwarg — must not leak through.
+    cfg = Config(stage_models={"execute": {"agent": "cursor", "model": "composer-1"}})
+    assert loop._stage_overrides(cfg, "execute") == {"model": "composer-1"}
+
+
+def test_stage_overrides_falls_back_to_default_model():
+    cfg = Config(model="opus", stage_models={"execute": {"effort": "high"}})
+    # execute has no model of its own -> inherits the global default
+    assert loop._stage_overrides(cfg, "execute") == {"model": "opus", "effort": "high"}
+    # verify has no override at all -> still gets the default
+    assert loop._stage_overrides(cfg, "verify") == {"model": "opus"}
+
+
+def test_stage_own_model_beats_default_model():
+    cfg = Config(model="opus", stage_models={"execute": {"model": "sonnet"}})
+    assert loop._stage_overrides(cfg, "execute") == {"model": "sonnet"}
+
+
+# --------------------------------------------------------------------------- #
+# Config: per-stage agent + global default model
+# --------------------------------------------------------------------------- #
+def test_config_parses_per_stage_agent(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    (env / "harn.toml").write_text('[models.execute]\nagent = "cursor"\nmodel = "composer-1"\n')
+    assert Config.load(env).stage_models == {
+        "execute": {"agent": "cursor", "model": "composer-1"}}
+
+
+def test_config_parses_default_model(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    (env / "harn.toml").write_text('[harn]\nmodel = "opus"\n')
+    assert Config.load(env).model == "opus"
+
+
+def test_config_default_model_empty_by_default(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    assert Config.load(env).model == ""
+
+
+# --------------------------------------------------------------------------- #
+# loop._adapter_for_stage
+# --------------------------------------------------------------------------- #
+def test_adapter_for_stage_uses_override(monkeypatch):
+    class A: name = "claude"
+    class B: name = "cursor"
+    monkeypatch.setattr(loop, "get_adapter", lambda n: B() if n == "cursor" else A())
+    cfg = Config(stage_models={"execute": {"agent": "cursor"}})
+    assert loop._adapter_for_stage(cfg, "execute", A()).name == "cursor"
+    # a stage with no agent override keeps the default
+    assert loop._adapter_for_stage(cfg, "verify", A()).name == "claude"
+
+
+def test_adapter_for_stage_unknown_agent_falls_back(monkeypatch):
+    class A: name = "claude"
+    def boom(n):
+        raise ValueError("unknown")
+    monkeypatch.setattr(loop, "get_adapter", boom)
+    cfg = Config(stage_models={"execute": {"agent": "nope"}})
+    assert loop._adapter_for_stage(cfg, "execute", A()).name == "claude"
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end: loop.run() actually threads the override into run_turn per stage
 # --------------------------------------------------------------------------- #
@@ -124,6 +189,23 @@ def test_execute_and_verify_stages_get_their_own_model(tmp_path, monkeypatch):
 
     assert fake.calls[0] == {"model": "sonnet", "effort": None, "temperature": None}
     assert fake.calls[1] == {"model": "opus", "effort": "high", "temperature": None}
+
+
+def test_per_stage_agent_routes_to_that_adapter(tmp_path, monkeypatch):
+    """execute runs on 'cursor', verify on the default 'fake' — provider-
+    agnostic per-stage agent selection, end to end through loop.run()."""
+    env = _env(tmp_path, extra_toml='[models.execute]\nagent = "cursor"\n')
+    fake = RecordingAdapter(["work done", "looks correct\nVERIFY: PASS"])
+    cursor = RecordingAdapter(["cursor did the work"])
+    registry = {"cursor": cursor, "fake": fake}
+    monkeypatch.setattr(loop, "get_adapter", lambda name: registry.get(name, fake))
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    # the execute turn went to cursor; verify stayed on the default adapter
+    assert len(cursor.calls) == 1
+    assert fake.calls and fake.calls[0]["model"] is None   # fake's first call is verify
 
 
 def test_stage_without_override_passes_no_model(tmp_path, monkeypatch):

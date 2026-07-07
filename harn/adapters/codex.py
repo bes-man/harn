@@ -20,6 +20,7 @@ class CodexAdapter(Adapter):
     # convention, unconfirmed for this specific CLI build — override the
     # *_FLAG class attrs above if your `codex` version uses different syntax
     # (e.g. `-c key=value` config overrides instead of plain flags).
+    MODELS = ("gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5-codex", "o4-mini")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,

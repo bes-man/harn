@@ -23,6 +23,7 @@ class AntigravityAdapter(Adapter):
     # `--model`/`--effort`/`--temperature` are the base class's best-effort
     # convention, unconfirmed for this specific CLI build — override the
     # *_FLAG class attrs above if your `antigravity` CLI uses different syntax.
+    MODELS = ("gemini-3-pro", "gemini-3-flash", "gemini-3-deep-think")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,

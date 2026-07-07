@@ -49,8 +49,12 @@ def active(env_dir: Path) -> dict | None:
 
 
 def launch(project_root: Path, env_dir: Path, task_id: str, *,
-           auto: bool = False) -> dict:
-    """Start `harn run --task <task_id>` in the background.
+           auto: bool = False, stage: str | None = None,
+           rerun: bool = False) -> dict:
+    """Start `harn run --task <task_id>` in the background — the whole task
+    loop by default, or exactly ONE stage (`stage=...`, optionally `rerun=True`
+    to first restore that stage's git checkpoint) for the studio UI's per-step
+    Run/Rerun controls.
 
     Refuses if a run is already active for this project (single-runner-at-a-
     time — see module docstring). stdout/stderr go to state/ui_run.log so the
@@ -66,7 +70,11 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
     state_dir = env_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, "-m", "harn", "run", "--task", task_id]
-    if auto:
+    if stage:
+        cmd += ["--stage", stage]
+        if rerun:
+            cmd.append("--rerun")
+    elif auto:
         cmd.append("--auto")
     cmd.append(str(project_root))
     with open(_log_path(env_dir), "wb") as lf:
@@ -78,7 +86,7 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
     # A background thread just to reap it costs nothing and never blocks.
     threading.Thread(target=proc.wait, daemon=True).start()
     info = {"pid": proc.pid, "task_id": task_id, "auto": bool(auto),
-            "started_at": time.time()}
+            "stage": stage, "rerun": bool(rerun), "started_at": time.time()}
     _pid_path(env_dir).write_text(json.dumps(info), encoding="utf-8")
     return {"ok": True, **info}
 

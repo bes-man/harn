@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from harn.adapters import get_adapter
-from harn.adapters.base import AgentResult
+from harn.adapters.base import AgentResult, resolve_binary
 
 
 ALL_AGENTS = ["claude", "codex", "cursor", "antigravity", "qwen"]
@@ -39,6 +39,10 @@ def test_unknown_agent_raises():
 
 @pytest.mark.parametrize("agent", ALL_AGENTS)
 def test_missing_binary_reports_not_available(monkeypatch, agent):
+    # available() also searches common install dirs beyond PATH, so a real
+    # `claude` in ~/.local/bin would otherwise show up here — neutralize the
+    # whole resolver to simulate "not installed anywhere".
+    monkeypatch.setattr("harn.adapters.base.resolve_binary", lambda _b: None)
     monkeypatch.setattr("shutil.which", lambda _b: None)
     adapter = get_adapter(agent)
     assert adapter.available() is False
@@ -87,3 +91,52 @@ def test_timeout_is_reported(monkeypatch, agent):
     result = adapter.run_turn("PROMPT", Path("."), timeout=1)
     assert result.ok is False
     assert "timed out" in result.text.lower()
+
+
+# --- binary resolution beyond PATH (stripped-PATH / GUI-launched processes) - #
+
+def test_resolve_binary_prefers_path(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/" + _b)
+    assert resolve_binary("claude") == "/usr/bin/claude"
+
+
+def test_resolve_binary_falls_back_to_common_dir(monkeypatch, tmp_path):
+    # not on PATH, but installed in one of the extra dirs harn searches
+    monkeypatch.setattr("shutil.which", lambda _b: None)
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr("harn.adapters.base._EXTRA_BIN_DIRS", (str(tmp_path),))
+    assert resolve_binary("claude") == str(fake)
+
+
+def test_resolve_binary_none_when_absent(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _b: None)
+    monkeypatch.setattr("harn.adapters.base._EXTRA_BIN_DIRS", ())
+    assert resolve_binary("claude") is None
+    assert resolve_binary("") is None
+
+
+def test_exec_uses_absolute_path_when_off_path(monkeypatch, tmp_path):
+    """A CLI found only via the extra-dir search must be launched by its
+    absolute path — subprocess.run resolves argv[0] via PATH only."""
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr("shutil.which", lambda _b: None)
+    monkeypatch.setattr("harn.adapters.base._EXTRA_BIN_DIRS", (str(tmp_path),))
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+
+        class P:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    get_adapter("claude").run_turn("PROMPT", Path("."))
+    assert captured["argv"][0] == str(fake)

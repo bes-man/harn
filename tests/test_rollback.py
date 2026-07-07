@@ -114,6 +114,73 @@ def test_rollback_never_touches_harn_env(tmp_path):
     assert not any(f.startswith("harn_env/") for f in res.files)
 
 
+# --------------------------------------------------------------------------- #
+# Per-stage checkpoints (git stash create + hidden ref) — the mechanism that
+# guarantees "rerun this stage" undoes EXACTLY that stage's changes.
+# --------------------------------------------------------------------------- #
+def test_checkpoint_leaves_no_visible_trace(tmp_path):
+    root = _repo(tmp_path)
+    (root / "app.py").write_text("dirty change\n")   # uncommitted
+    ref = gitutil.checkpoint(root, "PRJ-001", "execute")
+    assert ref
+    # no new commit, no visible stash entry
+    log = subprocess.run(["git", "log", "--oneline"], cwd=root,
+                         capture_output=True, text=True).stdout
+    assert log.count("\n") == 1   # only the original "baseline" commit
+    stash = subprocess.run(["git", "stash", "list"], cwd=root,
+                           capture_output=True, text=True).stdout
+    assert stash.strip() == ""
+    # but a hidden ref pins it against GC
+    refs = subprocess.run(["git", "for-each-ref", "refs/harn"], cwd=root,
+                          capture_output=True, text=True).stdout
+    assert "PRJ-001/execute" in refs
+    # the working tree itself is untouched by taking the snapshot
+    assert (root / "app.py").read_text() == "dirty change\n"
+
+
+def test_checkpoint_restores_exactly_that_stage(tmp_path):
+    root = _repo(tmp_path)
+    (root / "app.py").write_text("before stage\n")
+    ref = gitutil.checkpoint(root, "PRJ-001", "execute")
+
+    # the stage runs and makes a mess
+    (root / "app.py").write_text("stage broke this\n")
+    (root / "new_file.py").write_text("junk\n")
+
+    res = gitutil.rollback_to(ref, root, apply=True)
+    assert res.ok
+    assert (root / "app.py").read_text() == "before stage\n"
+    assert not (root / "new_file.py").exists()
+
+
+def test_checkpoint_on_clean_tree_uses_head(tmp_path):
+    root = _repo(tmp_path)   # freshly committed, nothing dirty
+    ref = gitutil.checkpoint(root, "PRJ-001", "plan")
+    assert ref == gitutil.head(root)
+
+
+def test_checkpoint_not_a_repo_returns_empty(tmp_path):
+    assert gitutil.checkpoint(tmp_path, "PRJ-001", "execute") == ""
+
+
+def test_reopen_clears_stage_checkpoints(tmp_path):
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = make_task(env, "PRJ-001", status=tasks.REVIEW)
+    tasks.set_baseline(t, gitutil.head(root))
+    ref = gitutil.checkpoint(root, "PRJ-001", "execute")
+    t.stage_checkpoints["execute"] = ref
+    tasks._save(t)
+
+    loop.rollback(root, env, "PRJ-001", apply=True, reopen=True)
+
+    fresh = tasks.find(env, "PRJ-001")
+    assert fresh.stage_checkpoints == {}
+    refs = subprocess.run(["git", "for-each-ref", "refs/harn/checkpoints/PRJ-001"],
+                          cwd=root, capture_output=True, text=True).stdout
+    assert refs.strip() == ""
+
+
 def test_baseline_round_trips(tmp_path):
     env = _env(tmp_path)
     t = make_task(env, "PRJ-001")

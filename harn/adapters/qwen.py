@@ -23,6 +23,7 @@ class QwenAdapter(Adapter):
     # `--model`/`--effort`/`--temperature` are the base class's best-effort
     # convention, unconfirmed for this specific CLI build — override the
     # *_FLAG class attrs above if your `qwen` build uses different syntax.
+    MODELS = ("qwen3-coder-plus", "qwen3-coder-flash", "qwen3-max")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,

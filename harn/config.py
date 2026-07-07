@@ -75,7 +75,10 @@ def _parse_stage_models(models_raw: dict) -> dict:
         if not isinstance(st, dict):
             continue
         entry = {}
-        for key in ("model", "effort", "temperature"):
+        # `agent` overrides WHICH CLI runs this stage (provider-agnostic —
+        # e.g. plan with claude, execute with cursor); model/effort/temperature
+        # are the per-turn overrides passed to that CLI.
+        for key in ("agent", "model", "effort", "temperature"):
             v = st.get(key)
             if v is not None and str(v).strip():
                 entry[key] = str(v).strip()
@@ -98,7 +101,10 @@ DEFAULTS: dict = {
     # all context (AGENTS.md, the task board, PROGRESS.md, ANSWERS.md, MCP), so
     # whichever one runs next understands what's done and what's planned.
     "harn": {"agent": "claude", "agents": [], "project": "prj001",
-             "autonomy": 0.7, "require_mcp": True, "guidance": "lean"},
+             "autonomy": 0.7, "require_mcp": True, "guidance": "lean",
+             # Default model for every harn run stage that has no per-stage
+             # override; empty = let the CLI use its own default.
+             "model": ""},
     "feedback": {"test_cmd": "", "require_tests": True},
     "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
              "auto": False, "auto_max_iterations": 30,
@@ -120,6 +126,9 @@ DEFAULTS: dict = {
 class Config:
     agent: str = "claude"
     agents: list[str] = field(default_factory=list)
+    # Default model applied to every harn run stage lacking a per-stage
+    # override (empty = each CLI's own default). From `[harn] model`.
+    model: str = ""
     project: str = "prj001"   # project code for the prj…-prd…-task… scheme
     # How self-directed the agent is, 0.0–1.0. 0 = meticulous (clarify
     # everything), 1 = creative (decide for itself). Default 0.7.
@@ -211,6 +220,7 @@ class Config:
         return cls(
             agent=os.environ.get("HARN_AGENT", data["harn"]["agent"]),
             agents=agents,
+            model=str(os.environ.get("HARN_MODEL") or data["harn"].get("model", "") or "").strip(),
             project=str(data["harn"].get("project", "prj001")).strip().lower(),
             autonomy=_clamp01(
                 os.environ.get("HARN_AUTONOMY") or data["harn"].get("autonomy", 0.7)

@@ -31,6 +31,51 @@ def head(cwd: Path) -> str:
     return out if code == 0 else ""
 
 
+def checkpoint(cwd: Path, task_id: str, stage: str) -> str:
+    """Snapshot the CURRENT working tree (staged + unstaged + untracked) right
+    before a stage's turn runs, so a later "rerun this stage" can restore
+    EXACTLY this starting point via `rollback_to` — undoing only that attempt,
+    not the task's whole history.
+
+    Uses `git stash create`: a dangling commit object capturing the full
+    working-tree state, WITHOUT touching the branch, HEAD, or the working tree
+    itself, and WITHOUT appearing in `git stash list` or `git log` — a real git
+    primitive, not custom plumbing. Pinned against garbage collection with a
+    hidden ref (refs/harn/checkpoints/<task_id>/<stage>) that no normal git
+    command surfaces.
+
+    If the tree is completely clean, there's nothing to stash — HEAD itself
+    already IS that state, so restoring later is correctly a no-op.
+
+    Returns the checkpoint commit hash, or '' if this isn't a git repo / git
+    isn't available (checkpointing is best-effort, like the rest of this
+    module — never blocks a turn from running).
+    """
+    if not is_repo(cwd):
+        return ""
+    code, out, _ = _run(["stash", "create", f"harn:{task_id}:{stage}"], cwd)
+    ref = out.strip() if code == 0 and out.strip() else head(cwd)
+    if not ref:
+        return ""
+    _run(["update-ref", f"refs/harn/checkpoints/{task_id}/{stage}", ref], cwd)
+    return ref
+
+
+def clear_checkpoints(cwd: Path, task_id: str) -> None:
+    """Delete every hidden checkpoint ref for a task (a full rerun/reopen makes
+    the old per-stage checkpoints stale — this stops them accumulating as
+    dangling refs forever)."""
+    if not is_repo(cwd):
+        return
+    code, out, _ = _run(["for-each-ref", "--format=%(refname)",
+                        f"refs/harn/checkpoints/{task_id}"], cwd)
+    if code != 0:
+        return
+    for ref in out.splitlines():
+        if ref.strip():
+            _run(["update-ref", "-d", ref.strip()], cwd)
+
+
 def is_dirty(cwd: Path) -> bool:
     code, out, _ = _run(["status", "--porcelain"], cwd)
     return code == 0 and bool(out)
