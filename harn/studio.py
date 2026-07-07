@@ -1802,6 +1802,7 @@ async function saveFlow(){
 // preset editing. saveFlow() detects PLAN_MODE and posts to /api/task_plan
 // instead of /api/workflow, so preset files are never touched from here.
 async function openTaskPlan(taskId){
+  if(dirty && !confirm('Unsaved '+(PLAN_MODE?'plan':'workflow')+' edits will be lost. Continue?')) return;
   const r=await (await fetch(api('/api/task_plan?task='+encodeURIComponent(taskId)))).json();
   if(!r.ok){ alert(r.error||'could not load this task\'s plan'); return; }
   PLAN_MODE={taskId};
