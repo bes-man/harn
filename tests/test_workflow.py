@@ -2,6 +2,7 @@
 agent-agnostic wiring, MCP read/save tools."""
 from __future__ import annotations
 
+import re as re_mod
 from pathlib import Path
 
 from harn import workflow, scaffold, skills, ENV_DIRNAME
@@ -97,82 +98,75 @@ def test_refresh_updates_snapshot_keeps_steps(tmp_path):
     assert out.count(workflow._SNAP_START) == 1
 
 
-# --- explicit per-step Stage mapping (unlocks model + Run/Rerun in the UI) - #
+# --- per-step execution fields (Id / Agent / Model / Effort / Temperature) - #
 
-def test_parse_defaults_stage_to_empty(tmp_path):
+def test_parse_defaults_step_fields_to_empty(tmp_path):
     env = tmp_path / ENV_DIRNAME
     workflow.write(env)
     parsed = workflow.parse(env)
-    assert all(n["stage"] == "" for n in parsed["nodes"] if n["kind"] == "step")
+    for n in parsed["nodes"]:
+        if n["kind"] == "step":
+            assert n["id"] == "" and n["agent"] == "" and n["model"] == ""
+            assert n["effort"] == "" and n["temperature"] == ""
 
 
-def test_stage_round_trips_through_compose(tmp_path):
+def test_step_fields_round_trip_through_compose(tmp_path):
     env = tmp_path / ENV_DIRNAME
     workflow.write(env)
     parsed = workflow.parse(env)
     step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
-    step["stage"] = "execute"
+    step.update(id="step-3f8a9c", agent="cursor", model="composer-1",
+                effort="high", temperature="0.2")
     workflow.save_parsed(env, parsed)
+    re = workflow.parse(env)
+    s2 = next(n for n in re["nodes"] if n["title"] == "Implement")
+    assert s2["id"] == "step-3f8a9c" and s2["agent"] == "cursor"
+    assert s2["model"] == "composer-1" and s2["effort"] == "high"
+    assert s2["temperature"] == "0.2"
+    # other steps untouched
+    other = next(n for n in re["nodes"] if n["title"] == "Session start — orient")
+    assert other["agent"] == "" and other["id"] == ""
 
-    reparsed = workflow.parse(env)
-    step2 = next(n for n in reparsed["nodes"] if n["title"] == "Implement")
-    assert step2["stage"] == "execute"
-    # never silently guessed for OTHER steps
-    other = next(n for n in reparsed["nodes"] if n["title"] == "Session start — orient")
-    assert other["stage"] == ""
 
-
-def test_compose_writes_stage_line(tmp_path):
+def test_id_survives_rename(tmp_path):
     env = tmp_path / ENV_DIRNAME
     workflow.write(env)
     parsed = workflow.parse(env)
     step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
-    step["stage"] = "execute"
-    text = workflow.compose(env, parsed)
-    assert "Stage: execute" in text
+    step["id"] = "step-aa11bb"
+    step["title"] = "Build the thing"
+    workflow.save_parsed(env, parsed)
+    re = workflow.parse(env)
+    assert next(n for n in re["nodes"]
+                if n["title"] == "Build the thing")["id"] == "step-aa11bb"
 
 
-def test_invalid_stage_value_is_dropped_on_parse(tmp_path):
+def test_ensure_ids_fills_only_missing(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["id"] = "step-keepme"
+    out = workflow.ensure_ids(parsed)
+    ids = [n["id"] for n in out["nodes"] if n["kind"] == "step"]
+    assert all(ids), "every step got an id"
+    assert "step-keepme" in ids
+    assert len(set(ids)) == len(ids), "ids are unique"
+    for i in ids:
+        if i != "step-keepme":
+            assert re_mod.fullmatch(r"step-[0-9a-f]{6}", i), i
+
+
+def test_legacy_stage_line_is_dropped_silently(tmp_path):
     env = tmp_path / ENV_DIRNAME
     workflow.write(env)
     p = env / "WORKFLOW.md"
     p.write_text(p.read_text().replace(
-        "## 3. Implement", "## 3. Implement\nStage: not_a_real_stage"), encoding="utf-8")
+        "## 3. Implement", "## 3. Implement\nStage: execute"), encoding="utf-8")
     parsed = workflow.parse(env)
     step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
-    assert step["stage"] == ""
-
-
-def test_stage_none_is_an_explicit_opt_out(tmp_path):
-    """"none" persists as an explicit opt-out, distinct from "" (undecided —
-    the UI falls back to guessing from the title)."""
-    env = tmp_path / ENV_DIRNAME
-    workflow.write(env)
-    parsed = workflow.parse(env)
-    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
-    step["stage"] = "none"
-    workflow.save_parsed(env, parsed)
-
-    text = (env / "WORKFLOW.md").read_text()
-    assert "Stage: none" in text
-    reparsed = workflow.parse(env)
-    assert next(n for n in reparsed["nodes"] if n["title"] == "Implement")["stage"] == "none"
-
-
-def test_renaming_step_does_not_move_the_stage_mapping(tmp_path):
-    """The whole point of an explicit Stage: line — a keyword-based guess would
-    break silently on rename; this must not."""
-    env = tmp_path / ENV_DIRNAME
-    workflow.write(env)
-    parsed = workflow.parse(env)
-    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
-    step["stage"] = "execute"
-    step["title"] = "Build the thing"
-    workflow.save_parsed(env, parsed)
-
-    reparsed = workflow.parse(env)
-    renamed = next(n for n in reparsed["nodes"] if n["title"] == "Build the thing")
-    assert renamed["stage"] == "execute"
+    assert "Stage:" not in step["body"]
+    assert "stage" not in step  # the key no longer exists
 
 
 # --- setup / onboard wiring ------------------------------------------------ #
