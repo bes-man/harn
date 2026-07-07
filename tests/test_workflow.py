@@ -125,7 +125,10 @@ def test_step_fields_round_trip_through_compose(tmp_path):
     assert s2["temperature"] == "0.2"
     # other steps untouched
     other = next(n for n in re["nodes"] if n["title"] == "Session start — orient")
-    assert other["agent"] == "" and other["id"] == ""
+    assert other["agent"] == ""            # untouched fields stay empty
+    # save_parsed stamps a stable id on EVERY step (spec: ids on first save,
+    # so task snapshots inherit the preset's ids)
+    assert re_mod.fullmatch(r"step-[0-9a-f]{6}", other["id"])
 
 
 def test_id_survives_rename(tmp_path):

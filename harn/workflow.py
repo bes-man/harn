@@ -356,9 +356,9 @@ def ensure_ids(parsed: dict) -> dict:
 def save_parsed(env_dir: Path, parsed: dict) -> Path:
     """Write WORKFLOW.md from an edited structure (visual editor → file).
 
-    Does NOT call `ensure_ids()` — a save must not silently stamp ids onto
-    steps the caller didn't touch (steps without an explicit id stay "" until
-    something needs one, e.g. `harn run` calling `ensure_ids()` itself)."""
+    Calls `ensure_ids()` to stamp stable ids on first save, so task snapshots
+    inherit the preset's ids (per spec: ids on first save)."""
+    ensure_ids(parsed)
     p = env_dir / FILENAME
     p.write_text(compose(env_dir, parsed), encoding="utf-8")
     return p
