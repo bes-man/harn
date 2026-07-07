@@ -471,19 +471,32 @@ def stop_task(env_dir: Path, payload: dict) -> dict:
     return runner_mod.stop(env_dir)
 
 
-def launch_stage(env_dir: Path, payload: dict) -> dict:
-    """Start (or rerun) exactly ONE pipeline stage for one task in the
+def launch_step(env_dir: Path, payload: dict) -> dict:
+    """Start (or rerun) exactly ONE workflow step for one task in the
     background — the Flow tab's per-step Run/Rerun controls. `rerun=True`
-    first restores the working tree to that stage's git checkpoint (see
-    gitutil.checkpoint / loop.run_stage), discarding its last attempt."""
+    first restores the working tree to that step's git checkpoint (see
+    gitutil.checkpoint / loop.run_step), discarding its last attempt."""
     task_id = (payload.get("task_id") or "").strip()
-    stage = (payload.get("stage") or "").strip()
-    if stage not in MODEL_STAGES:
-        return {"ok": False, "error": f"unknown stage '{stage}'"}
-    if tasks_mod.find(env_dir, task_id) is None:
+    step_id = (payload.get("step_id") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
         return {"ok": False, "error": f"no task {task_id}"}
+    plan = workflows_mod.load_task_plan(env_dir, task_id) \
+        or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
+    known = {n.get("id") for n in plan.get("nodes", []) if n.get("kind") == "step"}
+    if step_id not in known:
+        return {"ok": False, "error": f"unknown step '{step_id}'"}
     return runner_mod.launch(env_dir.parent, env_dir, task_id,
-                             stage=stage, rerun=bool(payload.get("rerun")))
+                             step=step_id, rerun=bool(payload.get("rerun")))
+
+
+def launch_stage(env_dir: Path, payload: dict) -> dict:
+    """Deprecated: superseded by launch_step (per-step ids, not fixed
+    pipeline stages). Kept only for the /api/tasks/run_stage interim route
+    (see that route's handler) until the studio frontend (Task 6) is
+    rewritten to post to /api/tasks/run_step."""
+    return {"ok": False,
+            "error": "replaced by /api/tasks/run_step (per-step ids)"}
 
 
 def rerun_workflow(env_dir: Path, payload: dict) -> dict:
@@ -656,6 +669,8 @@ def _make_handler(default_env: Path):
                 self._json(stop_task(env, body))
             elif route == "/api/tasks/run_stage":
                 self._json(launch_stage(env, body))
+            elif route == "/api/tasks/run_step":
+                self._json(launch_step(env, body))
             elif route == "/api/tasks/rerun_workflow":
                 self._json(rerun_workflow(env, body))
             elif route == "/api/attachments/upload":

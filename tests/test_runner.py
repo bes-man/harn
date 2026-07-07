@@ -50,35 +50,35 @@ def test_launch_command_includes_task_and_project(tmp_path):
     assert str(tmp_path) in cmd
 
 
-def test_launch_stage_includes_stage_flag_not_auto(tmp_path):
+def test_launch_step_includes_step_flag_not_auto(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
          patch("harn.runner.os.kill"):
-        r = runner.launch(tmp_path, env, "PRJ-003", stage="execute", auto=True)
+        r = runner.launch(tmp_path, env, "PRJ-003", step="step-000001", auto=True)
     cmd = m.call_args[0][0]
-    assert "--stage" in cmd and "execute" in cmd
+    assert "--step" in cmd and "step-000001" in cmd
     assert "--rerun" not in cmd
-    assert "--auto" not in cmd   # stage mode takes precedence over auto
-    assert r["stage"] == "execute" and r["rerun"] is False
+    assert "--auto" not in cmd   # step mode takes precedence over auto
+    assert r["step"] == "step-000001" and r["rerun"] is False
 
 
-def test_launch_stage_rerun_includes_rerun_flag(tmp_path):
+def test_launch_step_rerun_includes_rerun_flag(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
          patch("harn.runner.os.kill"):
-        r = runner.launch(tmp_path, env, "PRJ-004", stage="verify", rerun=True)
+        r = runner.launch(tmp_path, env, "PRJ-004", step="step-000002", rerun=True)
     cmd = m.call_args[0][0]
-    assert "--stage" in cmd and "verify" in cmd and "--rerun" in cmd
-    assert r["stage"] == "verify" and r["rerun"] is True
+    assert "--step" in cmd and "step-000002" in cmd and "--rerun" in cmd
+    assert r["step"] == "step-000002" and r["rerun"] is True
 
 
-def test_active_reports_stage_info(tmp_path):
+def test_active_reports_step_info(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(555)), \
          patch("harn.runner.os.kill"):
-        runner.launch(tmp_path, env, "PRJ-005", stage="oracle")
+        runner.launch(tmp_path, env, "PRJ-005", step="step-000003")
         cur = runner.active(env)
-        assert cur["stage"] == "oracle"
+        assert cur["step"] == "step-000003"
 
 
 def test_launch_refuses_when_already_active(tmp_path):

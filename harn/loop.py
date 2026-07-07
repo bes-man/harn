@@ -928,16 +928,65 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
     return "ok"
 
 
-def run_stage(project_root: Path, env_dir: Path, task_id: str, stage: str,
-             *, rerun: bool = False) -> dict:
-    """Deprecated: the fixed six-stage pipeline is gone. Task 5 rewrites this as
-    `run_step` (run/rerun ONE step of the task's own workflow plan by step id).
+def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
+            *, rerun: bool = False) -> dict:
+    """Run (or rerun) exactly ONE step of a task's own workflow plan, outside
+    `run()`'s full multi-step cycle — the studio UI's per-step Run/Rerun
+    controls and `harn run --task ID --step STEP_ID [--rerun]`.
 
-    Kept as an importable stub so the module loads and callers get a clear
-    error until Task 5 lands.
+    `rerun=True` first restores the working tree to that step's own git
+    checkpoint (see `_checkpoint_stage`/gitutil.checkpoint), discarding
+    whatever that step's last attempt changed, before running it again.
+    Best-effort: no prior checkpoint (or no git repo) just skips the restore
+    rather than failing the run.
     """
-    return {"ok": False,
-            "error": "run_stage was replaced; use run_step (see Task 5)"}
+    cfg = Config.load(env_dir)
+    task = tasks.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task '{task_id}'"}
+
+    plan = workflows.load_task_plan(env_dir, task_id) \
+        or workflows.snapshot_for_task(env_dir, task_id, task.workflow)
+    step = next((n for n in plan["nodes"]
+                 if n.get("kind") == "step" and n.get("id") == step_id), None)
+    if step is None:
+        return {"ok": False, "error": f"unknown step id {step_id!r}"}
+    title = step.get("title", "")
+
+    if rerun:
+        ref = task.stage_checkpoints.get(step_id)
+        if ref:
+            gitutil.rollback_to(ref, project_root, apply=True)
+
+    adapter = _pick_adapter(cfg)
+    step_adapter = _adapter_for_step(cfg, step, adapter)
+
+    if not task.baseline_ref:
+        tasks.set_baseline(task, gitutil.head(project_root))
+
+    started = tasks._now_iso()
+    task.step_results[step_id] = {"status": "running", "started": started,
+                                  "ended": None}
+    tasks._save(task)
+    _checkpoint_stage(project_root, task, step_id)
+
+    tok_totals: dict = {}
+    tok_costs: dict = {}
+    result = _run_turn(
+        step_adapter, env_dir,
+        _build_step_prompt(env_dir, cfg, task, step),
+        project_root, task_id=task_id, stage=step_id, step_title=title,
+        overrides=_step_overrides(cfg, step),
+        tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+
+    task = tasks.find(env_dir, task_id) or task
+    task.step_results[step_id] = {"status": "ok" if result.ok else "failed",
+                                  "started": started, "ended": tasks._now_iso(),
+                                  "tokens": result.total_tokens}
+    tasks._save(task)
+
+    return {"ok": bool(result.ok), "step_id": step_id, "title": title,
+            "text": result.text}
 
 
 def _run_end(env_dir: Path, st: "state.State") -> str:
