@@ -12,6 +12,10 @@ from harn import loop, tasks
 from .conftest import make_task
 
 
+_STEP = {"kind": "step", "id": "step-000001", "title": "Implement",
+         "body": "do the work", "required": [], "tools": [], "enabled": True}
+
+
 def _env(tmp_path: Path) -> Path:
     env = tmp_path / "harn_env"
     env.mkdir()
@@ -80,7 +84,7 @@ def test_continuity_block_in_executor_prompt(tmp_path):
     t = tasks.find(env, "PRJ-001")
 
     cfg = loop.Config.load(env)
-    prompt = loop._build_prompt(env, cfg, t)
+    prompt = loop._build_step_prompt(env, cfg, t, _STEP)
     assert "REMEMBER: indexes pending" in prompt
     assert "Use sqlite" in prompt
     assert "Decisions you've already made" in prompt
@@ -112,6 +116,6 @@ def test_scratchpad_absent_means_no_block(tmp_path):
     (env / "harn.toml").write_text('[harn]\nagent = "fake"\n')
     t = make_task(env, "PRJ-001")
     cfg = loop.Config.load(env)
-    prompt = loop._build_prompt(env, cfg, t)
+    prompt = loop._build_step_prompt(env, cfg, t, _STEP)
     assert "continuity" not in prompt.lower()
     assert "Decisions you've already made" not in prompt

@@ -16,14 +16,12 @@ from __future__ import annotations
 import re
 import subprocess
 import time
-from dataclasses import dataclass
-from typing import Callable
 from pathlib import Path
 
-from . import browser, design as design_mod, events, gitutil, progress, \
+from . import design as design_mod, events, gitutil, progress, \
     prd as prd_mod, semble_bridge, skills, state, tasks, workflows
 from .adapters import Adapter, get_adapter
-from .config import Config, MODEL_STAGES
+from .config import Config
 from .feedback import run_feedback
 from .notify import notify
 from .telegram import TelegramHIL
@@ -37,50 +35,31 @@ _APPROVE_WORDS = {
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline graph — the per-task stages as DATA (single source of truth)
+# `harn explain` — the ACTIVE workflow's enabled steps (predictability before
+# running). The engine walks each task's own plan; this renders the project
+# default (WORKFLOW.md) so you can SEE what will run before running it.
 # --------------------------------------------------------------------------- #
-# The loop below walks these stages; what's optional and what gates it lives
-# HERE, not scattered across `if cfg.x:` checks. `harn explain` renders this for
-# the current config so you can SEE what will run before running it, and the
-# loop emits `gate_skipped` for every stage a config turns off.
-@dataclass(frozen=True)
-class Stage:
-    name: str
-    gate: Callable[[Config], bool]   # does this stage run for a given config?
-    desc: str
-    optional: bool = True            # False = always runs (can't be gated off)
-
-
-PIPELINE: list[Stage] = [
-    Stage("plan",      lambda c: c.planning,        "Clarify + lock spec (funnel)"),
-    Stage("execute",   lambda c: True,              "Implement the task", optional=False),
-    Stage("test",      lambda c: bool(c.test_cmd) or c.require_tests,
-          "Run the test command + missing-tests gate"),
-    Stage("verify",    lambda c: c.verify,          "Check each acceptance criterion"),
-    Stage("ui_verify", lambda c: c.browser_enabled, "Drive the live UI via Playwright"),
-    Stage("oracle",    lambda c: c.oracle,          "Independent correctness review"),
-    Stage("reconcile", lambda c: True,
-          "Capture learnings + changelog", optional=False),
-]
-
-
-def active_stages(cfg: Config) -> list[Stage]:
-    """The stages that will run for this config (gates applied)."""
-    return [s for s in PIPELINE if s.gate(cfg)]
-
-
-def explain(cfg: Config) -> str:
-    """Human-readable view of the pipeline for a given config — what runs, what's
-    gated off, in order. Powers `harn explain` (predictability before running)."""
-    lines = ["Pipeline for this config (todo → in_progress → review → done):"]
-    for i, s in enumerate(PIPELINE, 1):
-        on = s.gate(cfg)
+def explain(env_dir: Path, cfg: Config) -> str:
+    """Human-readable view of the ACTIVE workflow — its enabled steps, in order,
+    with each step's agent/model override (or the run default). Powers
+    `harn explain`."""
+    from . import workflow as workflow_mod
+    parsed = workflow_mod.parse(env_dir)
+    steps = [n for n in parsed.get("nodes", []) if n.get("kind") == "step"]
+    default_agent = cfg.agent_chain[0] if cfg.agent_chain else "?"
+    default_model = cfg.model or "default"
+    lines = ["Workflow for this task (todo → in_progress → review → done):"]
+    n = 0
+    for s in steps:
+        on = s.get("enabled", True) is not False
         mark = "✓" if on else "·"
-        if not s.optional:
-            tag = "always"
-        else:
-            tag = "on" if on else "off"
-        lines.append(f"  {i}. [{mark}] {s.name:<10} {s.desc}  ({tag})")
+        n += 1
+        agent = (s.get("agent") or "").strip() or default_agent
+        model = (s.get("model") or "").strip() or default_model
+        lines.append(f"  {n}. [{mark}] {s.get('title', '')} "
+                     f"({agent} / {model})")
+    if n == 0:
+        lines.append("  (no steps defined in WORKFLOW.md)")
     return "\n".join(lines)
 
 
@@ -146,72 +125,6 @@ def _autonomy_note(level: float) -> str:
     """Translate the 0.0–1.0 autonomy level into a behavioural directive."""
     from .config import autonomy_directive
     return autonomy_directive(level)
-
-# Max consecutive planning turns per task before harn proceeds to execution
-# even without an explicit lock_spec — a backstop against a non-locking agent
-# burning the iteration budget on the funnel.
-_MAX_PLAN_TURNS = 3
-
-
-def _planning_instructions(cfg: Config) -> str:
-    hint = semble_bridge.planning_hint(cfg)
-    search_step = (
-        "\n2. **Search existing patterns**: " + hint.splitlines()[-1]
-        if hint else ""
-    )
-    n = 3 if hint else 2
-    return f"""\
-## PLANNING PHASE — a funnel, not a code session (write no code yet)
-
-Goal: NARROW the task from many possible interpretations down to ONE verified,
-unambiguous spec. Each question should eliminate the most uncertainty; after
-each answer, DROP the options it ruled out. Converge, then lock.
-
-{hint}
-
-1. **Read** the task and every referenced PRD carefully.{search_step}
-{n}. **Funnel the ambiguity**: surface the HIGHEST-LEVERAGE open question first \
-(the one whose answer collapses the most branches), via `ask_user` (expanded: \
-context + 2-3 options + your recommendation). One at a time — never dump a \
-questionnaire. After each answer, narrow scope and discard the rejected options. \
-Repeat only while real ambiguity remains. Never guess on scope.
-{n+1}. **Lock the spec**: when nothing material is left open, call `lock_spec` \
-with the final `done_when` (concrete, independently verifiable criteria — one \
-observable fact per line), the chosen `approach` (rejected alternatives dropped), \
-and the `decisions` you settled with the human. This is the funnel's output: a \
-tight spec the executor implements verbatim, so the full PRD need not be re-read.
-{n+2}. **Skills**: confirm the task's `skills` covers what the executor needs; \
-`update_task` if not.
-
-Do NOT touch the codebase. End the turn by calling `lock_spec`. Planning is \
-complete once the spec is locked.
-"""
-
-
-def _design_instructions(cfg: Config, task: tasks.Task) -> str:
-    """Planning-phase step for user-facing tasks: mockup before code."""
-    if not cfg.design:
-        return ""
-    return f"""\
-## DESIGN — only if this task has a user-facing surface
-
-If the task changes or creates anything the user will SEE (a page, screen,
-component, dashboard, form), produce the interface design BEFORE implementation:
-
-1. Generate a single-file static HTML mockup of the final interface — inline
-   CSS, realistic sample data, every state the acceptance criteria mention —
-   and save it with the `save_design` MCP tool (it lands in
-   `harn_env/design/{task.id}.html`).
-2. Confirm it with the human: call `ask_user` summarising the mockup (layout,
-   key elements, flows) and pointing at the file. Iterate until approved.
-3. Ensure the task's `skills` list includes "ui" (via `update_task`) so the
-   browser-verification phase runs on this task.
-
-Once approved, the mockup is the visual contract: the executor builds to it and
-the verification phases check the real UI against it. If the task has no
-user-facing surface, skip this section entirely.
-"""
-
 
 def _design_block(env_dir: Path, task_id: str, max_chars: int = 4000) -> str:
     """The approved mockup, injected into executor/oracle/UI-verify prompts."""
@@ -337,28 +250,6 @@ def _missing_tests(project_root: Path) -> bool:
             and not _TEST_FILE_RE.search(f)]
     tests_touched = any(_TEST_FILE_RE.search(f) for f in files)
     return bool(code) and not tests_touched
-
-
-def _build_planning_prompt(env_dir: Path, cfg: Config, task: tasks.Task) -> str:
-    agents_md = env_dir.parent / "AGENTS.md"
-    base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-    task_body = _task_spec(task)
-
-    parts: list[str] = [base]
-    if task.prds:
-        prd_parts = []
-        for pid in task.prds:
-            p = prd_mod.find(env_dir, pid)
-            prd_parts.append(
-                _prd_excerpt(p, _PRD_PLAN_MAX) if p
-                else f"### PRD: {pid}\n(not found — create `harn_env/prd/{pid}.md`)"
-            )
-        parts.append("## Referenced PRDs\n" + "\n\n---\n\n".join(prd_parts))
-    parts.append(f"## Task to clarify — {task.id}\n" + task_body)
-    parts.append(_autonomy_note(cfg.autonomy))
-    parts.append(_planning_instructions(cfg))
-    parts.append(_design_instructions(cfg, task))
-    return "\n\n".join(p for p in parts if p.strip())
 
 
 def _build_oracle_prompt(
@@ -554,217 +445,6 @@ def _decisions_to_verify(task: tasks.Task) -> str:
     return "\n".join(lines)
 
 
-def _build_prompt(
-    env_dir: Path, cfg: Config, task: tasks.Task, feedback_tail: str = "",
-    auto: bool = False,
-) -> str:
-    state_dir = env_dir / "state"
-    agents_md = env_dir.parent / "AGENTS.md"
-    base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-    task_body = _task_spec(task)
-
-    # Prompt is ordered STABLE-FIRST, VOLATILE-LAST so the agent CLI's automatic
-    # prompt caching (Anthropic 5-min prefix cache) reuses the longest possible
-    # prefix across turns. Keep per-turn-changing content (board, progress,
-    # answers, feedback) at the END — see the volatile tail below. Do NOT move
-    # volatile blocks up here or every turn busts the cache for everything after.
-    parts: list[str] = [base]
-
-    if auto:
-        parts.append(_AUTO_NOTE)
-
-    if cfg.loop_aware:
-        parts.append(_LIFECYCLE_NOTE)
-
-    parts.append(
-        "## Available skills (load only what you need)\n"
-        "Read a skill's full text via the harn `read_skill` tool ONLY when the "
-        "task calls for it, to keep the context window small:\n" + skills.index(env_dir)
-    )
-    # Flag domains the task needs but no skill covers; tell the agent to bootstrap.
-    from . import skill_library
-    gap_note = skill_library.gap_note(env_dir, task)
-    if gap_note:
-        parts.append(gap_note)
-    # Persistent AS-IS knowledge: the service registry index (or the
-    # instruction to seed it) — answers the AS-IS step without re-indexing.
-    from . import codebase as codebase_mod
-    parts.append(codebase_mod.prompt_note(env_dir))
-    # Inject PRD context. Once the funnel has locked the spec, the task already
-    # carries the distilled criteria — inject only a COMPACT reference and let
-    # the agent `read_prd` on demand (big recurring token saving, no fidelity
-    # loss). Before lock (planning), inject the full PRD so questions converge.
-    if task.prds:
-        if task.spec_locked:
-            refs: list[str] = []
-            for prd_id in task.prds:
-                p = prd_mod.find(env_dir, prd_id)
-                if p:
-                    why = (p.sections.get("Problem")
-                           or p.sections.get("Goal") or "").strip().splitlines()
-                    one = (why[0] if why else "")[:160]
-                    refs.append(f"- **{p.id}** — {p.title}: {one} "
-                                f"(`read_prd(\"{p.id}\")` for full text)")
-                else:
-                    refs.append(f"- **{prd_id}** (missing — create "
-                                f"`harn_env/prd/{prd_id}.md`)")
-            parts.append(
-                "## Task lineage (spec locked — PRD on demand)\nThe `## Done "
-                "when` below is the verified, narrowed spec. Implement exactly "
-                "that; read a PRD only if you need the deeper why:\n"
-                + "\n".join(refs))
-        else:
-            prd_parts: list[str] = []
-            for prd_id in task.prds:
-                p = prd_mod.find(env_dir, prd_id)
-                if p:
-                    prd_parts.append(_prd_excerpt(p, _PRD_INLINE_MAX))
-                else:
-                    prd_parts.append(
-                        f"### PRD: {prd_id}\n(file not found — create "
-                        f"`harn_env/prd/{prd_id}.md`)")
-            prd_header = (
-                f"This task belongs to PRD(s): **{', '.join(task.prds)}**. "
-                "Read them for the why, scope, and acceptance criteria.")
-            if task.epic:
-                prd_header += f" Epic: `{task.epic}`."
-            if task.user_story:
-                prd_header += f" User story: `{task.user_story}`."
-            hint = prd_mod.normalisation_hint(
-                [p for pid in task.prds
-                 for p in ([prd_mod.find(env_dir, pid)] if prd_mod.find(env_dir, pid) else [])]
-            )
-            parts.append(
-                "## Task lineage\n" + prd_header
-                + ("\n\n" + hint if hint else "")
-                + "\n\n" + "\n\n---\n\n".join(prd_parts))
-    parts.append(f"## Current task — {task.id} (status: {task.status})\n" + task_body)
-    dz = _design_block(env_dir, task.id)
-    if dz:
-        parts.append(dz)
-    cont = _continuity_block(task)
-    if cont:
-        parts.append(cont)
-    if not auto:
-        parts.append(_autonomy_note(cfg.autonomy))
-    parts.append(
-        "## Rules\n"
-        "- When unsure, follow the autonomy level above: ask via the harn "
-        "`ask_user` tool (or write `harn_env/state/BLOCKED.md` and end your turn) "
-        "rather than guessing on anything you shouldn't decide alone.\n"
-        "- " + _ASK_GUIDANCE + "\n"
-        "- If this task is `changes_requested`, read its Review log and address "
-        "the reviewer's comment.\n"
-        "- When the task is complete and tests pass, say what you did so the "
-        "human can review it."
-    )
-    # --- Volatile tail (changes every turn → kept last for cache hits) -------
-    if cfg.loop_aware:
-        parts.append("## Task board\n" + tasks.board(env_dir))
-        prog = progress.tail(env_dir)
-        if prog:
-            parts.append("## Progress so far (shared across agents)\n" + prog)
-        answers = _answers_tail(state_dir)
-        if answers:
-            parts.append("## Earlier answers from the human\n" + answers)
-    if feedback_tail:
-        parts.append("## Last feedback (tests)\n```\n" + feedback_tail + "\n```")
-    return "\n\n".join(p for p in parts if p.strip())
-
-
-_VERIFY_INSTRUCTIONS = (
-    "## You are VERIFYING — do not start new work\n"
-    "This is a verification pass for the task above, before it goes to a human.\n"
-    "1. Re-read the task's acceptance criteria (its 'Done when' / scope).\n"
-    "2. Check the ACTUAL implementation satisfies EACH criterion — not just that "
-    "tests pass. Use `run_tests` and read the relevant code.\n"
-    "3. If something is missing, wrong, or low-quality and you can safely fix it "
-    "now, fix it.\n"
-    "4. If resolving it needs a human decision (ambiguous, risky, a product "
-    "choice), call `ask_user` with an EXPANDED question (context + options + your "
-    "recommendation) and STOP.\n"
-    "5. End your reply with exactly one line: `VERIFY: PASS` (criteria met) or "
-    "`VERIFY: FAIL` (gaps remain)."
-)
-
-
-def _build_verify_prompt(
-    env_dir: Path, cfg: Config, task: tasks.Task, auto: bool = False
-) -> str:
-    # AGENTS.md intentionally omitted: verify has its own focused instructions
-    # (~1.3k tokens saved per verify turn).
-    task_body = _task_spec(task)
-    parts = [
-        _HARN_TOOLS_HINT,
-        f"## Task under verification — {task.id}\n" + task_body,
-        _continuity_block(task),
-        _VERIFY_INSTRUCTIONS,
-        _AUTO_NOTE if auto else _ASK_GUIDANCE,
-    ]
-    return "\n\n".join(p for p in parts if p.strip())
-
-
-def _verify_verdict(text: str) -> str:
-    """'fail' only on an explicit VERIFY: FAIL; else 'pass' (lenient)."""
-    t = (text or "").lower()
-    if "verify: fail" in t and "verify: pass" not in t:
-        return "fail"
-    return "pass"
-
-
-# --------------------------------------------------------------------------- #
-# Browser verification (Playwright MCP) — check the criteria in the LIVE app
-# --------------------------------------------------------------------------- #
-def _ui_applicable(env_dir: Path, task: tasks.Task) -> bool:
-    """A task gets the browser pass when it has an approved design or is
-    explicitly tagged with the 'ui' skill (the planner sets one of the two)."""
-    return design_mod.exists(env_dir, task.id) or "ui" in task.skills
-
-
-def _build_ui_verify_prompt(
-    env_dir: Path, cfg: Config, task: tasks.Task, shots_dir: Path,
-    auto: bool = False,
-) -> str:
-    # AGENTS.md intentionally omitted: UI-verify has its own focused instructions.
-    instructions = f"""\
-## You are VERIFYING THE LIVE UI — do not start new work
-
-The app is RUNNING at **{cfg.app_url}**. Use the Playwright MCP tools
-(`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
-`browser_take_screenshot`, …) to check the task's acceptance criteria against
-the real interface, the way a user would:
-
-1. Walk EVERY user-visible acceptance criterion in the task's `## Done when` —
-   navigate, click, fill forms, observe the result. Not just the happy path:
-   try empty input, wrong input, repeated submits where the criteria imply them.
-2. Take a screenshot of each verified state and save it under `{shots_dir}`
-   (one file per criterion, named after what it shows).
-3. If there is an approved design above, compare what you see against it —
-   layout, key elements, states must match.
-4. If something is broken or diverges and you can safely fix it in code, fix it
-   (the loop will re-run tests). If it needs a human decision, call `ask_user`
-   (expanded) and STOP.
-5. End your reply with exactly one line: `UI: PASS` or `UI: FAIL — <reason>`.
-"""
-    parts = [
-        _HARN_TOOLS_HINT,
-        f"## Task under UI verification — {task.id}\n" + _task_spec(task),
-        _design_block(env_dir, task.id),
-        _continuity_block(task),
-        instructions,
-        _AUTO_NOTE if auto else _ASK_GUIDANCE,
-    ]
-    return "\n\n".join(p for p in parts if p.strip())
-
-
-def _ui_verdict(text: str) -> str:
-    """'fail' only on an explicit UI: FAIL; else 'pass' (lenient)."""
-    t = (text or "").lower()
-    if "ui: fail" in t and "ui: pass" not in t:
-        return "fail"
-    return "pass"
-
-
 # --------------------------------------------------------------------------- #
 # Token accounting (best-effort: only agents that report usage, e.g. Claude)
 # --------------------------------------------------------------------------- #
@@ -773,32 +453,6 @@ def _accumulate(totals: dict, costs: dict, task_id: str, r) -> None:
         totals[task_id] = totals.get(task_id, 0) + r.total_tokens
     if r.cost_usd is not None:
         costs[task_id] = costs.get(task_id, 0.0) + r.cost_usd
-
-
-def _stage_overrides(cfg: Config, stage: str) -> dict:
-    """This stage's {model, effort, temperature} kwargs for adapter.run_turn,
-    from harn.toml's `[models.<stage>]` (Config.stage_models). The per-stage
-    `agent` key is NOT a run_turn kwarg (it selects the CLI — see
-    _adapter_for_stage) so it's stripped here. A missing model falls back to
-    the global default (`[harn] model` / Config.model)."""
-    ov = {k: v for k, v in cfg.stage_models.get(stage, {}).items() if k != "agent"}
-    if not ov.get("model") and cfg.model:
-        ov["model"] = cfg.model
-    return ov
-
-
-def _adapter_for_stage(cfg: Config, stage: str, default: Adapter) -> Adapter:
-    """The adapter that runs this stage: its per-stage `agent` override
-    (harn.toml's `[models.<stage>] agent = "cursor"`) if set and known,
-    otherwise the run's default adapter. Provider-agnostic — lets e.g. plan
-    run on one CLI and execute on another."""
-    name = (cfg.stage_models.get(stage, {}) or {}).get("agent", "").strip()
-    if not name or name == default.name:
-        return default
-    try:
-        return get_adapter(name)
-    except ValueError:
-        return default
 
 
 def _step_overrides(cfg: Config, step: dict) -> dict:
@@ -832,7 +486,7 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
                        auto: bool = False) -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
-    stage-specific builders). Structure mirrors _build_prompt: stable
+    stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
     instructions in the middle, volatile tail (board/progress/feedback)
     last for prompt-cache reuse."""
@@ -897,7 +551,8 @@ def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> Non
 
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
               task_id: str, stage: str, tok_totals: dict, tok_costs: dict,
-              cfg: Config, verdict: str | None = None):
+              cfg: Config, verdict: str | None = None,
+              overrides: dict | None = None, step_title: str | None = None):
     """Run one agent turn and emit a structured stage_start/stage_end pair.
 
     Centralising the run_turn call guarantees that EVERY completed agent cycle
@@ -905,15 +560,17 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     summary) in events.jsonl — the observability spine. `_accumulate` is folded
     in so callers keep their running token tally. Re-raises after logging an
     `error` event so the loop's own handling is unchanged.
+
+    `stage` is the step id (the workflow node's stable key); `step_title` is
+    that step's human title, emitted alongside so the trace reads clearly.
+    `overrides` are the run_turn kwargs (model/effort/temperature) for this
+    step — the caller passes `_step_overrides(cfg, step)`.
     """
-    # Per-stage agent override (provider-agnostic): a stage can run on a
-    # different CLI than the run's default — see _adapter_for_stage.
-    adapter = _adapter_for_stage(cfg, stage, adapter)
     events.emit(env_dir, "stage_start", task_id=task_id, stage=stage,
-                agent=adapter.name)
+                agent=adapter.name, step_title=step_title)
     t0 = time.time()
     try:
-        res = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, stage))
+        res = adapter.run_turn(prompt, project_root, **(overrides or {}))
     except Exception as e:
         events.emit(env_dir, "error", task_id=task_id, stage=stage,
                     detail=str(e)[:300])
@@ -922,7 +579,7 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     _accumulate(tok_totals, tok_costs, task_id, res)
     lines = [ln for ln in (res.text or "").strip().splitlines() if ln.strip()]
     events.emit(env_dir, "stage_end", task_id=task_id, stage=stage,
-                agent=adapter.name, ok=res.ok,
+                agent=adapter.name, ok=res.ok, step_title=step_title,
                 tok_in=res.input_tokens, tok_out=res.output_tokens,
                 cost_usd=res.cost_usd, dur_ms=dur_ms, verdict=verdict,
                 summary=(lines[-1][:200] if lines else None))
@@ -1103,103 +760,6 @@ def _review_gate(
 # --------------------------------------------------------------------------- #
 # The loop
 # --------------------------------------------------------------------------- #
-def _run_verify(adapter, env_dir, cfg, task, project_root, st, state_dir, auto,
-                tok_totals, tok_costs) -> str:
-    """Run the verification turn. Returns 'ok', 'resumed', 'blocked', or 'loop'
-    (caller should rework the same task)."""
-    st.transition(state.VERIFYING)
-    st.save(state_dir)
-    if not auto:
-        progress.log(env_dir, f"{task.id}: verifying against acceptance criteria",
-                     agent=adapter.name)
-    print(f"[harn] Verifying '{task.id}'…")
-    _checkpoint_stage(project_root, task, "verify")
-    vres = _run_turn(adapter, env_dir,
-                     _build_verify_prompt(env_dir, cfg, task, auto=auto),
-                     project_root, task_id=task.id, stage="verify",
-                     tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-    print(vres.text[-1500:] if vres.text else "(verify: no output)")
-    if not auto and vres.usage_str():
-        progress.log(env_dir, f"{task.id}: verify used {vres.usage_str()}",
-                     agent=adapter.name)
-
-    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
-    if b == "resumed":
-        return "resumed"
-    if b == "blocked":
-        return "blocked"
-    if b == "auto":
-        return "loop"
-
-    fb = run_feedback(cfg.test_cmd, project_root)
-    if fb.ran and not fb.ok:
-        print("[harn] Verify left tests failing; looping to fix.")
-        return "loop"
-    if _verify_verdict(vres.text) == "fail":
-        if not auto:
-            progress.log(env_dir, f"{task.id}: verify found gaps; reworking",
-                         agent=adapter.name)
-        print("[harn] Verify reported gaps; looping to address them.")
-        return "loop"
-    return "ok"
-
-
-def _run_ui_verify(adapter, env_dir, cfg, task, project_root, st, state_dir,
-                   auto, tok_totals, tok_costs) -> str:
-    """Run the browser-verification turn against the live app. Returns 'ok',
-    'resumed', 'blocked', 'loop' (rework), or 'skipped' (app not reachable —
-    surfaced to PROGRESS, never blocks the pipeline)."""
-    app = browser.start_app(cfg.app_cmd, cfg.app_url, project_root,
-                            cfg.ready_timeout_s)
-    if not app.ready:
-        progress.log(env_dir,
-                     f"{task.id}: browser verify SKIPPED — {app.error}",
-                     agent=adapter.name)
-        print(f"[harn] Browser verify skipped: {app.error}")
-        return "skipped"
-
-    st.transition(state.UI_VERIFYING)
-    st.save(state_dir)
-    shots_dir = env_dir / "state" / "screenshots" / task.id
-    shots_dir.mkdir(parents=True, exist_ok=True)
-    if not auto:
-        progress.log(env_dir, f"{task.id}: verifying the live UI via Playwright",
-                     agent=adapter.name)
-    print(f"[harn] Browser-verifying '{task.id}' at {cfg.app_url}…")
-    _checkpoint_stage(project_root, task, "ui_verify")
-    try:
-        ures = _run_turn(adapter, env_dir,
-                         _build_ui_verify_prompt(env_dir, cfg, task, shots_dir, auto=auto),
-                         project_root, task_id=task.id, stage="ui_verify",
-                         tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-    finally:
-        app.stop()
-    print(ures.text[-1500:] if ures.text else "(ui verify: no output)")
-    if not auto and ures.usage_str():
-        progress.log(env_dir, f"{task.id}: ui verify used {ures.usage_str()}",
-                     agent=adapter.name)
-
-    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
-    if b in ("resumed", "blocked"):
-        return b
-    if b == "auto":
-        return "loop"
-
-    fb = run_feedback(cfg.test_cmd, project_root)
-    if fb.ran and not fb.ok:
-        print("[harn] UI verify left tests failing; looping to fix.")
-        return "loop"
-    if _ui_verdict(ures.text) == "fail":
-        if not auto:
-            progress.log(env_dir, f"{task.id}: UI verify found gaps; reworking",
-                         agent=adapter.name)
-        print("[harn] UI verify reported gaps; looping to address them.")
-        return "loop"
-    if not auto:
-        progress.log(env_dir, f"{task.id}: UI verify PASS", agent=adapter.name)
-    return "ok"
-
-
 def _pick_oracle_adapter(cfg: Config) -> "Adapter":
     """Return the oracle adapter (separate agent, or same as main)."""
     name = cfg.oracle_agent or cfg.agent_chain[0]
@@ -1219,9 +779,6 @@ def oracle_review(
     Returns (verdict, detail, result) where verdict is PASS / FAIL / DEBT.
     """
     adapter = adapter or _pick_oracle_adapter(cfg)
-    # A per-stage `[models.oracle] agent` override wins over the oracle_agent
-    # default (most-specific setting takes precedence).
-    adapter = _adapter_for_stage(cfg, "oracle", adapter)
     progress.log(env_dir, f"{task.id}: oracle reviewing…", agent=adapter.name)
     diff = _git_diff(project_root)
     prompt = _build_oracle_prompt(env_dir, cfg, task, diff)
@@ -1230,7 +787,8 @@ def oracle_review(
     _checkpoint_stage(project_root, task, "oracle")
     t0 = time.time()
     try:
-        ores = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "oracle"))
+        ores = adapter.run_turn(prompt, project_root,
+                                **({"model": cfg.model} if cfg.model else {}))
     except Exception as e:  # never let the oracle crash the dispatcher
         progress.log(env_dir, f"{task.id}: oracle error: {e}", agent=adapter.name)
         events.emit(env_dir, "error", task_id=task.id, stage="oracle",
@@ -1265,22 +823,6 @@ def oracle_review(
             ts=tasks._now_iso(), event="oracle_pass", agent=adapter.name))
         tasks._save(task)
     return (verdict, detail, ores)
-
-
-def _run_oracle(
-    oracle_adapter, env_dir: Path, cfg: Config, task: tasks.Task,
-    project_root: Path, st: "state.State", state_dir: Path,
-    tok_totals: dict, tok_costs: dict,
-) -> str:
-    """In-loop oracle wrapper for `harn run`. Returns 'ok' | 'loop' | 'debt'."""
-    print(f"[harn] Oracle reviewing '{task.id}' ({oracle_adapter.name})…")
-    verdict, detail, ores = oracle_review(env_dir, cfg, task, project_root,
-                                          adapter=oracle_adapter)
-    if ores is not None:
-        _accumulate(tok_totals, tok_costs, task.id, ores)
-    if verdict == "FAIL":
-        return "loop"   # oracle_review set changes_requested; loop reworks it
-    return "debt" if verdict == "DEBT" else "ok"
 
 
 _RECONCILE_RULES = (
@@ -1320,39 +862,6 @@ def _build_reconcile_prompt(env_dir: Path, cfg: Config, task: tasks.Task) -> str
     return "\n\n".join(p for p in parts if p.strip())
 
 
-def _run_reconcile(
-    adapter, env_dir: Path, cfg: Config, task: tasks.Task,
-    project_root: Path, st: "state.State", state_dir: Path,
-    tok_totals: dict, tok_costs: dict,
-) -> str:
-    """Capture learnings into skills/standards after the agent's work.
-
-    Always runs (non-optional). If the agent calls ask_user for a trade-off,
-    the loop blocks on it — the answer is saved into the skill and the loop
-    resumes. Returns 'ok' or 'blocked'.
-    """
-    progress.log(env_dir, f"{task.id}: reconciling skills/standards",
-                 agent=adapter.name)
-    print(f"[harn] Reconciling skills for '{task.id}'…")
-    _checkpoint_stage(project_root, task, "reconcile")
-    rres = _run_turn(adapter, env_dir, _build_reconcile_prompt(env_dir, cfg, task),
-                     project_root, task_id=task.id, stage="reconcile",
-                     tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-    print(rres.text[-800:] if rres.text else "(reconcile: no output)")
-    if rres.usage_str():
-        progress.log(env_dir, f"{task.id}: reconcile used {rres.usage_str()}",
-                     agent=adapter.name)
-
-    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
-    if b == "resumed":
-        # A skill trade-off question was answered — skill is saved, continue.
-        st = state.State.load(state_dir)
-        return "resumed"
-    if b == "blocked":
-        return "blocked"
-    return "ok"
-
-
 def _auto_changelog(env_dir: Path, cfg: Config, task: tasks.Task,
                     summary: str = "") -> None:
     """Deterministic documentation backstop: guarantee a task leaves a changelog
@@ -1382,7 +891,7 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
     stamps a `reconciled` review_log marker so it runs once per task. The turn
     is told NOT to ask questions (no human in this headless path) — it captures
     only confident, factual learnings."""
-    adapter = _adapter_for_stage(cfg, "reconcile", adapter or _pick_adapter(cfg))
+    adapter = adapter or _pick_adapter(cfg)
     progress.log(env_dir, f"{task.id}: auto-reconciling (headless)…",
                  agent=adapter.name)
     prompt = (_build_reconcile_prompt(env_dir, cfg, task) +
@@ -1395,7 +904,8 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
                     agent=adapter.name)
         _checkpoint_stage(project_root, task, "reconcile")
         t0 = time.time()
-        rres = adapter.run_turn(prompt, project_root, **_stage_overrides(cfg, "reconcile"))
+        rres = adapter.run_turn(prompt, project_root,
+                                **({"model": cfg.model} if cfg.model else {}))
         events.emit(env_dir, "stage_end", task_id=task.id, stage="reconcile",
                     agent=adapter.name, dur_ms=int((time.time() - t0) * 1000),
                     tok_in=rres.input_tokens, tok_out=rres.output_tokens,
@@ -1420,88 +930,14 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
 
 def run_stage(project_root: Path, env_dir: Path, task_id: str, stage: str,
              *, rerun: bool = False) -> dict:
-    """Run (or rerun) exactly ONE real agent turn for one task, in isolation
-    from `run()`'s full multi-stage cycle.
+    """Deprecated: the fixed six-stage pipeline is gone. Task 5 rewrites this as
+    `run_step` (run/rerun ONE step of the task's own workflow plan by step id).
 
-    This is the studio UI's per-step Run/Rerun controls (and
-    `harn run --task ID --stage STAGE [--rerun]`) — a deliberately SIMPLER,
-    one-shot contract than the main loop: no planning-funnel turn limits, no
-    auto-mode branching, no advancing to the next stage afterward. It exists
-    for a human to force one specific stage to run again, not to replace
-    `harn run`'s own state machine.
-
-    `rerun=True` first restores the working tree to this stage's git
-    checkpoint (`gitutil.checkpoint`, captured right before its last attempt),
-    so the retry starts from EXACTLY that state instead of layering a new
-    attempt's changes on top of a half-finished previous one. Every real stage
-    (see `_checkpoint_stage`) captures its own checkpoint as part of running,
-    whether invoked from here or from the main loop — so a stage run via
-    `run_stage` is itself checkpointed too, and can be rerun again.
+    Kept as an importable stub so the module loads and callers get a clear
+    error until Task 5 lands.
     """
-    if stage not in MODEL_STAGES:
-        return {"ok": False,
-                "error": f"unknown stage '{stage}' (expected one of {', '.join(MODEL_STAGES)})"}
-    cfg = Config.load(env_dir)
-    task = tasks.find(env_dir, task_id)
-    if task is None:
-        return {"ok": False, "error": f"no task '{task_id}'"}
-
-    if rerun:
-        ref = task.stage_checkpoints.get(stage) or task.baseline_ref
-        if not ref:
-            return {"ok": False,
-                    "error": f"no checkpoint recorded for '{stage}' yet — run it once first"}
-        env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
-        res = gitutil.rollback_to(ref, project_root, apply=True, exclude=(env_rel + "/",))
-        if not res.ok:
-            return {"ok": False, "error": f"checkpoint restore failed: {res.message}"}
-        progress.log(env_dir, f"{task_id}: restored to '{stage}' checkpoint before rerunning")
-
-    adapter = _pick_oracle_adapter(cfg) if stage == "oracle" else _pick_adapter(cfg)
-    events.new_run(env_dir, kind="stage")
-    state_dir = env_dir / "state"
-    st = state.State.load(state_dir)
-    tok_totals: dict = {}
-    tok_costs: dict = {}
-
-    # plan/execute are inline in run()'s loop body (no reusable wrapper), so
-    # they checkpoint themselves here. verify/ui_verify/oracle/reconcile
-    # already checkpoint internally (_run_verify etc. — see _checkpoint_stage
-    # call sites) so run_stage doesn't duplicate that for them.
-    if stage == "plan":
-        _checkpoint_stage(project_root, task, "plan")
-        pres = _run_turn(adapter, env_dir, _build_planning_prompt(env_dir, cfg, task),
-                         project_root, task_id=task.id, stage="plan",
-                         tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-        return {"ok": pres.ok, "stage": stage, "text": (pres.text or "")[-2000:]}
-
-    if stage == "execute":
-        if not task.baseline_ref:
-            tasks.set_baseline(task, gitutil.head(project_root))
-        _checkpoint_stage(project_root, task, "execute")
-        res = _run_turn(adapter, env_dir, _build_prompt(env_dir, cfg, task, "", auto=False),
-                        project_root, task_id=task.id, stage="execute",
-                        tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-        return {"ok": res.ok, "stage": stage, "text": (res.text or "")[-2000:]}
-
-    if stage == "verify":
-        outcome = _run_verify(adapter, env_dir, cfg, task, project_root, st,
-                              state_dir, False, tok_totals, tok_costs)
-        return {"ok": True, "stage": stage, "outcome": outcome}
-
-    if stage == "ui_verify":
-        outcome = _run_ui_verify(adapter, env_dir, cfg, task, project_root, st,
-                                 state_dir, False, tok_totals, tok_costs)
-        return {"ok": True, "stage": stage, "outcome": outcome}
-
-    if stage == "oracle":
-        outcome = _run_oracle(adapter, env_dir, cfg, task, project_root, st,
-                              state_dir, tok_totals, tok_costs)
-        return {"ok": True, "stage": stage, "outcome": outcome}
-
-    outcome = _run_reconcile(adapter, env_dir, cfg, task, project_root, st,
-                             state_dir, tok_totals, tok_costs)
-    return {"ok": True, "stage": stage, "outcome": outcome}
+    return {"ok": False,
+            "error": "run_stage was replaced; use run_step (see Task 5)"}
 
 
 def _run_end(env_dir: Path, st: "state.State") -> str:
@@ -1533,13 +969,6 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     st = state.State.load(state_dir)
     adapter = _pick_adapter(cfg)
     events.new_run(env_dir, kind="auto" if auto else "loop")
-    # The pipeline graph (PIPELINE) is the single source of truth for which
-    # optional stages run. Record the gated-off ones once so the trace shows
-    # what this config disabled.
-    active = {s.name for s in active_stages(cfg)}
-    for s in PIPELINE:
-        if s.optional and s.name not in active:
-            events.emit(env_dir, "gate_skipped", stage=s.name, reason="config")
     if max_iterations is not None:
         limit = max_iterations
     elif auto:
@@ -1564,7 +993,10 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     tok_costs: dict[str, float] = {}
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
-    plan_turns: dict[str, int] = {}  # funnel turns per task (capped)
+    last_step_text = ""              # last step's output (for the review summary)
+    # In auto mode task files are never mutated, so step progress is tracked
+    # in memory instead of the on-disk ledger (task.step_results).
+    auto_done: dict[str, set] = {}
     for _ in range(limit):
         task = tasks.next_task(env_dir, exclude=handled, only=only_task)
         if task is None:
@@ -1588,181 +1020,146 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
 
         if task.id != working_id:
             working_id, feedback_tail = task.id, ""
-            # Render the task's chosen workflow into WORKFLOW.md BEFORE any turn,
-            # so every agent (Claude/Codex/Cursor) reads the right flow from the
-            # one file they all read. Empty → the project default.
-            active_wf = workflows.activate(env_dir, task.workflow)
+            last_step_text = ""
+            # Snapshot the task's OWN workflow plan (idempotent — from its chosen
+            # preset), then render it into WORKFLOW.md so every agent
+            # (Claude/Codex/Cursor) reads the exact flow this task will walk.
+            workflows.snapshot_for_task(env_dir, task.id, task.workflow)
+            workflows.activate_task(env_dir, task.id)
             if task.workflow:
-                progress.log(env_dir, f"{task.id}: workflow → {active_wf}",
+                progress.log(env_dir, f"{task.id}: workflow → {task.workflow}",
                              agent=adapter.name)
 
         was_rework = task.status == tasks.CHANGES_REQUESTED
-        is_new = not task.review_log      # never been touched → planning candidate
-
-        # ── PLANNING TURN(S) ─────────────────────────────────────────────────
-        # The clarification funnel: keep planning until the agent locks the spec
-        # (`lock_spec` → task.spec_locked). Multiple narrowing questions can span
-        # several turns. Skipped in auto mode and on rework (spec already locked).
-        # Capped at _MAX_PLAN_TURNS so a non-locking agent can't burn the budget;
-        # past the cap we proceed to execution with the current description.
-        if (cfg.planning and not task.spec_locked and not auto and not was_rework
-                and plan_turns.get(task.id, 0) < _MAX_PLAN_TURNS):
-            plan_turns[task.id] = plan_turns.get(task.id, 0) + 1
-            st.transition(state.PLANNING)
-            tasks.set_status(task, tasks.IN_PROGRESS)
-            if is_new:
-                task.review_log.append(tasks.ReviewEntry(
-                    ts=tasks._now_iso(), event="planning_started", agent=adapter.name,
-                ))
+        # On rework, the prior run's steps are all ledgered "ok"; clear them so
+        # the engine actually re-walks the plan to address the reviewer.
+        if was_rework and not auto and task.step_results:
+            task.step_results = {}
             tasks._save(task)
+
+        # The steps this task walks — its own plan's enabled step nodes, in order.
+        plan = workflows.load_task_plan(env_dir, task.id) or {"nodes": []}
+        steps = [n for n in plan.get("nodes", [])
+                 if n.get("kind") == "step" and n.get("enabled", True) is not False]
+
+        # A step is "done" when the on-disk ledger says ok (normal mode) or the
+        # in-memory set says so (auto mode never mutates task files).
+        done_ids = auto_done.setdefault(task.id, set())
+
+        def _step_done(sid: str) -> bool:
+            if auto:
+                return sid in done_ids
+            return task.step_results.get(sid, {}).get("status") == "ok"
+
+        # Find the first step not yet done (resume support).
+        pending = [s for s in steps if not _step_done(s.get("id"))]
+
+        if pending:
+            step = pending[0]
+            sid = step.get("id") or ""
+            title = step.get("title", "")
+            step_adapter = _adapter_for_step(cfg, step, adapter)
+
+            # ── STEP TURN ────────────────────────────────────────────────────
+            if not auto:
+                tasks.set_status(task, tasks.IN_PROGRESS)
+                # Capture a git baseline the first time real work starts, so the
+                # human can `harn rollback <id>` to redo the task from scratch.
+                if not task.baseline_ref:
+                    tasks.set_baseline(task, gitutil.head(project_root))
+                # log_started only on the very first step of the task (or rework).
+                first_step = not any(_step_done(s.get("id")) for s in steps)
+                if first_step:
+                    tasks.log_started(task, step_adapter.name, rework=was_rework)
+            st.transition(state.EXECUTING)
             st.current_task = task.id
             st.iterations += 1
             st.save(state_dir)
-            progress.log(env_dir, f"{task.id}: planning — clarifying requirements",
-                         agent=adapter.name)
-            print(f"[harn] Planning '{task.id}' ({task.title}) with {adapter.name}…")
+            if not auto:
+                if first_step:
+                    progress.log(
+                        env_dir,
+                        f"{task.id}: {'reworking' if was_rework else 'started'} "
+                        f"({task.title})",
+                        agent=step_adapter.name,
+                    )
+                progress.log(
+                    env_dir,
+                    f"{task.id}: {title} ({step_adapter.name})",
+                    agent=step_adapter.name,
+                )
+            print(f"[harn] {task.id} · {title} with {step_adapter.name}{mode}...")
 
-            _checkpoint_stage(project_root, task, "plan")
-            pres = _run_turn(adapter, env_dir,
-                             _build_planning_prompt(env_dir, cfg, task),
-                             project_root, task_id=task.id, stage="plan",
-                             tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-            print(pres.text[-2000:] if pres.text else "(planning: no output)")
-            if pres.usage_str():
-                progress.log(env_dir, f"{task.id}: planning used {pres.usage_str()}",
-                             agent=adapter.name)
+            started = tasks._now_iso()
+            if not auto:
+                task.step_results[sid] = {"status": "running",
+                                          "started": started, "ended": None}
+                tasks._save(task)
+            _checkpoint_stage(project_root, task, sid)
+            result = _run_turn(
+                step_adapter, env_dir,
+                _build_step_prompt(env_dir, cfg, task, step, feedback_tail, auto=auto),
+                project_root, task_id=task.id, stage=sid, step_title=title,
+                overrides=_step_overrides(cfg, step),
+                tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+            last_step_text = result.text or ""
+            print(result.text[-2000:] if result.text else "(no output)")
+            if not auto and result.usage_str():
+                progress.log(env_dir, f"{task.id}: {title} used {result.usage_str()}",
+                             agent=step_adapter.name)
 
-            b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
+            # 1) Did the agent block on a question? (re-runs the SAME step)
+            b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
             if b == "resumed":
                 st = state.State.load(state_dir)
-                continue
+                continue  # reload state, re-run the same step next iteration
             if b == "blocked":
+                if not auto:
+                    task.step_results[sid] = {**task.step_results.get(sid, {}),
+                                              "status": "blocked"}
+                    tasks._save(task)
                 return _run_end(env_dir, st)
-            # Reload task — the agent may have called lock_spec this turn.
-            task = tasks.find(env_dir, task.id) or task
-            if task.spec_locked:
-                progress.log(env_dir, f"{task.id}: spec locked — planning complete",
-                             agent=adapter.name)
+            if b == "auto":
+                feedback_tail = _AUTO_DECIDE_NOTE
+                continue  # let the agent decide and retry the same step
+
+            # 2) Feedback signal (project test command) — re-run the SAME step
+            fb = run_feedback(cfg.test_cmd, project_root)
+            feedback_tail = fb.tail()
+            if fb.ran and not fb.ok:
+                print("[harn] Tests failing; looping to let the agent fix them.")
+                continue  # same step, with failure as feedback
+
+            # 2b) Test-writing gate: code changed but no tests did → one nudge
+            #     (once per task; re-runs the SAME step with the nudge).
+            if (cfg.require_tests and task.id not in tests_nudged
+                    and _missing_tests(project_root)):
+                tests_nudged.add(task.id)
+                feedback_tail = _TESTS_NUDGE
+                if not auto:
+                    progress.log(env_dir,
+                                 f"{task.id}: code changed without tests; "
+                                 "asking the agent to add them",
+                                 agent=step_adapter.name)
+                print("[harn] Code changed without tests; looping to add them.")
+                continue  # same step, with the nudge as feedback
+
+            # Step done — ledger it and advance to the next step next iteration.
+            feedback_tail = ""
+            if auto:
+                done_ids.add(sid)
             else:
-                progress.log(env_dir, f"{task.id}: planning continues (spec not "
-                             "locked yet)", agent=adapter.name)
-            continue   # loop: execution if locked, else another planning turn
-
-        # ── EXECUTION TURN ────────────────────────────────────────────────────
-        if not auto:
-            tasks.set_status(task, tasks.IN_PROGRESS)
-            # Capture a git baseline the first time real work starts, so the
-            # human can `harn rollback <id>` to redo the task from scratch.
-            if not task.baseline_ref:
-                tasks.set_baseline(task, gitutil.head(project_root))
-            tasks.log_started(task, adapter.name, rework=was_rework)
-        st.transition(state.EXECUTING)
-        st.current_task = task.id
-        st.iterations += 1
-        st.save(state_dir)
-        if not auto:
-            progress.log(
-                env_dir,
-                f"{task.id}: {'reworking' if was_rework else 'started'} ({task.title})",
-                agent=adapter.name,
-            )
-        print(f"[harn] Working task '{task.id}' ({task.title}) with {adapter.name}{mode}...")
-
-        _checkpoint_stage(project_root, task, "execute")
-        result = _run_turn(adapter, env_dir,
-                           _build_prompt(env_dir, cfg, task, feedback_tail, auto=auto),
-                           project_root, task_id=task.id, stage="execute",
-                           tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
-        print(result.text[-2000:] if result.text else "(no output)")
-        if not auto and result.usage_str():
-            progress.log(env_dir, f"{task.id}: turn used {result.usage_str()}",
-                         agent=adapter.name)
-
-        # 1) Did the agent block on a question?
-        b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
-        if b == "resumed":
-            st = state.State.load(state_dir)
-            continue  # task stays in_progress → resumed next iteration
-        if b == "blocked":
-            return _run_end(env_dir, st)
-        if b == "auto":
-            feedback_tail = _AUTO_DECIDE_NOTE
-            continue  # let the agent decide and retry the same task
-
-        # 2) Feedback signal (project test command)
-        fb = run_feedback(cfg.test_cmd, project_root)
-        feedback_tail = fb.tail()
-        if fb.ran and not fb.ok:
-            print("[harn] Tests failing; looping to let the agent fix them.")
-            continue  # task stays in_progress → another turn
-
-        # 2b) Test-writing gate: code changed but no tests did → one nudge
-        if (cfg.require_tests and task.id not in tests_nudged
-                and _missing_tests(project_root)):
-            tests_nudged.add(task.id)
-            feedback_tail = _TESTS_NUDGE
-            if not auto:
-                progress.log(env_dir,
-                             f"{task.id}: code changed without tests; "
-                             "asking the agent to add them",
-                             agent=adapter.name)
-            print("[harn] Code changed without tests; looping to add them.")
-            continue  # same task, with the nudge as feedback
-
-        # 3) Verify the work against the task's acceptance criteria
-        if "verify" in active:
-            v = _run_verify(adapter, env_dir, cfg, task, project_root, st,
-                            state_dir, auto, tok_totals, tok_costs)
-            if v == "resumed":
-                st = state.State.load(state_dir)
+                task.step_results[sid] = {"status": "ok", "started": started,
+                                          "ended": tasks._now_iso(),
+                                          "tokens": result.total_tokens}
+                tasks._save(task)
+                task = tasks.find(env_dir, task.id) or task
+            # More steps remain? loop to run the next one.
+            if any(not _step_done(s.get("id")) for s in steps):
                 continue
-            if v == "blocked":
-                return _run_end(env_dir, st)
-            if v == "loop":
-                continue  # rework the same task
 
-        # 3a) Browser verification: drive the LIVE app through Playwright MCP
-        if "ui_verify" in active and _ui_applicable(env_dir, task):
-            u = _run_ui_verify(adapter, env_dir, cfg, task, project_root, st,
-                               state_dir, auto, tok_totals, tok_costs)
-            if u == "resumed":
-                st = state.State.load(state_dir)
-                continue
-            if u == "blocked":
-                return _run_end(env_dir, st)
-            if u == "loop":
-                continue  # rework the same task
-
-        # 3b) Oracle: independent agent checks correctness + technical debt
-        oracle_note = ""
-        if "oracle" in active and not auto:
-            oracle_adapter = _pick_oracle_adapter(cfg)
-            ov = _run_oracle(oracle_adapter, env_dir, cfg, task, project_root,
-                             st, state_dir, tok_totals, tok_costs)
-            if ov == "loop":
-                continue   # oracle found real failure → rework
-            if ov == "debt":
-                debt_entry = next(
-                    (e for e in reversed(task.review_log) if e.event == "oracle_debt"),
-                    None,
-                )
-                oracle_note = (
-                    f"\n\n⚠️ **Oracle flagged technical debt**: "
-                    f"{debt_entry.comment if debt_entry else '(see log)'}"
-                )
-            task = tasks.find(env_dir, task.id) or task   # reload after oracle writes
-
-        # 3c) Reconcile skills/standards — capture learnings before submitting
-        if not auto:
-            rv = _run_reconcile(adapter, env_dir, cfg, task, project_root, st,
-                                state_dir, tok_totals, tok_costs)
-            if rv == "blocked":
-                return _run_end(env_dir, st)
-            if rv == "resumed":
-                st = state.State.load(state_dir)
-                continue   # skill question answered; loop re-runs (execution
-                           # will be a no-op, verify will re-run cleanly)
-            task = tasks.find(env_dir, task.id) or task   # reload after reconcile
+        # ── ALL STEPS DONE ────────────────────────────────────────────────────
+        result_text = last_step_text
 
         # 4a) AUTO: executed, but never mutate the task track — record in memory
         if auto:
@@ -1777,8 +1174,9 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             continue
 
         # 4b) Submit for human review
+        oracle_note = ""
         usage = _usage_summary(tok_totals, tok_costs, task.id)
-        summary = (result.text or "").strip().splitlines()[-1:] or [""]
+        summary = (result_text or "").strip().splitlines()[-1:] or [""]
         # Deterministic documentation backstop: if reconcile didn't record a
         # change, guarantee one from the task's data before submitting.
         _auto_changelog(env_dir, cfg, task, summary[0][:200])
@@ -1795,7 +1193,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
         print(f"[harn] Task '{task.id}' submitted for review."
               + (f" Usage: {usage}" if usage else ""))
 
-        outcome = _review_gate(env_dir, cfg, task, result.text)
+        outcome = _review_gate(env_dir, cfg, task, result_text)
         working_id, feedback_tail = None, ""
         tok_totals.pop(task.id, None)
         tok_costs.pop(task.id, None)

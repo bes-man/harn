@@ -1,7 +1,9 @@
-"""Design artifacts: storage, prompt injection, planning instructions."""
-from __future__ import annotations
+"""Design artifacts: storage + injection into the oracle prompt.
 
-from pathlib import Path
+The executor/planning design-instruction injection went away with the fixed
+six-stage pipeline (Task 4); the design block still feeds the oracle review
+(`_build_oracle_prompt`, kept), which is what these tests now cover."""
+from __future__ import annotations
 
 from harn import design, loop, ENV_DIRNAME
 from harn.config import Config
@@ -17,16 +19,6 @@ def test_save_and_load_roundtrip(tmp_path):
     assert design.load(env, "PRJ-404") is None
 
 
-def test_design_block_injected_into_executor_prompt(tmp_path):
-    env = tmp_path / ENV_DIRNAME
-    t = make_task(env, "PRJ-001", title="UI feat")
-    cfg = Config()
-    assert "Approved UI design" not in loop._build_prompt(env, cfg, t)
-    design.save(env, "PRJ-001", "<html><h1>Dash</h1></html>")
-    prompt = loop._build_prompt(env, cfg, t)
-    assert "Approved UI design" in prompt and "<h1>Dash</h1>" in prompt
-
-
 def test_design_block_injected_into_oracle_prompt_with_screenshots(tmp_path):
     env = tmp_path / ENV_DIRNAME
     t = make_task(env, "PRJ-001", title="UI feat")
@@ -37,12 +29,3 @@ def test_design_block_injected_into_oracle_prompt_with_screenshots(tmp_path):
     prompt = loop._build_oracle_prompt(env, Config(), t, diff="")
     assert "Approved UI design" in prompt
     assert "UI evidence" in prompt
-
-
-def test_planning_prompt_carries_design_instructions(tmp_path):
-    env = tmp_path / ENV_DIRNAME
-    t = make_task(env, "PRJ-001", title="UI feat")
-    prompt = loop._build_planning_prompt(env, Config(design=True), t)
-    assert "save_design" in prompt and "PRJ-001.html" in prompt
-    prompt_off = loop._build_planning_prompt(env, Config(design=False), t)
-    assert "save_design" not in prompt_off

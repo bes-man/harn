@@ -30,11 +30,16 @@ def _env_with_task(tmp_path: Path, *, wait=False) -> Path:
     for p in (env / "tasks").glob("*.json"):
         p.unlink()
     from tests.conftest import make_task
+    from harn import workflows
     make_task(env, "PRJ-001", title="Feat", priority=1,
               description="## What\nBuild a thing.\n\n## Done when\n- works")
+    # A single-step plan so turn counts are deterministic (one turn per step).
+    workflows.save_task_plan(env, "PRJ-001", {"preamble": "", "nodes": [
+        {"kind": "step", "id": "step-000001", "title": "Implement",
+         "body": "do it", "required": [], "tools": [], "enabled": True}]})
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
-        f"[loop]\nmax_iterations = 6\nverify = false\nplanning = false\noracle = false\n"
+        f"[loop]\nmax_iterations = 6\n"
         f"[notify]\nwait_for_reply = {str(wait).lower()}\n"
     )
     return env
@@ -67,7 +72,7 @@ def test_loop_submits_for_review_then_waits_cli(tmp_path, monkeypatch):
     assert phase == state.REVIEW
     t = tasks.find(env, "PRJ-001")
     assert t.status == tasks.REVIEW
-    assert fake.calls == 2  # work turn + reconcile turn
+    assert fake.calls == 1  # one step turn
     # progress log recorded the journey
     log = progress.tail(env)
     assert "started" in log and "submitted for review" in log
@@ -93,7 +98,7 @@ def test_cli_review_changes_then_accept(tmp_path, monkeypatch):
     # agent reworks → back to review
     loop.run(tmp_path, env)
     assert tasks.find(env, "PRJ-001").status == tasks.REVIEW
-    assert fake.calls == 4  # work×2 + reconcile×2
+    assert fake.calls == 2  # one step turn per run (initial + rework)
 
     # user accepts with notes
     loop.review(env, "PRJ-001", approve=True, notes="watch the edge case in parse()")
@@ -130,4 +135,4 @@ def test_loop_review_via_telegram(tmp_path, monkeypatch):
     assert done.status == tasks.DONE
     notes_entry = next((e for e in done.review_log if e.event == "accepted"), None)
     assert notes_entry and "great job" in notes_entry.notes
-    assert fake.calls == 4  # work×2 + reconcile×2
+    assert fake.calls == 2  # one step turn per run (initial + rework)

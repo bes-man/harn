@@ -45,7 +45,9 @@ def test_autonomy_note_injected_into_prompt(tmp_path):
     (env / "harn.toml").write_text('[harn]\nagent = "fake"\nautonomy = 0.2\n')
     t = make_task(env, "PRJ-001")
     cfg = Config.load(env)
-    prompt = loop._build_prompt(env, cfg, t)
+    step = {"kind": "step", "id": "step-000001", "title": "Implement",
+            "body": "do it", "required": [], "tools": [], "enabled": True}
+    prompt = loop._build_step_prompt(env, cfg, t, step)
     assert "Autonomy: 20% self-directed" in prompt
     assert "METICULOUS" in prompt
 

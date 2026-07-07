@@ -9,6 +9,13 @@ from harn.adapters.base import AgentResult
 from tests.conftest import make_task
 
 
+def _one_step_plan(env, task_id):
+    from harn import workflows
+    workflows.save_task_plan(env, task_id, {"preamble": "", "nodes": [
+        {"kind": "step", "id": "step-000001", "title": "Implement",
+         "body": "do it", "required": [], "tools": [], "enabled": True}]})
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
@@ -85,11 +92,11 @@ def test_loop_nudges_once_per_task(tmp_path, monkeypatch):
     scaffold.setup(repo)
     env = repo / ENV_DIRNAME
     make_task(env, "PRJ-001", title="Feat", priority=1)
+    _one_step_plan(env, "PRJ-001")
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n'
         '[feedback]\ntest_cmd = ""\nrequire_tests = true\n'
-        "[loop]\nmax_iterations = 6\nverify = false\nplanning = false\n"
-        "oracle = false\n"
+        "[loop]\nmax_iterations = 6\n"
         "[notify]\nwait_for_reply = false\n"
     )
     fake = NudgeCountingAdapter(repo)
@@ -98,11 +105,11 @@ def test_loop_nudges_once_per_task(tmp_path, monkeypatch):
 
     phase = loop.run(repo, env)
 
-    # turn 1: code w/o tests → nudge; turn 2 carries the nudge, gate doesn't
-    # re-fire (once per task) → task proceeds to review; turn 3 is reconcile.
+    # turn 1: code w/o tests → nudge; the SAME step re-runs (turn 2) carrying the
+    # nudge; the gate doesn't re-fire (once per task) → the step completes → review.
     assert phase == state.REVIEW
-    assert fake.calls == 3  # work×2 + reconcile×1
-    assert fake.feedbacks == [False, True, False]  # reconcile prompt has no nudge
+    assert fake.calls == 2  # step turn ×2 (initial + nudged re-run)
+    assert fake.feedbacks == [False, True]
     assert tasks.find(env, "PRJ-001").status == tasks.REVIEW
 
 
@@ -111,11 +118,11 @@ def test_gate_off_by_config(tmp_path, monkeypatch):
     scaffold.setup(repo)
     env = repo / ENV_DIRNAME
     make_task(env, "PRJ-001", title="Feat", priority=1)
+    _one_step_plan(env, "PRJ-001")
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n'
         '[feedback]\ntest_cmd = ""\nrequire_tests = false\n'
-        "[loop]\nmax_iterations = 6\nverify = false\nplanning = false\n"
-        "oracle = false\n"
+        "[loop]\nmax_iterations = 6\n"
         "[notify]\nwait_for_reply = false\n"
     )
     fake = NudgeCountingAdapter(repo)
@@ -123,4 +130,4 @@ def test_gate_off_by_config(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
 
     assert loop.run(repo, env) == state.REVIEW
-    assert fake.calls == 2  # work turn + reconcile turn
+    assert fake.calls == 1  # one step turn, gate off

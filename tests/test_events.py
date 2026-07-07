@@ -105,6 +105,13 @@ class FakeAdapter:
                            input_tokens=10, output_tokens=5)
 
 
+def _one_step_plan(env, task_id):
+    from harn import workflows
+    workflows.save_task_plan(env, task_id, {"preamble": "", "nodes": [
+        {"kind": "step", "id": "step-000001", "title": "Implement",
+         "body": "do it", "required": [], "tools": [], "enabled": True}]})
+
+
 def _env_with_task(tmp_path: Path) -> Path:
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
@@ -112,9 +119,10 @@ def _env_with_task(tmp_path: Path) -> Path:
         p.unlink()
     make_task(env, "PRJ-001", title="Feat", priority=1,
               description="## What\nBuild.\n\n## Done when\n- works")
+    _one_step_plan(env, "PRJ-001")
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
-        "[loop]\nmax_iterations = 6\nverify = false\nplanning = false\noracle = false\n"
+        "[loop]\nmax_iterations = 6\n"
         "[notify]\nwait_for_reply = false\n"
     )
     return env
@@ -134,9 +142,10 @@ def test_loop_emits_run_stage_and_cycle_events(tmp_path, monkeypatch):
     assert "stage_end" in kinds          # a completed agent cycle is logged
     assert "cycle_end" in kinds          # the task work-cycle is logged
     assert "run_end" in kinds            # the run span is closed
-    # the execution stage_end carries token + duration telemetry
-    se = next(e for e in evs if e["event"] == "stage_end" and e["stage"] == "execute")
+    # the step's stage_end carries token + duration telemetry, keyed by step id
+    se = next(e for e in evs if e["event"] == "stage_end" and e["stage"] == "step-000001")
     assert se["task_id"] == "PRJ-001"
+    assert se["step_title"] == "Implement"
     assert se["tok_in"] == 10 and se["tok_out"] == 5
     assert "dur_ms" in se
     # all events of the run share one run_id
@@ -155,39 +164,13 @@ def test_loop_run_end_carries_final_phase(tmp_path, monkeypatch):
     assert end["phase"] == phase
 
 
-def test_loop_emits_gate_skipped_for_off_stages(tmp_path, monkeypatch):
-    env = _env_with_task(tmp_path)  # verify=false, planning=false, oracle=false
-    fake = FakeAdapter()
-    monkeypatch.setattr(loop, "get_adapter", lambda name: fake)
-    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+# --- explain: the active workflow's enabled steps -------------------------- #
 
-    loop.run(tmp_path, env)
-    skipped = {e["stage"] for e in events.read(env)
-               if e["event"] == "gate_skipped"}
-    assert {"verify", "oracle"} <= skipped  # configured off → recorded
-
-
-# --- pipeline graph (Phase 3) ---------------------------------------------- #
-
-def test_active_stages_respects_gates():
+def test_explain_lists_active_workflow_steps(tmp_path):
     from harn.config import Config
-    on = Config(verify=True, oracle=True, browser_enabled=True, planning=True)
-    names = {s.name for s in loop.active_stages(on)}
-    assert {"plan", "execute", "verify", "ui_verify", "oracle", "reconcile"} <= names
-
-    off = Config(verify=False, oracle=False, browser_enabled=False, planning=False)
-    names_off = {s.name for s in loop.active_stages(off)}
-    assert "verify" not in names_off
-    assert "oracle" not in names_off
-    assert "ui_verify" not in names_off
-    # non-optional stages always present
-    assert "execute" in names_off and "reconcile" in names_off
-
-
-def test_explain_marks_on_and_off():
-    from harn.config import Config
-    text = loop.explain(Config(verify=True, oracle=False, browser_enabled=False))
-    assert "verify" in text and "oracle" in text
-    # numbered, ordered, with on/off tags
-    assert "1." in text and "(on)" in text and "(off)" in text
-    assert "always" in text  # execute / reconcile
+    env = _env_with_task(tmp_path)   # default workflow active
+    text = loop.explain(env, Config.load(env))
+    # numbered, ordered listing of the default workflow's steps
+    assert "1." in text
+    assert "Implement" in text        # a default-workflow step
+    assert "[✓]" in text              # enabled marker

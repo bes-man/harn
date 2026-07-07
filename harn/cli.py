@@ -395,7 +395,7 @@ def cmd_explain(args) -> int:
     from . import loop
     from .config import Config
     env_dir = _env_dir(Path(args.path).resolve())
-    print(loop.explain(Config.load(env_dir)))
+    print(loop.explain(env_dir, Config.load(env_dir)))
     return 0
 
 

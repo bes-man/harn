@@ -24,17 +24,22 @@ class ScriptedAdapter:
         return item(prompt, cwd) if callable(item) else AgentResult(ok=True, text=item)
 
 
-def _auto_env(tmp_path: Path, *, verify: bool = False) -> Path:
+def _auto_env(tmp_path: Path, *, n_steps: int = 1) -> Path:
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
     for p in (env / "tasks").glob("*.json"):
         p.unlink()
     from .conftest import make_task
+    from harn import workflows
     make_task(env, "PRJ-001", title="Feat", priority=1,
               description="## What\nBuild it.\n\n## Done when\n- it works")
+    workflows.save_task_plan(env, "PRJ-001", {"preamble": "", "nodes": [
+        {"kind": "step", "id": f"step-{i:06x}", "title": f"Step {i}",
+         "body": f"do {i}", "required": [], "tools": [], "enabled": True}
+        for i in range(1, n_steps + 1)]})
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
-        f"[loop]\nauto_max_iterations = 6\nverify = {str(verify).lower()}\n"
+        "[loop]\nauto_max_iterations = 6\n"
     )
     return env
 
@@ -59,16 +64,16 @@ def test_auto_executes_without_touching_md(tmp_path, monkeypatch):
     assert fake.calls == 1
 
 
-def test_auto_runs_verify_turn_too(tmp_path, monkeypatch):
-    env = _auto_env(tmp_path, verify=True)
-    fake = ScriptedAdapter(["work done", "checked\nVERIFY: PASS"])
+def test_auto_walks_all_steps(tmp_path, monkeypatch):
+    env = _auto_env(tmp_path, n_steps=2)
+    fake = ScriptedAdapter(["work done", "checked"])
     _wire(monkeypatch, fake)
 
     phase = loop.run(tmp_path, env, auto=True)
 
     assert phase == state.DONE
     assert tasks.find(env, "PRJ-001").status == tasks.TODO  # still untouched
-    assert fake.calls == 2  # work + verify, even in auto
+    assert fake.calls == 2  # both steps run, even in auto
 
 
 def test_auto_does_not_block_on_questions(tmp_path, monkeypatch):
@@ -93,8 +98,10 @@ def test_auto_prompt_carries_autonomous_note(tmp_path):
     env = _auto_env(tmp_path)
     cfg = Config.load(env)
     task = tasks.find(env, "PRJ-001")
-    assert "AUTONOMOUS MODE" in loop._build_prompt(env, cfg, task, auto=True)
-    assert "AUTONOMOUS MODE" not in loop._build_prompt(env, cfg, task, auto=False)
+    step = {"kind": "step", "id": "step-000001", "title": "Implement",
+            "body": "do it", "required": [], "tools": [], "enabled": True}
+    assert "AUTONOMOUS MODE" in loop._build_step_prompt(env, cfg, task, step, auto=True)
+    assert "AUTONOMOUS MODE" not in loop._build_step_prompt(env, cfg, task, step, auto=False)
 
 
 def test_auto_uses_larger_iteration_budget():

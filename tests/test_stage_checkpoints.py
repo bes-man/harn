@@ -51,9 +51,16 @@ def _env(tmp_path: Path) -> Path:
         p.unlink()
     make_task(env, "PRJ-001", title="Feat", priority=1,
               description="## What\nBuild it.\n\n## Done when\n- it works")
+    # A two-step plan so each step's own git checkpoint is captured by step id.
+    from harn import workflows
+    workflows.save_task_plan(env, "PRJ-001", {"preamble": "", "nodes": [
+        {"kind": "step", "id": "step-000001", "title": "Implement",
+         "body": "do it", "required": [], "tools": [], "enabled": True},
+        {"kind": "step", "id": "step-000002", "title": "Verify",
+         "body": "check it", "required": [], "tools": [], "enabled": True}]})
     (env / "harn.toml").write_text(
         '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\nrequire_tests = false\n'
-        "[loop]\nmax_iterations = 6\nverify = true\nplanning = false\noracle = false\n"
+        "[loop]\nmax_iterations = 6\n"
         "[notify]\nwait_for_reply = false\n"
     )
     return env
@@ -64,42 +71,40 @@ def _wire(monkeypatch, adapter):
     monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
 
 
-def test_execute_and_verify_stages_get_checkpoints(tmp_path, monkeypatch):
+def test_each_step_gets_a_checkpoint(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     env = _env(root)
-    fake = ScriptedAdapter(["work done", "looks correct\nVERIFY: PASS"], root)
+    fake = ScriptedAdapter(["work done", "verified"], root)
     _wire(monkeypatch, fake)
 
     loop.run(root, env)
 
     t = tasks.find(env, "PRJ-001")
-    assert "execute" in t.stage_checkpoints
-    assert "verify" in t.stage_checkpoints
+    assert "step-000001" in t.stage_checkpoints
+    assert "step-000002" in t.stage_checkpoints
     # each checkpoint is a resolvable git object
     for ref in t.stage_checkpoints.values():
         code, _, _ = gitutil._run(["cat-file", "-e", ref], root)
         assert code == 0
 
 
-def test_checkpoint_captures_pre_stage_state_not_post(tmp_path, monkeypatch):
-    """The checkpoint for a stage must reflect the tree BEFORE that stage's
-    edits — restoring it should undo exactly that stage's own changes."""
+def test_checkpoint_captures_pre_step_state_not_post(tmp_path, monkeypatch):
+    """The checkpoint for a step must reflect the tree BEFORE that step's
+    edits — restoring it should undo exactly that step's own changes."""
     root = _repo(tmp_path)
     env = _env(root)
-    fake = ScriptedAdapter(["work done", "looks correct\nVERIFY: PASS"], root)
+    fake = ScriptedAdapter(["work done", "verified"], root)
     _wire(monkeypatch, fake)
 
     loop.run(root, env)
 
     t = tasks.find(env, "PRJ-001")
-    execute_ref = t.stage_checkpoints["execute"]
-    # app.py was "call 1\n" (baseline) before execute wrote "call 1\n" itself —
-    # restoring the execute checkpoint should give back the ORIGINAL baseline
-    # content, not what execute itself wrote.
-    res = gitutil.rollback_to(execute_ref, root, apply=False)
+    first_ref = t.stage_checkpoints["step-000001"]
+    # restoring the first step's checkpoint should give back the ORIGINAL
+    # baseline content, not what that step itself wrote.
+    res = gitutil.rollback_to(first_ref, root, apply=False)
     assert res.ok
-    # dry run only reports; verify restoring for real recovers the pre-execute text
-    res2 = gitutil.rollback_to(execute_ref, root, apply=True)
+    res2 = gitutil.rollback_to(first_ref, root, apply=True)
     assert res2.ok
     assert (root / "app.py").read_text() == "def f():\n    return 1\n"
 
@@ -107,7 +112,7 @@ def test_checkpoint_captures_pre_stage_state_not_post(tmp_path, monkeypatch):
 def test_no_git_repo_run_still_succeeds(tmp_path, monkeypatch):
     """Checkpointing is best-effort — a non-git project must still work."""
     env = _env(tmp_path)   # tmp_path is NOT a git repo
-    fake = ScriptedAdapter(["work done", "looks correct\nVERIFY: PASS"], tmp_path)
+    fake = ScriptedAdapter(["work done", "verified"], tmp_path)
     _wire(monkeypatch, fake)
 
     loop.run(tmp_path, env)

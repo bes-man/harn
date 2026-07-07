@@ -64,7 +64,10 @@ def test_prompt_is_cache_friendly_stable_first(tmp_path):
     env = tmp_path / ENV_DIRNAME
     t = tasks.create_task(env, "Add login", task_id="PRJ-001",
                           description="## What\nlogin\n## Done when\n- works")
-    p = loop._build_prompt(env, Config.load(env), t, feedback_tail="3 passed")
+    step = {"kind": "step", "id": "step-000001", "title": "Implement",
+            "body": "do it", "required": [], "tools": [], "enabled": True}
+    p = loop._build_step_prompt(env, Config.load(env), t, step,
+                                feedback_tail="3 passed")
     i_skills = p.find("Available skills")        # stable
     i_task = p.find("Current task")              # task-stable
     i_board = p.find("Task board")               # volatile
