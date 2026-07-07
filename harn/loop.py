@@ -131,6 +131,16 @@ _AUTO_BUTTON_NOTE = (
     "proceed. Record the choice with `record_decision` so it can be reviewed."
 )
 
+# Standing "save your learnings" nudge appended to every step's prompt.
+_INSIGHT_NUDGE = (
+    "## Capture what you learned\n"
+    "If this step surfaced a durable convention, trade-off resolution, or "
+    "release-worthy change, record it before finishing: `save_to_skill` for "
+    "confident conventions, `save_service` for changed service standards, "
+    "`record_change` for the release-note line. Skip silently if nothing "
+    "durable was learned — do not invent insights."
+)
+
 
 def _autonomy_note(level: float) -> str:
     """Translate the 0.0–1.0 autonomy level into a behavioural directive."""
@@ -789,6 +799,86 @@ def _adapter_for_stage(cfg: Config, stage: str, default: Adapter) -> Adapter:
         return get_adapter(name)
     except ValueError:
         return default
+
+
+def _step_overrides(cfg: Config, step: dict) -> dict:
+    """This step's {model, effort, temperature} kwargs for adapter.run_turn.
+    The step's own fields win; a missing model falls back to the global
+    default ([harn] model). Empty values are omitted entirely."""
+    ov = {}
+    for key in ("model", "effort", "temperature"):
+        v = str(step.get(key) or "").strip()
+        if v:
+            ov[key] = v
+    if "model" not in ov and cfg.model:
+        ov["model"] = cfg.model
+    return ov
+
+
+def _adapter_for_step(cfg: Config, step: dict, default: Adapter) -> Adapter:
+    """The adapter that runs this step: its `Agent:` override if set and
+    known, else the run's default. Provider-agnostic — any step can run on
+    any installed CLI."""
+    name = str(step.get("agent") or "").strip()
+    if not name or name == default.name:
+        return default
+    try:
+        return get_adapter(name)
+    except ValueError:
+        return default
+
+
+def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
+                       step: dict, feedback_tail: str = "",
+                       auto: bool = False) -> str:
+    """ONE prompt builder for EVERY workflow step (replaces the six
+    stage-specific builders). Structure mirrors _build_prompt: stable
+    context first (AGENTS.md, skills index, task spec), the step's own
+    instructions in the middle, volatile tail (board/progress/feedback)
+    last for prompt-cache reuse."""
+    state_dir = env_dir / "state"
+    agents_md = env_dir.parent / "AGENTS.md"
+    base = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+    parts: list[str] = [base]
+    if auto:
+        parts.append(_AUTO_NOTE)
+    if cfg.loop_aware:
+        parts.append(_LIFECYCLE_NOTE)
+    parts.append(
+        "## Available skills (load only what you need)\n"
+        "Read a skill via `read_skill` ONLY when needed:\n" + skills.index(env_dir))
+    req = [s for s in (step.get("required") or []) if s]
+    if req:
+        parts.append("## Required skills for THIS step\nLoad these now via "
+                     "`read_skill`: " + ", ".join(req))
+    parts.append(f"## Current task — {task.id} (status: {task.status})\n"
+                 + _task_spec(task))
+    tools = [t for t in (step.get("tools") or []) if t]
+    parts.append(
+        f"## THIS STEP: {step.get('title', '')}\n"
+        + (step.get("body") or "").strip()
+        + ("\n\nTools for this step: " + ", ".join(tools) if tools else "")
+        + "\n\nDo ONLY this step's work, then end your turn — the next step "
+          "runs as a separate session with this task's updated state.")
+    cont = _continuity_block(task)
+    if cont:
+        parts.append(cont)
+    if not auto:
+        parts.append(_autonomy_note(cfg.autonomy))
+        parts.append("## Rules\n- " + _ASK_GUIDANCE)
+    parts.append(_INSIGHT_NUDGE)
+    # volatile tail — keep last (prompt cache)
+    if cfg.loop_aware:
+        parts.append("## Task board\n" + tasks.board(env_dir))
+        prog = progress.tail(env_dir)
+        if prog:
+            parts.append("## Progress so far\n" + prog)
+        answers = _answers_tail(state_dir)
+        if answers:
+            parts.append("## Earlier answers from the human\n" + answers)
+    if feedback_tail:
+        parts.append("## Last feedback (tests)\n```\n" + feedback_tail + "\n```")
+    return "\n\n".join(p for p in parts if p.strip())
 
 
 def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> None:
