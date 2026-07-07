@@ -180,6 +180,11 @@ class Task:
     # a new attempt on top of a half-finished previous one. Distinct from
     # `baseline_ref` (the task's very first checkpoint, for a full rerun).
     stage_checkpoints: dict = field(default_factory=dict)
+    # Durable per-step results ledger ({step_id: {...}}) — the step-execution
+    # engine's record of what happened for each step in the task's workflow
+    # snapshot (harn_env/tasks/<id>.workflow.json). Keyed by step id so it
+    # survives step re-ordering/renaming in the plan.
+    step_results: dict = field(default_factory=dict)
 
     @property
     def done(self) -> bool:
@@ -262,6 +267,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         spec_locked=bool(d.get("spec_locked", False)),
         workflow=d.get("workflow") or None,
         stage_checkpoints=dict(d.get("stage_checkpoints") or {}),
+        step_results=dict(d.get("step_results") or {}),
     )
 
 
@@ -289,6 +295,7 @@ def _to_dict(task: Task) -> dict:
         "spec_locked": task.spec_locked,
         "workflow":    task.workflow,
         "stage_checkpoints": task.stage_checkpoints,
+        "step_results": task.step_results,
     }
 
 
@@ -350,7 +357,8 @@ def load_tasks(env_dir: Path) -> list[Task]:
     tasks_dir = env_dir / "tasks"
     if not tasks_dir.exists():
         return []
-    return [_load(p) for p in sorted(tasks_dir.glob("*.json"))]
+    return [_load(p) for p in sorted(tasks_dir.glob("*.json"))
+            if not p.name.endswith(".workflow.json")]
 
 
 def find(env_dir: Path, task_id: str) -> Task | None:
@@ -533,6 +541,11 @@ def create_task(
         workflow=(workflow or None),
     )
     _save(task)
+    try:
+        from . import workflows as workflows_mod
+        workflows_mod.snapshot_for_task(env_dir, task.id, workflow)
+    except Exception:
+        pass   # a failed snapshot must never fail task creation
     return task
 
 

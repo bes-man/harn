@@ -24,6 +24,7 @@ layer and the loop both call these functions — never poke the files directly.
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import Path
@@ -273,3 +274,56 @@ def create(env_dir: Path, *, name: str, title: str = "", description: str = "",
     })
     save(env_dir, wf)
     return {k: wf[k] for k in ("name", "title", "description", "version")}
+
+
+# ---------------------------------------------------------------------------
+# Per-task plan snapshots — each task's OWN copy of its workflow.
+# Presets are templates: create_task copies one here; the engine and the
+# studio canvas then read/write ONLY this file for that task.
+# ---------------------------------------------------------------------------
+def task_plan_path(env_dir: Path, task_id: str) -> Path:
+    return env_dir / "tasks" / f"{task_id}.workflow.json"
+
+
+def load_task_plan(env_dir: Path, task_id: str) -> dict | None:
+    p = task_plan_path(env_dir, task_id)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
+def save_task_plan(env_dir: Path, task_id: str, parsed: dict) -> Path:
+    workflow_mod.ensure_ids(parsed)
+    p = task_plan_path(env_dir, task_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(parsed, ensure_ascii=False, indent=1),
+                 encoding="utf-8")
+    return p
+
+
+def snapshot_for_task(env_dir: Path, task_id: str, preset: str | None) -> dict:
+    """Copy the task's chosen preset (or the default) into its own plan file.
+    Idempotent: an existing snapshot is returned untouched — a task's plan is
+    never silently reset by a second call."""
+    existing = load_task_plan(env_dir, task_id)
+    if existing is not None:
+        return existing
+    wf = (load(env_dir, preset) if preset else None) or _ensure_default(env_dir)
+    plan = copy.deepcopy({"preamble": wf.get("preamble", ""),
+                          "nodes": wf.get("nodes", [])})
+    workflow_mod.ensure_ids(plan)
+    save_task_plan(env_dir, task_id, plan)
+    return plan
+
+
+def activate_task(env_dir: Path, task_id: str) -> bool:
+    """Render the task's snapshot into WORKFLOW.md (the one file every chat
+    agent reads). The headless engine reads the snapshot directly instead."""
+    plan = load_task_plan(env_dir, task_id)
+    if plan is None:
+        return False
+    render(env_dir, {"name": f"task:{task_id}", **plan})
+    return True
