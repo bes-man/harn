@@ -120,8 +120,8 @@ class Adapter:
                 model: str | None = None, effort: str | None = None,
                 temperature: str | None = None) -> AgentResult:
         """Run one non-interactive turn with `prompt` in working dir `cwd`.
-        `model`/`effort`/`temperature` are this stage's optional overrides
-        (see harn.toml's `[models.<stage>]` / Config.stage_models)."""
+        `model`/`effort`/`temperature` are this step's optional overrides
+        (set per-step in the task's WORKFLOW.md plan)."""
         raise NotImplementedError
 
     def _exec(self, argv: Sequence[str], cwd: Path, timeout: int) -> _Exec:

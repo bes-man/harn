@@ -63,30 +63,6 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, v))
 
 
-# The real, separately-invoked agent turns in `harn run` — "test" runs the
-# configured test command, not an LLM turn, so it takes no model override.
-MODEL_STAGES = ("plan", "execute", "verify", "ui_verify", "oracle", "reconcile")
-
-
-def _parse_stage_models(models_raw: dict) -> dict:
-    out: dict = {}
-    for stage in MODEL_STAGES:
-        st = models_raw.get(stage) or {}
-        if not isinstance(st, dict):
-            continue
-        entry = {}
-        # `agent` overrides WHICH CLI runs this stage (provider-agnostic —
-        # e.g. plan with claude, execute with cursor); model/effort/temperature
-        # are the per-turn overrides passed to that CLI.
-        for key in ("agent", "model", "effort", "temperature"):
-            v = st.get(key)
-            if v is not None and str(v).strip():
-                entry[key] = str(v).strip()
-        if entry:
-            out[stage] = entry
-    return out
-
-
 _HIL_CHANNELS = {"chat", "telegram", "both"}
 
 
@@ -106,9 +82,9 @@ DEFAULTS: dict = {
              # override; empty = let the CLI use its own default.
              "model": ""},
     "feedback": {"test_cmd": "", "require_tests": True},
-    "loop": {"max_iterations": 10, "loop_aware": True, "verify": True,
+    "loop": {"max_iterations": 10, "loop_aware": True,
              "auto": False, "auto_max_iterations": 30,
-             "planning": True, "oracle": True, "oracle_agent": "",
+             "oracle": True, "oracle_agent": "",
              "design": True, "auto_reconcile": True},
     "browser": {"enabled": False, "app_cmd": "", "app_url": "",
                 "ready_timeout_s": 60},
@@ -144,7 +120,6 @@ class Config:
     require_tests: bool = True
     max_iterations: int = 10
     loop_aware: bool = True
-    verify: bool = True
     auto: bool = False
     auto_max_iterations: int = 30
     # Code search backends (both default on; gracefully degrade if not installed)
@@ -153,9 +128,6 @@ class Config:
     # context7 MCP: up-to-date library docs for the agent (default on; set
     # [mcp] context7 = false to drop it from the generated MCP config).
     mcp_context7: bool = True
-    # Planning turn: first agent turn for a new task asks clarifying questions
-    # and writes acceptance criteria before any code is written.
-    planning: bool = True
     # Oracle turn: after verify, an independent agent with fresh context checks
     # whether the work actually solves the problem and flags technical debt.
     oracle: bool = True
@@ -184,15 +156,6 @@ class Config:
     # Keep a release-notes-style changelog per task (record_change + reconcile
     # backstop), assembled into docs via `harn changelog` / generate_changelog.
     log_changes: bool = True
-    # Per-stage model overrides for `harn run`'s real, separately-invoked agent
-    # turns (plan/execute/verify/ui_verify/oracle/reconcile — NOT the WORKFLOW.md
-    # steps a chat agent follows within one turn, which harn can't force-switch
-    # models for). {stage: {"model": ..., "effort": ..., "temperature": ...}},
-    # only the keys actually set. From `[models.<stage>]` tables in harn.toml —
-    # see Adapter.MODEL_FLAG/EFFORT_FLAG/TEMPERATURE_FLAG for what each CLI
-    # actually accepts (provider-agnostic: same override, whichever CLI is
-    # currently active in the agent chain).
-    stage_models: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
     @property
@@ -231,13 +194,11 @@ class Config:
             require_tests=bool(data["feedback"].get("require_tests", True)),
             max_iterations=int(data["loop"].get("max_iterations", 10)),
             loop_aware=bool(data["loop"].get("loop_aware", True)),
-            verify=bool(data["loop"].get("verify", True)),
             code_search_semble=bool(data["code_search"].get("semble", True)),
             code_search_socraticcode=bool(data["code_search"].get("socraticcode", True)),
             mcp_context7=bool(data["mcp"].get("context7", True)),
             auto=bool(data["loop"].get("auto", False)),
             auto_max_iterations=int(data["loop"].get("auto_max_iterations", 30)),
-            planning=bool(data["loop"].get("planning", True)),
             oracle=bool(data["loop"].get("oracle", False)),
             oracle_agent=str(data["loop"].get("oracle_agent", "") or "").strip(),
             design=bool(data["loop"].get("design", True)),
@@ -255,6 +216,5 @@ class Config:
                 or data["notify"].get("chat_grace_minutes", 5)
             ),
             log_changes=bool(data.get("log", {}).get("changes", True)),
-            stage_models=_parse_stage_models(data.get("models", {}) or {}),
             raw=data,
         )
