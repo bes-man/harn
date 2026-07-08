@@ -103,6 +103,7 @@ harn review <task_id> --changes "rename the module to auth/"
 [harn]
 agent = "claude"                    # claude | codex | cursor | antigravity | qwen
 # agents = ["claude", "codex"]      # or several, tried in order (first installed runs)
+# model = ""                        # default model for any step that sets none of its own
 autonomy = 0.7                      # 0 ask-everything … 1 decide-everything
 
 [feedback]
@@ -112,11 +113,12 @@ require_tests = true                # code change w/o tests → one "add tests" 
 [loop]
 max_iterations = 10
 loop_aware = true                   # agent sees the board + progress + lifecycle
-verify = true                       # extra turn: check work vs acceptance criteria
 oracle = true                       # independent verification turn (blast-radius)
-planning = true                     # first turn writes acceptance criteria
 design = true                       # UI tasks: HTML mockup approved BEFORE code
 auto = false                        # autonomous (also `harn run --auto`); see below
+# Per-step agent/model/effort/temperature now live on the step itself, in the
+# workflow plan (set via the studio UI) — not here. `[harn] model` above is
+# just the default a step falls back to when it sets none of its own.
 
 [browser]                           # Playwright phase: verify criteria in the LIVE app
 enabled = false                     # turn on, then re-run `harn setup` (adds the MCP)

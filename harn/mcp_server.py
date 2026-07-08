@@ -701,10 +701,12 @@ def build_server():
 
     @mcp.tool()
     def explain_pipeline() -> str:
-        """Show which pipeline stages run for the current config, gated-off ones
-        marked. Tells the user what will happen before work starts."""
+        """Show the active workflow's steps, in order, with each step's
+        agent/model (or the run default). Tells the user what will happen
+        before work starts."""
         from . import loop as loop_mod
-        return loop_mod.explain(Config.load(_env_dir()))
+        env_dir = _env_dir()
+        return loop_mod.explain(env_dir, Config.load(env_dir))
 
     @mcp.tool()
     def read_workflow() -> str:
