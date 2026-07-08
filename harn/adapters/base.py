@@ -104,8 +104,8 @@ class Adapter:
 
     def _model_args(self, model: str | None = None, effort: str | None = None,
                     temperature: str | None = None) -> list[str]:
-        """CLI args for this turn's per-stage overrides (harn_env/harn.toml's
-        `[models.<stage>]`), empty for anything not set or not supported by
+        """CLI args for this step's overrides (set per-step in the task's
+        WORKFLOW.md plan), empty for anything not set or not supported by
         this adapter."""
         args: list[str] = []
         if model and self.MODEL_FLAG:
