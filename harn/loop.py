@@ -580,8 +580,20 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     started = tasks._now_iso()
     task.step_results[sid] = {"status": "running", "started": started, "ended": None}
     tasks._save(task)
+    # stage_start/stage_end mirror _run_turn's event pair so the studio's
+    # progress view (keyed generically by `stage` = step id) paints a command
+    # step's live status exactly like an agent step, with zero changes needed
+    # on the reading side.
+    events.emit(env_dir, "stage_start", task_id=task.id, stage=sid,
+                agent="command", step_title=title)
+    t0 = time.time()
     result = run_feedback(command, project_root)
+    dur_ms = int((time.time() - t0) * 1000)
     ended = tasks._now_iso()
+    lines = [ln for ln in (result.output or "").strip().splitlines() if ln.strip()]
+    events.emit(env_dir, "stage_end", task_id=task.id, stage=sid,
+                agent="command", step_title=title, ok=result.ok, dur_ms=dur_ms,
+                summary=(lines[-1][:200] if lines else None))
     if result.ok:
         task.step_results[sid] = {"status": "ok", "started": started,
                                   "ended": ended, "output": result.tail(40)}

@@ -7,7 +7,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from harn import loop, tasks, workflows, scaffold, ENV_DIRNAME
+from harn import loop, tasks, workflows, scaffold, events, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from .conftest import make_task
 
@@ -248,3 +248,39 @@ def test_checkpoint_captured_for_command_step(tmp_path, monkeypatch):
     loop.run(tmp_path, env)
     fresh = tasks.find(env, t.id)
     assert "step-t1" in fresh.stage_checkpoints
+
+
+def test_command_step_emits_stage_start_and_end_events(tmp_path, monkeypatch):
+    """Command steps must show up in the studio's live progress view exactly
+    like agent steps — this is what drives the canvas active/done/complete
+    coloring (harn/studio.py's progress_payload reads stage_start/stage_end
+    keyed by step id, agnostic to step type)."""
+    env, t = _project(tmp_path, [
+        _step("Tests", id="step-t1", type="command", command="echo hello"),
+    ])
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    evs = events.read(env)
+    starts = [e for e in evs if e["event"] == "stage_start" and e["stage"] == "step-t1"]
+    ends = [e for e in evs if e["event"] == "stage_end" and e["stage"] == "step-t1"]
+    assert len(starts) == 1 and len(ends) == 1
+    assert ends[0]["ok"] is True
+    assert ends[0]["summary"] == "hello"
+    assert ends[0]["step_title"] == "Tests"
+    assert ends[0]["dur_ms"] is not None
+
+
+def test_failing_command_step_stage_end_reports_ok_false_with_summary(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Tests", id="step-t1", type="command", command="sh -c 'echo boom; exit 1'"),
+    ])
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    evs = events.read(env)
+    ends = [e for e in evs if e["event"] == "stage_end" and e["stage"] == "step-t1"]
+    assert ends[0]["ok"] is False
+    assert "boom" in ends[0]["summary"]

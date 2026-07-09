@@ -1339,6 +1339,22 @@ async function deleteAttachment(taskId,name){
 function fmtDur(ms){ if(!ms) return '0s'; const s=Math.round(ms/1000); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
 function fmtBytes(n){ if(!n) return '0B'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB'; }
 function hasRun(){ return PROG.run && Object.keys(PROG.stages||{}).length>0; }
+// The selected task's `step_results` entry for a step — the same data
+// `run_step()`/the engine write for BOTH agent and command steps, but only
+// command steps have no dur_ms/tok_in of their own to show, so their canvas
+// stat line and inspector output block read this directly instead.
+function selTaskStepResult(stepId){
+  const taskId=runStepTaskId();
+  const t=taskId&&(BOARD.tasks||[]).find(x=>x.id===taskId);
+  return (t&&t.step_results&&t.step_results[stepId])||null;
+}
+function lastRunOutputBlock(n){
+  const res=n.id&&selTaskStepResult(n.id);
+  if(!res) return `<label>Last run output</label><div class="toolDoc runlog" id="cmdOutput">(not run yet)</div>`;
+  const mark=res.status==='ok'?'✓ ok':res.status==='failed'?'✗ failed':res.status||'…';
+  return `<label>Last run output <span class="mut">(${esc(mark)})</span></label>
+    <div class="toolDoc runlog" id="cmdOutput">${esc(res.output||'(no output)')}</div>`;
+}
 function applyProgress(){
   const st=PROG.stages||{};
   const live=hasRun();   // only animate when a run actually has stages
@@ -1351,6 +1367,16 @@ function applyProgress(){
     if(info){ cls = info.status==='active'?'st-active': info.status==='complete'?'st-complete':'st-done'; }
     el.classList.add(cls);
     let line=el.querySelector('.stat');
+    if(n.type==='command'){
+      const res=n.id&&selTaskStepResult(n.id);
+      if(info&&res){
+        const lastLine=(res.output||'').trim().split('\n').filter(Boolean).pop()||'';
+        const mark=res.status==='ok'?'✓ ok':res.status==='failed'?'✗ failed':res.status||'…';
+        if(!line){ line=document.createElement('div'); line.className='stat'; el.appendChild(line); }
+        line.textContent=lastLine?`${mark} · ${lastLine.slice(0,60)}`:mark;
+      } else if(line){ line.remove(); }
+      return;
+    }
     if(info&&(info.dur_ms||info.tok_in||info.tok_out)){
       const tok=(info.tok_in||0)+(info.tok_out||0);
       const cost=info.cost_usd?` · $${info.cost_usd.toFixed(4)}`:'';
@@ -1358,6 +1384,14 @@ function applyProgress(){
       line.textContent=`${fmtDur(info.dur_ms)} · ${tok} tok${cost}`;
     } else if(line){ line.remove(); }
   });
+  // Targeted live-refresh of an OPEN command step's "Last run output" box —
+  // never a full renderInsp() here, so editing the Command textarea doesn't
+  // get its cursor/focus stolen by a poll tick landing mid-keystroke.
+  const outEl=document.getElementById('cmdOutput');
+  if(outEl && selNode && selNode.type==='command'){
+    const res=selNode.id&&selTaskStepResult(selNode.id);
+    outEl.textContent = res ? (res.output||'(no output)') : '(not run yet)';
+  }
 }
 // `harn run` (the whole workflow) only picks up tasks in these statuses
 // (tasks.next_task's needs_agent) — 'review'/'done' won't move further.
@@ -1734,6 +1768,7 @@ function renderInsp(){
     <label>On fail <span class="mut">(dispatch this agent step, then retry the command)</span></label>
     <select onchange="setStepField('on_fail',this.value)">${onFailOpts}</select>
     ${runBtns}
+    ${lastRunOutputBlock(n)}
     <div class="mut" style="font-size:11px;margin-top:6px;line-height:1.6">
       Failure = non-zero exit or timeout. With no On-fail target, a failed
       command step just records its output for the next step to see — same as
