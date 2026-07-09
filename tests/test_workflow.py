@@ -160,6 +160,117 @@ def test_ensure_ids_fills_only_missing(tmp_path):
             assert re_mod.fullmatch(r"step-[0-9a-f]{6}", i), i
 
 
+# --- command steps + on-fail (Phase 2) --------------------------------- #
+
+def test_parse_defaults_type_command_onfail_to_empty(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    for n in parsed["nodes"]:
+        if n["kind"] == "step":
+            assert n["type"] == "" and n["command"] == "" and n["on_fail"] == ""
+
+
+def test_command_step_round_trips_through_compose(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    tests_step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    implement_step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    tests_step["type"] = "command"
+    tests_step["command"] = "npm test"
+    tests_step["on_fail"] = implement_step["id"] or "step-aaaaaa"
+    if not implement_step["id"]:
+        implement_step["id"] = "step-aaaaaa"
+    workflow.save_parsed(env, parsed)
+
+    reparsed = workflow.parse(env)
+    t2 = next(n for n in reparsed["nodes"] if n["title"] == "Tests")
+    assert t2["type"] == "command"
+    assert t2["command"] == "npm test"
+    assert t2["on_fail"] == implement_step["id"]
+    # other steps stay untouched
+    other = next(n for n in reparsed["nodes"] if n["title"] == "Verify")
+    assert other["type"] == "" and other["command"] == "" and other["on_fail"] == ""
+
+
+def test_compose_writes_onfail_as_target_title_not_id(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    workflow.ensure_ids(parsed)
+    tests_step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    implement_step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    tests_step["type"] = "command"
+    tests_step["command"] = "npm test"
+    tests_step["on_fail"] = implement_step["id"]
+    text = workflow.compose(env, parsed)
+    assert "On fail: Implement" in text
+    # the On fail line carries the target's title, never its raw id (the id
+    # itself legitimately appears elsewhere, in the target's own `Id:` line)
+    assert f"On fail: {implement_step['id']}" not in text
+
+
+def test_onfail_survives_target_rename(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    workflow.ensure_ids(parsed)
+    tests_step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    implement_step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    tests_step["type"] = "command"
+    tests_step["command"] = "npm test"
+    tests_step["on_fail"] = implement_step["id"]
+    implement_step["title"] = "Build the thing"
+    workflow.save_parsed(env, parsed)
+
+    reparsed = workflow.parse(env)
+    t2 = next(n for n in reparsed["nodes"] if n["title"] == "Tests")
+    renamed = next(n for n in reparsed["nodes"] if n["title"] == "Build the thing")
+    assert t2["on_fail"] == renamed["id"]
+
+
+def test_onfail_dangling_reference_drops_to_empty_on_parse(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    p = env / "WORKFLOW.md"
+    p.write_text(p.read_text().replace(
+        "## 4. Tests", "## 4. Tests\nType: command\nCommand: npm test\n"
+        "On fail: Not A Real Step Title"), encoding="utf-8")
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    assert step["type"] == "command" and step["command"] == "npm test"
+    assert step["on_fail"] == ""
+
+
+def test_compose_omits_onfail_line_when_target_deleted(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    workflow.ensure_ids(parsed)
+    tests_step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    implement_step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    tests_step["type"] = "command"
+    tests_step["command"] = "npm test"
+    tests_step["on_fail"] = implement_step["id"]
+    parsed["nodes"] = [n for n in parsed["nodes"] if n["title"] != "Implement"]
+    text = workflow.compose(env, parsed)
+    tests_block = text[text.index("## 4. Tests"):]
+    tests_block = tests_block[:tests_block.index("\n## ", 1)] if "\n## " in tests_block[1:] else tests_block
+    assert "On fail:" not in tests_block
+
+
+def test_invalid_type_value_is_dropped_on_parse(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    p = env / "WORKFLOW.md"
+    p.write_text(p.read_text().replace(
+        "## 3. Implement", "## 3. Implement\nType: not_a_real_type"), encoding="utf-8")
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    assert step["type"] == ""
+
+
 def test_legacy_stage_line_is_dropped_silently(tmp_path):
     env = tmp_path / ENV_DIRNAME
     workflow.write(env)
