@@ -102,18 +102,28 @@ def _ensure_watch_running(env_dir: Path) -> None:
         pass  # watch is optional — never block the MCP server
 
 
-def build_server():
+
+# `start_watch=False` is for INTROSPECTION-ONLY callers (`tool_catalog()`) that
+# just need the registered tools' names/docstrings — they must never have the
+# side effect of spawning a real, detached `harn watch` daemon or minting a
+# spurious "chat" run_id. Every REAL entry point (an actual agent session,
+# `harn mcp`) keeps the default. (Deliberately a comment, not this function's
+# own docstring — test_guidance.py's fixed-overhead budget sweeps every
+# triple-quoted string found in build_server's source as a proxy for
+# agent-facing token cost, and this note is maintainer-facing only.)
+def build_server(start_watch: bool = True):
     from mcp.server.fastmcp import FastMCP, Image  # lazy: core CLI has no hard dep
 
     mcp = FastMCP("harn")
 
-    # Auto-start the watch dispatcher so Telegram escalation, oracle, and live
-    # status work without the user having to run a separate command.
-    _ensure_watch_running(_env_dir())
+    if start_watch:
+        # Auto-start the watch dispatcher so Telegram escalation, oracle, and
+        # live status work without the user having to run a separate command.
+        _ensure_watch_running(_env_dir())
 
-    # Open a correlation scope for this chat session so every logged cycle
-    # (submit, reconcile, oracle) joins up under one run_id in events.jsonl.
-    events_mod.new_run(_env_dir(), kind="chat")
+        # Open a correlation scope for this chat session so every logged cycle
+        # (submit, reconcile, oracle) joins up under one run_id in events.jsonl.
+        events_mod.new_run(_env_dir(), kind="chat")
 
     @mcp.tool()
     def list_skills() -> str:
@@ -774,7 +784,7 @@ def tool_catalog() -> dict[str, str]:
     global _catalog_cache
     if _catalog_cache is None:
         import asyncio
-        mcp = build_server()
+        mcp = build_server(start_watch=False)
         tools = asyncio.run(mcp.list_tools())
         _catalog_cache = {t.name: (t.description or "").strip() for t in tools}
     return _catalog_cache
