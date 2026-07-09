@@ -484,7 +484,7 @@ def _adapter_for_step(cfg: Config, step: dict, default: Adapter) -> Adapter:
 
 def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
-                       auto: bool = False) -> str:
+                       auto: bool = False, onfail_context: str = "") -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
     stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
@@ -514,6 +514,8 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
         + ("\n\nTools for this step: " + ", ".join(tools) if tools else "")
         + "\n\nDo ONLY this step's work, then end your turn — the next step "
           "runs as a separate session with this task's updated state.")
+    if onfail_context:
+        parts.append(onfail_context)
     cont = _continuity_block(task)
     if cont:
         parts.append(cont)
@@ -547,6 +549,101 @@ def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> Non
     if ref:
         task.stage_checkpoints[stage] = ref
         tasks._save(task)
+
+
+def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
+                      step: dict, steps: list[dict]) -> str:
+    """Run a `type: command` step's shell command (harn/feedback.py's
+    run_feedback) instead of an agent turn. Unlike agent-turn steps, a
+    command step's ledger entry is written UNCONDITIONALLY — even in `auto`
+    mode — because a command's exit code is an objective fact being recorded
+    for the next step to see, not the kind of agent-judgment bookkeeping
+    `auto` mode is designed to keep out of the .md/JSON files.
+
+    On failure, dispatches the step's `on_fail` handler (if it resolves to a
+    live agent step) via `_run_onfail_handler`, then returns so the SAME
+    command step is naturally re-selected by `run()`'s `pending[0]`
+    reselection next iteration (its ledger status stays "failed", not "ok").
+
+    Returns one of: "advance" (success, or failure with no usable handler —
+    either way move on), "handled" (failure dispatched to a handler and
+    ledgered; caller should retry), "blocked" (the handler itself blocked on
+    ask_user; caller should end the run).
+    """
+    sid = step.get("id") or ""
+    title = step.get("title", "")
+    command = step.get("command", "")
+    _checkpoint_stage(project_root, task, sid)
+    started = tasks._now_iso()
+    task.step_results[sid] = {"status": "running", "started": started, "ended": None}
+    tasks._save(task)
+    result = run_feedback(command, project_root)
+    ended = tasks._now_iso()
+    if result.ok:
+        task.step_results[sid] = {"status": "ok", "started": started,
+                                  "ended": ended, "output": result.tail(40)}
+        tasks._save(task)
+        progress.log(env_dir, f"{task.id}: {title} (command) — ok")
+        return "advance"
+    task.step_results[sid] = {"status": "failed", "started": started,
+                              "ended": ended, "output": result.tail(40)}
+    tasks._save(task)
+    progress.log(env_dir, f"{task.id}: {title} (command) — failed")
+    on_fail_id = str(step.get("on_fail") or "").strip()
+    handler = next((s for s in steps if s.get("id") == on_fail_id), None) \
+        if on_fail_id else None
+    if handler is None or handler.get("type") == "command":
+        if on_fail_id:
+            events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
+                        detail=f"on_fail target {on_fail_id!r} is not a live agent step")
+        return "advance"   # no usable handler — record failure, move on (Phase-1-equivalent)
+    return _run_onfail_handler(env_dir, project_root, task, step, handler)
+
+
+def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
+                        failing_step: dict, handler: dict) -> str:
+    """Dispatch a command step's `on_fail` target as ONE agent turn, reusing
+    the same machinery `run()`'s main branch uses for agent steps. The
+    handler's prompt gets an extra context block describing the failure
+    (`_build_step_prompt`'s `onfail_context` param).
+
+    The handler gets exactly one attempt per failure — no internal retry
+    loop. `_handle_block`'s "resumed"/"auto" outcomes normally mean "re-run
+    the same step" in `run()`'s main loop, but here any non-"blocked"
+    outcome means "this handler attempt is finished": if the human answered
+    a question mid-handler, that answer is already recorded in state, and
+    the NEXT top-level `run()` iteration re-evaluates `pending` fresh
+    (naturally retrying the original failing command step, not the handler).
+    """
+    cfg = Config.load(env_dir)
+    adapter = _pick_adapter(cfg)
+    handler_adapter = _adapter_for_step(cfg, handler, adapter)
+    hid = handler.get("id") or ""
+    result_entry = task.step_results.get(failing_step.get("id") or "", {})
+    onfail_context = (
+        f"## Triggered by a failed step\n**{failing_step.get('title', '')}** "
+        f"failed:\n```\n{result_entry.get('output', '')}\n```")
+    _checkpoint_stage(project_root, task, hid)
+    tok_totals: dict = {}
+    tok_costs: dict = {}
+    prompt = _build_step_prompt(env_dir, cfg, task, handler,
+                                onfail_context=onfail_context)
+    result = _run_turn(handler_adapter, env_dir, prompt, project_root,
+                       task_id=task.id, stage=hid, step_title=handler.get("title", ""),
+                       overrides=_step_overrides(cfg, handler),
+                       tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+    state_dir = env_dir / "state"
+    st = state.State.load(state_dir)
+    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
+    if b == "blocked":
+        return "blocked"
+    # resumed / auto / no-block: handler is DONE either way for this pass —
+    # its own ledger entry records the attempt, then the engine retries
+    # the original failing command step (NOT the handler) next iteration.
+    task.step_results[hid] = {"status": "ok" if result.ok else "failed",
+                              "tokens": result.total_tokens}
+    tasks._save(task)
+    return "handled"
 
 
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
@@ -1092,12 +1189,18 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                  if n.get("kind") == "step" and n.get("enabled", True) is not False]
 
         # A step is "done" when the on-disk ledger says ok (normal mode) or the
-        # in-memory set says so (auto mode never mutates task files).
+        # in-memory set says so (auto mode never mutates task files). `done_ids`
+        # doubles as a mode-agnostic "force done" registry: command steps use
+        # it to mark a step as no-longer-pending even when its ledger status
+        # is "failed" (a terminal failure with no usable on_fail handler is
+        # still "over" — there's nothing left that could change the outcome).
         done_ids = auto_done.setdefault(task.id, set())
 
         def _step_done(sid: str) -> bool:
+            if sid in done_ids:
+                return True
             if auto:
-                return sid in done_ids
+                return False
             return task.step_results.get(sid, {}).get("status") == "ok"
 
         # Find the first step not yet done (resume support).
@@ -1107,6 +1210,22 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             step = pending[0]
             sid = step.get("id") or ""
             title = step.get("title", "")
+
+            if step.get("type") == "command":
+                outcome = _run_command_step(env_dir, project_root, task, step, steps)
+                if outcome == "blocked":
+                    return _run_end(env_dir, st)
+                if outcome == "advance":
+                    # Success, or a terminal failure with no live on_fail
+                    # handler — either way this step will not change again;
+                    # don't let `pending` reselect it (a "failed" ledger
+                    # status alone wouldn't stop that). A "handled" outcome
+                    # deliberately does NOT reach here — the original command
+                    # step's ledger entry stays "failed" so it IS reselected
+                    # next iteration, retrying it after the handler ran.
+                    done_ids.add(sid)
+                continue   # "advance" or "handled" — re-evaluate `pending` next iteration
+
             step_adapter = _adapter_for_step(cfg, step, adapter)
 
             # ── STEP TURN ────────────────────────────────────────────────────
