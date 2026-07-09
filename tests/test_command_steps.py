@@ -187,6 +187,57 @@ def test_rework_clears_done_ids_so_command_step_rewalks(tmp_path, monkeypatch):
     assert fresh.step_results["step-t1"]["status"] == "ok"
 
 
+def test_two_consecutive_rework_rounds_both_rewalk_command_step(tmp_path, monkeypatch):
+    """Regression (fix pass 2): the `reworked` debounce used to reset only
+    when task.status left CHANGES_REQUESTED at the top of an iteration. For
+    a command-only plan, tasks.set_status(IN_PROGRESS) is never called (that
+    lives in the agent-turn path, which command steps skip), so status can
+    stay CHANGES_REQUESTED across TWO inline resubmissions within the same
+    run() call. That meant a second rework round's `was_rework and task.id
+    not in reworked` was False (still debounced from round 1), so round 2's
+    "needs work" was silently ignored and the task resubmitted unchanged.
+    The fix keys the debounce reset off submit_for_review() instead of the
+    status transition, so it's fresh for every resubmission. Drive TWO
+    rework rounds ("needs work" x2, then "approve") and assert the command
+    step genuinely re-executed all three times (initial + 2 reworks)."""
+    from harn import state
+    counter = tmp_path / "counter"
+    script = tmp_path / "count.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "p.write_text((p.read_text() if p.exists() else '') + 'ran\\n')\n"
+    )
+    env, t = _project(tmp_path, [
+        _step("Tests", id="step-t1", type="command",
+              command=f"python3 {script} {counter}"),
+    ])
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\nrequire_tests = false\n'
+        "[loop]\nmax_iterations = 20\n[notify]\nwait_for_reply = true\n")
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    replies = iter(["needs work", "needs work", "approve"])
+
+    class FakeHIL:
+        def wait_for_reply(self, text, *, state_dir, timeout_s, remind_every_s):
+            return next(replies)
+
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+
+    phase = loop.run(tmp_path, env)
+    assert phase == state.DONE
+    fresh = tasks.find(env, t.id)
+    assert fresh.status == tasks.DONE
+    # The command step must have run THREE times — the initial pass plus
+    # both rework rounds — proving the debounce reset on every resubmission,
+    # not just the first status transition out of CHANGES_REQUESTED.
+    assert counter.read_text().count("ran") == 3
+    assert fresh.step_results["step-t1"]["status"] == "ok"
+
+
 def test_checkpoint_captured_for_command_step(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Tests", id="step-t1", type="command", command="true"),

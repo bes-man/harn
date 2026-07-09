@@ -1144,12 +1144,15 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     # In auto mode task files are never mutated, so step progress is tracked
     # in memory instead of the on-disk ledger (task.step_results).
     auto_done: dict[str, set] = {}
-    # Debounces the rework reset below to fire once per task per run() call.
-    # Agent-turn steps naturally leave CHANGES_REQUESTED behind (the first
-    # turn calls tasks.set_status(IN_PROGRESS)), but a command-only plan
-    # never does — without this guard, was_rework would stay true forever
-    # and re-clear step_results/done_ids on every single iteration, forcing
-    # the same command step to re-run in an infinite loop.
+    # Debounces the rework reset below to fire once per rework episode, where
+    # an episode boundary is "task resubmitted for review" — NOT "status left
+    # CHANGES_REQUESTED". Agent-turn steps naturally leave CHANGES_REQUESTED
+    # behind (the first turn calls tasks.set_status(IN_PROGRESS)), but a
+    # command-only plan never does, so its status can stay CHANGES_REQUESTED
+    # across multiple resubmissions within the same run() call (e.g. inline
+    # review via the Telegram wait_for_reply path). Keying the reset off the
+    # submit_for_review() call instead of a status transition means every
+    # resubmission gets a fresh debounce, however many rework rounds happen.
     reworked: set[str] = set()
     for _ in range(limit):
         task = tasks.next_task(env_dir, exclude=handled, only=only_task)
@@ -1200,11 +1203,6 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 task.step_results = {}
                 tasks._save(task)
             auto_done.pop(task.id, None)
-        elif not was_rework:
-            # Task left CHANGES_REQUESTED (resubmitted, accepted, ...) — if
-            # the reviewer requests changes again later in this same run,
-            # that's a fresh rework round and should reset again.
-            reworked.discard(task.id)
 
         # The steps this task walks — its own plan's enabled step nodes, in order.
         plan = workflows.load_task_plan(env_dir, task.id) or {"nodes": []}
@@ -1376,6 +1374,9 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
         tasks.submit_for_review(task, adapter.name,
                                 summary=summary[0][:200] + oracle_note,
                                 tokens=usage)
+        # Fresh rework episode starts at resubmission — see note on
+        # `reworked`'s declaration above.
+        reworked.discard(task.id)
         events.emit(env_dir, "cycle_end", task_id=task.id, outcome="submitted",
                     tokens=usage, summary=summary[0][:200])
         progress.log(env_dir,
