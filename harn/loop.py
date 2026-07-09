@@ -597,6 +597,10 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
             events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
                         detail=f"on_fail target {on_fail_id!r} is not a live agent step")
         return "advance"   # no usable handler — record failure, move on (Phase-1-equivalent)
+    # Lazily resolve a default adapter here (not eagerly at the caller) —
+    # callers that never hit a live on_fail handler (the common case) should
+    # never have to resolve or even validate one.
+    adapter = adapter or _pick_adapter(cfg)
     return _run_onfail_handler(env_dir, project_root, task, step, handler, cfg, adapter)
 
 
@@ -1065,9 +1069,10 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         # side effects, which are simply outside the checkpoint's purview.
         # A command-step "rerun" is therefore: run the command again.
         # A command step's success path never touches the agent adapter —
-        # only a failed command with a live on_fail handler does (inside
-        # `_run_command_step`/`_run_onfail_handler`). Don't force agent
-        # resolution here just to run a shell command.
+        # only a failed command with a live on_fail handler does. Pass None
+        # here (never eagerly resolve just to run a shell command);
+        # `_run_command_step` resolves a real default adapter itself, lazily,
+        # only on that failure+live-handler path.
         _run_command_step(env_dir, project_root, task, step, plan_steps, cfg, None)
         fresh = tasks.find(env_dir, task_id) or task
         entry = fresh.step_results.get(step_id, {})

@@ -184,3 +184,32 @@ def test_run_step_command_rerun_restores_checkpoint(tmp_path, monkeypatch):
     # both runs append (checkpoint restores the WORKING TREE, not undo the
     # command's own side effects outside version control) — assert it ran twice
     assert (root / "marker.txt").read_text().count("x") == 2
+
+
+def test_run_step_failing_command_dispatches_live_onfail_handler(tmp_path, monkeypatch):
+    """A manual Run/Rerun of a FAILING command step with a resolvable on_fail
+    target must actually dispatch that handler (not crash on a None adapter —
+    the command-step path doesn't eagerly resolve one, since most command
+    steps never need it, but a failed one with a live handler does)."""
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.load_task_plan(env, t.id)
+    plan["nodes"] = [
+        {"kind": "step", "title": "Tests", "id": "step-cmd3",
+         "type": "command", "command": "false", "on_fail": "step-fix3",
+         "agent": "", "model": "", "effort": "", "temperature": "",
+         "required": [], "tools": [], "enabled": True},
+        {"kind": "step", "title": "Fix tests", "id": "step-fix3",
+         "type": "", "command": "", "on_fail": "", "agent": "", "model": "",
+         "effort": "", "temperature": "", "required": [], "tools": [],
+         "enabled": True},
+    ]
+    workflows.save_task_plan(env, t.id, plan)
+    fake = WritingAdapter(root, texts=["fixed it"])
+    _wire(monkeypatch, fake)
+    r = loop.run_step(root, env, t.id, "step-cmd3")   # must not crash
+    assert r["ok"] is False   # the command itself still failed
+    assert fake.calls == 1    # but the handler genuinely ran
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["step-fix3"]["status"] == "ok"
