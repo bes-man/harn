@@ -1566,7 +1566,7 @@ function autoArrange(){
 function addStep(){
   let my=40; document.querySelectorAll('.node').forEach(e=>my=Math.max(my,e.offsetTop+e.offsetHeight));
   const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true,
-    id:'',agent:'',model:'',effort:'',temperature:''};
+    id:'',agent:'',model:'',effort:'',temperature:'',type:'',command:'',on_fail:''};
   L[n.title]={x:120,y:my+50};
   S.workflow.nodes.push(n); selNode=n; bodyMode='write'; checkDirty(); renderFlow(); saveLayout();
 }
@@ -1709,6 +1709,37 @@ function renderInsp(){
   // Shown on EVERY step: pick the AGENT + MODEL this step runs with, and
   // Run/Rerun it in isolation — no more "which pipeline stage is this"
   // gating; any step can be run on its own via loop.run_step (by id).
+  const stepType=(n.type==='command')?'command':'agent';
+  const typeToggle=isStep?`
+    <label>Type</label>
+    <select onchange="setStepField('type',this.value==='agent'?'':this.value)">
+      <option value="agent" ${stepType==='agent'?'selected':''}>Agent — an LLM turn</option>
+      <option value="command" ${stepType==='command'?'selected':''}>Command — a shell command, no LLM</option>
+    </select>` : '';
+  const commandSection=(isStep && stepType==='command')?(()=>{
+    const others=S.workflow.nodes.filter(x=>x.kind==='step' && x!==n && x.id);
+    const onFailOpts=`<option value="">(none — just record the failure)</option>`
+      + others.map(x=>`<option value="${esc(x.id)}" ${n.on_fail===x.id?'selected':''}>${esc(x.title)}</option>`).join('');
+    const taskId=runStepTaskId();
+    const busy=!!BOARD.run;
+    const runBtns=n.id?`
+    <div class="row" style="margin-top:8px;gap:10px">
+      <button ${busy||!taskId?'disabled':''} title="${taskId?'Run just this step for '+esc(taskId):'No task selected'}" onclick="runStep('${esc(n.id)}')">▶ Run step</button>
+      <button ${busy||!taskId?'disabled':''} title="${taskId?'Rerun this step for '+esc(taskId):'No task selected'}" onclick="rerunStep('${esc(n.id)}')">↻ Rerun step</button>
+    </div>` : '';
+    return `
+    <label>Command <span class="mut">(shell, runs in the project root — no LLM, no tokens)</span></label>
+    <textarea style="min-height:70px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px"
+      oninput="setStepField('command',this.value)" placeholder="npm test">${esc(n.command||'')}</textarea>
+    <label>On fail <span class="mut">(dispatch this agent step, then retry the command)</span></label>
+    <select onchange="setStepField('on_fail',this.value)">${onFailOpts}</select>
+    ${runBtns}
+    <div class="mut" style="font-size:11px;margin-top:6px;line-height:1.6">
+      Failure = non-zero exit or timeout. With no On-fail target, a failed
+      command step just records its output for the next step to see — same as
+      today's default behavior.
+    </div>`;
+  })():'';
   const modelSection=isStep?(()=>{
     const runNote=`
       <div class="mut" style="font-size:11px;margin-top:6px;line-height:1.6">
@@ -1754,7 +1785,7 @@ function renderInsp(){
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
-    ${modelSection}`:''}
+    ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
   `;
 }
 function upd(k,v){
