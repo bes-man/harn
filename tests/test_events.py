@@ -174,3 +174,22 @@ def test_explain_lists_active_workflow_steps(tmp_path):
     assert "1." in text
     assert "Implement" in text        # a default-workflow step
     assert "[✓]" in text              # enabled marker
+
+
+def test_explain_shows_command_not_a_phantom_agent_model(tmp_path):
+    """A command step has no agent/model at all — explain() must show its
+    shell command, not fall back to printing the run's default agent/model
+    as if this step were an LLM turn (it costs zero tokens)."""
+    from harn.config import Config
+    from harn import workflow, scaffold as scaffold_mod, ENV_DIRNAME as _ENV
+    scaffold_mod.setup(tmp_path)
+    env = tmp_path / _ENV
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    step["type"] = "command"
+    step["command"] = "npm test"
+    workflow.save_parsed(env, parsed)
+    text = loop.explain(env, Config.load(env))
+    line = next(ln for ln in text.splitlines() if "Tests" in ln)
+    assert "command: npm test" in line
+    assert "/ default" not in line and "/ claude" not in line

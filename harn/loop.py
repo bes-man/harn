@@ -41,8 +41,8 @@ _APPROVE_WORDS = {
 # --------------------------------------------------------------------------- #
 def explain(env_dir: Path, cfg: Config) -> str:
     """Human-readable view of the ACTIVE workflow — its enabled steps, in order,
-    with each step's agent/model override (or the run default). Powers
-    `harn explain`."""
+    with each agent step's agent/model override (or the run default), and each
+    command step's shell command. Powers `harn explain`."""
     from . import workflow as workflow_mod
     parsed = workflow_mod.parse(env_dir)
     steps = [n for n in parsed.get("nodes", []) if n.get("kind") == "step"]
@@ -54,10 +54,13 @@ def explain(env_dir: Path, cfg: Config) -> str:
         on = s.get("enabled", True) is not False
         mark = "✓" if on else "·"
         n += 1
-        agent = (s.get("agent") or "").strip() or default_agent
-        model = (s.get("model") or "").strip() or default_model
-        lines.append(f"  {n}. [{mark}] {s.get('title', '')} "
-                     f"({agent} / {model})")
+        if s.get("type") == "command":
+            detail = f"(command: {s.get('command', '').strip() or '?'})"
+        else:
+            agent = (s.get("agent") or "").strip() or default_agent
+            model = (s.get("model") or "").strip() or default_model
+            detail = f"({agent} / {model})"
+        lines.append(f"  {n}. [{mark}] {s.get('title', '')} {detail}")
     if n == 0:
         lines.append("  (no steps defined in WORKFLOW.md)")
     return "\n".join(lines)
