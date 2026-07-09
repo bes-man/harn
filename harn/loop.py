@@ -1051,6 +1051,29 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         return {"ok": False, "error": f"unknown step id {step_id!r}"}
     title = step.get("title", "")
 
+    if step.get("type") == "command":
+        plan_steps = [n for n in plan["nodes"] if n.get("kind") == "step"]
+        # No explicit pre-restore here (unlike the agent-step path below):
+        # `_run_command_step` unconditionally checkpoints immediately before
+        # it runs the command, on every call including reruns, so the
+        # checkpoint recorded for this step always reflects "right before
+        # THIS attempt." A manual restore-to-the-PREVIOUS-checkpoint here
+        # would additionally delete untracked files the last attempt created
+        # (gitutil.rollback_to treats anything absent from that older ref's
+        # tree as "created since" and removes it) — appropriate for restoring
+        # git-tracked edits an agent made, but not for a raw shell command's
+        # side effects, which are simply outside the checkpoint's purview.
+        # A command-step "rerun" is therefore: run the command again.
+        # A command step's success path never touches the agent adapter —
+        # only a failed command with a live on_fail handler does (inside
+        # `_run_command_step`/`_run_onfail_handler`). Don't force agent
+        # resolution here just to run a shell command.
+        _run_command_step(env_dir, project_root, task, step, plan_steps, cfg, None)
+        fresh = tasks.find(env_dir, task_id) or task
+        entry = fresh.step_results.get(step_id, {})
+        return {"ok": entry.get("status") == "ok", "step_id": step_id, "title": title,
+                "output": entry.get("output", "")}
+
     if rerun:
         ref = task.stage_checkpoints.get(step_id)
         if ref:

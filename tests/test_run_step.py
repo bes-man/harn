@@ -148,3 +148,39 @@ def test_rerun_discards_previous_attempts_edit(tmp_path, monkeypatch):
     # rerun restores to BEFORE the first attempt (original), THEN the second
     # attempt's own edit lands on top of that clean state
     assert (root / "app.py").read_text() == "second attempt, clean"
+
+
+def test_run_step_executes_command_type_without_agent_call(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.load_task_plan(env, t.id)
+    plan["nodes"] = [{"kind": "step", "title": "Tests", "id": "step-cmd1",
+                      "type": "command", "command": "true", "on_fail": "",
+                      "agent": "", "model": "", "effort": "", "temperature": "",
+                      "required": [], "tools": [], "enabled": True}]
+    workflows.save_task_plan(env, t.id, plan)
+    monkeypatch.setattr(loop, "get_adapter",
+                        lambda n: (_ for _ in ()).throw(AssertionError("no agent for command step")))
+    r = loop.run_step(root, env, t.id, "step-cmd1")
+    assert r["ok"] is True
+    assert "text" not in r
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["step-cmd1"]["status"] == "ok"
+
+
+def test_run_step_command_rerun_restores_checkpoint(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.load_task_plan(env, t.id)
+    plan["nodes"] = [{"kind": "step", "title": "Touch", "id": "step-cmd2",
+                      "type": "command", "command": f"sh -c 'echo x >> {root}/marker.txt'",
+                      "on_fail": "", "agent": "", "model": "", "effort": "",
+                      "temperature": "", "required": [], "tools": [], "enabled": True}]
+    workflows.save_task_plan(env, t.id, plan)
+    loop.run_step(root, env, t.id, "step-cmd2")
+    loop.run_step(root, env, t.id, "step-cmd2", rerun=True)
+    # both runs append (checkpoint restores the WORKING TREE, not undo the
+    # command's own side effects outside version control) — assert it ran twice
+    assert (root / "marker.txt").read_text().count("x") == 2
