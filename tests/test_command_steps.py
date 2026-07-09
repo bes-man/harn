@@ -140,6 +140,53 @@ def test_persistent_failure_terminates_at_max_iterations_not_forever(tmp_path, m
     assert fresh.step_results["step-t1"]["status"] == "failed"   # command never got to "ok"
 
 
+def test_rework_clears_done_ids_so_command_step_rewalks(tmp_path, monkeypatch):
+    """Regression: `done_ids` (auto_done[task.id]) is an in-memory registry
+    that persists for the whole run() call. A command step force-advances
+    into it on any terminal outcome. If rework resolves INLINE within the
+    SAME run() call (the Telegram wait_for_reply auto-review path — see
+    test_loop_review_via_telegram), the on-disk ledger gets cleared for
+    rework but `done_ids` used to survive, silently skipping the command
+    step's re-walk. Assert it re-executes instead."""
+    from harn import state
+    counter = tmp_path / "counter"
+    # run_feedback uses shlex.split (no shell), so drive the append via a
+    # tiny script instead of relying on shell redirection.
+    script = tmp_path / "count.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "p.write_text((p.read_text() if p.exists() else '') + 'ran\\n')\n"
+    )
+    env, t = _project(tmp_path, [
+        _step("Tests", id="step-t1", type="command",
+              command=f"python3 {script} {counter}"),
+    ])
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\nrequire_tests = false\n'
+        "[loop]\nmax_iterations = 20\n[notify]\nwait_for_reply = true\n")
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    replies = iter(["needs work", "approve"])
+
+    class FakeHIL:
+        def wait_for_reply(self, text, *, state_dir, timeout_s, remind_every_s):
+            return next(replies)
+
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+
+    phase = loop.run(tmp_path, env)
+    assert phase == state.DONE
+    fresh = tasks.find(env, t.id)
+    assert fresh.status == tasks.DONE
+    # The command step must have run TWICE — once before the rework, once
+    # after — proving `done_ids` was cleared, not just the on-disk ledger.
+    assert counter.read_text().count("ran") == 2
+    assert fresh.step_results["step-t1"]["status"] == "ok"
+
+
 def test_checkpoint_captured_for_command_step(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Tests", id="step-t1", type="command", command="true"),

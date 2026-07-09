@@ -552,7 +552,7 @@ def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> Non
 
 
 def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
-                      step: dict, steps: list[dict]) -> str:
+                      step: dict, steps: list[dict], cfg: Config, adapter) -> str:
     """Run a `type: command` step's shell command (harn/feedback.py's
     run_feedback) instead of an agent turn. Unlike agent-turn steps, a
     command step's ledger entry is written UNCONDITIONALLY — even in `auto`
@@ -597,11 +597,11 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
             events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
                         detail=f"on_fail target {on_fail_id!r} is not a live agent step")
         return "advance"   # no usable handler — record failure, move on (Phase-1-equivalent)
-    return _run_onfail_handler(env_dir, project_root, task, step, handler)
+    return _run_onfail_handler(env_dir, project_root, task, step, handler, cfg, adapter)
 
 
 def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
-                        failing_step: dict, handler: dict) -> str:
+                        failing_step: dict, handler: dict, cfg: Config, adapter) -> str:
     """Dispatch a command step's `on_fail` target as ONE agent turn, reusing
     the same machinery `run()`'s main branch uses for agent steps. The
     handler's prompt gets an extra context block describing the failure
@@ -615,8 +615,6 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
     the NEXT top-level `run()` iteration re-evaluates `pending` fresh
     (naturally retrying the original failing command step, not the handler).
     """
-    cfg = Config.load(env_dir)
-    adapter = _pick_adapter(cfg)
     handler_adapter = _adapter_for_step(cfg, handler, adapter)
     hid = handler.get("id") or ""
     result_entry = task.step_results.get(failing_step.get("id") or "", {})
@@ -628,10 +626,12 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
     tok_costs: dict = {}
     prompt = _build_step_prompt(env_dir, cfg, task, handler,
                                 onfail_context=onfail_context)
+    started = tasks._now_iso()
     result = _run_turn(handler_adapter, env_dir, prompt, project_root,
                        task_id=task.id, stage=hid, step_title=handler.get("title", ""),
                        overrides=_step_overrides(cfg, handler),
                        tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+    ended = tasks._now_iso()
     state_dir = env_dir / "state"
     st = state.State.load(state_dir)
     b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
@@ -641,6 +641,7 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
     # its own ledger entry records the attempt, then the engine retries
     # the original failing command step (NOT the handler) next iteration.
     task.step_results[hid] = {"status": "ok" if result.ok else "failed",
+                              "started": started, "ended": ended,
                               "tokens": result.total_tokens}
     tasks._save(task)
     return "handled"
@@ -1143,6 +1144,13 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     # In auto mode task files are never mutated, so step progress is tracked
     # in memory instead of the on-disk ledger (task.step_results).
     auto_done: dict[str, set] = {}
+    # Debounces the rework reset below to fire once per task per run() call.
+    # Agent-turn steps naturally leave CHANGES_REQUESTED behind (the first
+    # turn calls tasks.set_status(IN_PROGRESS)), but a command-only plan
+    # never does — without this guard, was_rework would stay true forever
+    # and re-clear step_results/done_ids on every single iteration, forcing
+    # the same command step to re-run in an infinite loop.
+    reworked: set[str] = set()
     for _ in range(limit):
         task = tasks.next_task(env_dir, exclude=handled, only=only_task)
         if task is None:
@@ -1178,10 +1186,25 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
 
         was_rework = task.status == tasks.CHANGES_REQUESTED
         # On rework, the prior run's steps are all ledgered "ok"; clear them so
-        # the engine actually re-walks the plan to address the reviewer.
-        if was_rework and not auto and task.step_results:
-            task.step_results = {}
-            tasks._save(task)
+        # the engine actually re-walks the plan to address the reviewer. Also
+        # clear this task's `done_ids` (auto_done) — command steps force
+        # themselves into that set on a terminal outcome, and if rework
+        # resolves INLINE within the same run() call (e.g. the Telegram
+        # wait_for_reply path), that set would otherwise survive the ledger
+        # reset and silently skip re-walking those steps. Guarded by
+        # `reworked` so this fires once per task per run() call — see note
+        # on its declaration above.
+        if was_rework and not auto and task.id not in reworked:
+            reworked.add(task.id)
+            if task.step_results:
+                task.step_results = {}
+                tasks._save(task)
+            auto_done.pop(task.id, None)
+        elif not was_rework:
+            # Task left CHANGES_REQUESTED (resubmitted, accepted, ...) — if
+            # the reviewer requests changes again later in this same run,
+            # that's a fresh rework round and should reset again.
+            reworked.discard(task.id)
 
         # The steps this task walks — its own plan's enabled step nodes, in order.
         plan = workflows.load_task_plan(env_dir, task.id) or {"nodes": []}
@@ -1212,7 +1235,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             title = step.get("title", "")
 
             if step.get("type") == "command":
-                outcome = _run_command_step(env_dir, project_root, task, step, steps)
+                outcome = _run_command_step(env_dir, project_root, task, step, steps,
+                                            cfg, adapter)
                 if outcome == "blocked":
                     return _run_end(env_dir, st)
                 if outcome == "advance":
