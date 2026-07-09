@@ -77,7 +77,20 @@ def _ensure_watch_running(env_dir: Path) -> None:
 
     Called once when the MCP server starts so neither the user nor the agent
     needs to remember to launch it. Uses a PID file for idempotency.
+
+    Never runs under the test suite (`PYTEST_CURRENT_TEST`, set automatically
+    by pytest for the duration of every test): a test calling `build_server()`
+    directly — without mocking `subprocess.Popen` — would otherwise spawn a
+    REAL, fully-detached (`start_new_session=True`) daemon that outlives the
+    test's tmp_path forever, since nothing tears it down. This bit us for
+    real: dozens of these accumulated across a long session and one was still
+    polling a live project with the default "claude" agent, spending real API
+    cost via an unattended oracle turn. Tests that deliberately exercise this
+    function's own logic (`tests/test_watch_autostart.py`) mock
+    `subprocess.Popen` anyway and explicitly clear this env var first.
     """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     state_dir = env_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_file = state_dir / "watch.pid"
