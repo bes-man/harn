@@ -213,6 +213,119 @@ class CrashingAdapter(WritingAdapter):
                                 effort=effort, temperature=temperature)
 
 
+def test_disjoint_file_patches_both_merge_without_conflict(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()  # writes output_<dirname>.txt — disjoint by construction
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert (tmp_path / "output_s-be.txt").exists()
+    assert (tmp_path / "output_s-fe.txt").exists()
+
+
+def test_conflicting_patches_dispatch_one_merge_agent_turn(tmp_path, monkeypatch):
+    (tmp_path / "shared.txt").write_text("original\n")
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    class ConflictingAdapter:
+        name = "fake"
+        def __init__(self): self.calls = []
+        def available(self): return True
+        def run_turn(self, prompt, cwd, **kw):
+            self.calls.append({"prompt": prompt, "cwd": str(cwd)})
+            n = len(self.calls)
+            if n <= 2:
+                # both parallel steps edit the SAME line incompatibly
+                Path(cwd, "shared.txt").write_text(f"edited by call {n}\n")
+                return AgentResult(ok=True, text="done")
+            # third call = the merge agent turn
+            Path(cwd, "shared.txt").write_text("merged resolution\n")
+            return AgentResult(ok=True, text="resolved the conflict")
+    fake = ConflictingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 3  # 2 parallel + 1 merge turn
+    assert (tmp_path / "shared.txt").read_text() == "merged resolution\n"
+
+
+def test_parallel_step_block_defers_to_sequential_rerun(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    state_dir = env / "state"
+    class BlockingAdapter:
+        name = "fake"
+        def __init__(self): self.calls = 0
+        def available(self): return True
+        def run_turn(self, prompt, cwd, **kw):
+            self.calls += 1
+            if "Backend" in prompt:
+                (state_dir).mkdir(parents=True, exist_ok=True)
+                (state_dir / "BLOCKED.md").write_text("## Question\nWhich DB?\n")
+            else:
+                Path(cwd, "frontend_done.txt").write_text("ok\n")
+            return AgentResult(ok=True, text="...")
+    fake = BlockingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    phase = loop.run(tmp_path, env)
+
+    from harn import state as state_mod
+    assert phase == state_mod.BLOCKED
+    # Frontend's patch merged despite Backend blocking
+    assert (tmp_path / "frontend_done.txt").exists()
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results.get("s-fe", {}).get("status") == "ok"
+
+
+def test_merge_never_creates_a_git_commit_even_on_conflict(tmp_path, monkeypatch):
+    """harn's standing invariant: it never commits on the user's behalf.
+    Applying wave patches, and dispatching a merge-agent turn to resolve a
+    conflict, must both leave the merged result as an uncommitted diff."""
+    (tmp_path / "shared.txt").write_text("original\n")
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    log_before = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path,
+                                capture_output=True, text=True).stdout
+
+    class ConflictingAdapter:
+        name = "fake"
+        def __init__(self): self.calls = []
+        def available(self): return True
+        def run_turn(self, prompt, cwd, **kw):
+            self.calls.append(cwd)
+            n = len(self.calls)
+            if n <= 2:
+                Path(cwd, "shared.txt").write_text(f"edited by call {n}\n")
+                return AgentResult(ok=True, text="done")
+            Path(cwd, "shared.txt").write_text("merged resolution\n")
+            return AgentResult(ok=True, text="resolved")
+    fake = ConflictingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    log_after = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path,
+                               capture_output=True, text=True).stdout
+    assert log_after == log_before  # no new commit object anywhere in this flow
+    # the merged result is a real, uncommitted diff sitting in the tree
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path,
+                            capture_output=True, text=True).stdout
+    assert "shared.txt" in status
+    assert (tmp_path / "shared.txt").read_text() == "merged resolution\n"
+
+
 def test_run_does_not_crash_when_a_wave_member_turn_raises(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Backend", id="s-be", parallel="wave-1"),

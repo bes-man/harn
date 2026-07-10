@@ -1214,22 +1214,128 @@ def _replicate_connectors(project_root: Path, worktree_path: Path,
             shutil.copy(src, worktree_path / rel)
 
 
-def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
-                        wave: list[dict], results: dict, base_ref: str) -> str:
-    """Apply each wave member's captured patch into the main tree, in wave
-    order, and ledger the outcome.
+def _conflict_markers_in_tree(project_root: Path) -> dict[str, str]:
+    """Files under `project_root` (excluding `.git/`) that currently contain
+    `git apply --3way` conflict markers, mapped to their full content. Used to
+    build the merge-agent's prompt right after a conflicting `apply_patch`
+    call — that call leaves the markers sitting in the working tree, which is
+    exactly the state the merge agent needs to see and resolve."""
+    found: dict[str, str] = {}
+    for path in project_root.rglob("*"):
+        if not path.is_file() or ".git" in path.relative_to(project_root).parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if "<<<<<<<" in text and ">>>>>>>" in text:
+            found[str(path.relative_to(project_root))] = text
+    return found
 
-    NOTE for Task 5 (merge/conflict-resolution): this is a MINIMAL stub —
-    it applies every non-empty patch in order via `gitutil.apply_patch` and
-    always returns "advance". It does NOT detect or resolve conflicts between
-    two wave members' patches (a `git apply` failure here is simply recorded
-    as a "failed" step, not retried or escalated to a merge agent). Task 5
-    owns replacing this body with real conflict detection/resolution and the
-    `ask_user`-driven escalation the design spec describes; the call site
-    (`_run_parallel_wave`) already treats any non-"advance" return the same
-    way `run()` treats a normal step block, so no caller changes should be
-    needed when this is replaced.
+
+def _run_merge_agent_turn(env_dir: Path, project_root: Path, task: "tasks.Task",
+                          merged_so_far: list[dict], conflicting_step: dict,
+                          cfg: Config) -> str:
+    """Dispatch ONE agent turn, in the MAIN tree, to resolve a wave-merge
+    conflict left by a failed `gitutil.apply_patch` call. Reuses the normal
+    `_run_turn`/`_handle_block` machinery (same shape as
+    `_run_onfail_handler`) rather than inventing a new agent-dispatch path.
+
+    `merged_so_far` are the wave members whose patches already applied
+    cleanly (or were themselves conflict-resolved) earlier in this same merge
+    pass — named in the prompt alongside `conflicting_step` because their
+    changes are what's actually sitting in the tree the conflicting patch
+    collided with.
+
+    Returns "resolved" (agent finished, whether or not it explicitly says the
+    conflict is fixed — same "one attempt" contract as the on_fail handler)
+    or "blocked" (the merge agent itself called `ask_user`).
     """
+    markers = _conflict_markers_in_tree(project_root)
+    parts = [
+        "## Merge conflict in a parallel wave\n"
+        "Two or more steps of this task ran CONCURRENTLY, each in its own "
+        "isolated git worktree, and their changes have now been applied to "
+        "this ONE shared working tree one at a time. Applying one step's "
+        "changes conflicted with another's. Resolve the conflict markers "
+        "below directly in this working tree so the result reflects the "
+        "INTENT of every step listed, then end your turn. Do not create a "
+        "git commit."
+    ]
+    for step in [*merged_so_far, conflicting_step]:
+        parts.append(
+            f"### Step: {step.get('title', '')}\n" + (step.get("body") or "").strip())
+    for relpath, text in markers.items():
+        parts.append(f"### Conflicting file: {relpath}\n```\n{text}\n```")
+    prompt = "\n\n".join(p for p in parts if p.strip())
+
+    adapter = _pick_adapter(cfg)
+    stage = f"merge-{conflicting_step.get('id') or 'wave'}"
+    _run_turn(adapter, env_dir, prompt, project_root,
+             task_id=task.id, stage=stage,
+             step_title=f"Merge: {conflicting_step.get('title', '')}",
+             tok_totals={}, tok_costs={}, cfg=cfg)
+    state_dir = env_dir / "state"
+    st = state.State.load(state_dir)
+    b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
+    if b == "blocked":
+        return "blocked"
+    # resumed / auto / no-block: the merge agent's turn is done either way —
+    # stage whatever it left in the tree (clears any unmerged index entries
+    # the failed `git apply --3way` left behind) and move on.
+    gitutil.stage_all(project_root)
+    return "resolved"
+
+
+def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
+                        wave: list[dict], results: dict, base_ref: str,
+                        cfg: Config) -> str:
+    """Apply each wave member's captured patch into the main tree, ONE AT A
+    TIME, in wave order, and ledger the outcome.
+
+    - Clean `gitutil.apply_patch` → ledger "ok"/"failed" (per the step's own
+      `ok`), save the patch ref, move on.
+    - Conflicting `apply_patch` (patch non-empty but didn't apply cleanly) →
+      dispatch ONE `_run_merge_agent_turn` for just this conflict. If IT
+      blocks (`ask_user`), the whole wave returns "blocked". Otherwise the
+      conflict is considered resolved and the step is ledgered "ok".
+    - A member that wrote `BLOCKED.md` during its OWN turn (not the merge
+      turn) never gets its patch applied; its ledger entry is "blocked" and
+      the wave overall returns "blocked" — but every OTHER member still
+      merges normally (matching the design's "at most one live block, deferred
+      to a sequential re-run" model).
+
+    Never creates a git commit — the merged result is left as an uncommitted
+    diff in `project_root`, whether the wave finishes clean or blocked.
+    """
+    state_dir = env_dir / "state"
+    # BLOCKED.md lives in the SHARED env_dir/state/, not per-worktree, so at
+    # most one wave member's block can ever be "live" here. We can't recover
+    # which member wrote it from the marker alone (no attribution is
+    # recorded), so we attribute it to the first member whose patch came back
+    # empty — a step that stopped mid-turn to ask a question typically hasn't
+    # produced tree changes yet. This is a deliberate, documented
+    # simplification (see the design spec's "Blocking inside a wave" section);
+    # a wave where the blocking step already made edits before asking is not
+    # perfectly attributed by this heuristic.
+    blocked_sid = None
+    if state.read_block_question(state_dir):
+        # Reuse the SAME `_handle_block` machinery a normal (non-wave) step
+        # block goes through — it transitions/saves `st` (so the run's final
+        # phase reports BLOCKED), waits/notifies exactly like any other block.
+        st = state.State.load(state_dir)
+        b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
+        if b == "blocked":
+            blocked_sid = next(
+                (step.get("id") or "" for step in wave
+                 if results.get(step.get("id") or "") is not None
+                 and not results[step.get("id") or ""][1]),
+                wave[0].get("id") or "")
+        # 'resumed' / 'auto': someone already answered (or auto-decided)
+        # before we got here — nothing left to defer, merge normally below.
+
+    merged_so_far: list[dict] = []
+    wave_blocked = False
     for step in wave:
         sid = step.get("id") or ""
         outcome = results.get(sid)
@@ -1242,16 +1348,41 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
                                       "output": "worktree creation failed"}
             continue
         ok, patch = outcome
-        applied = True
-        if patch:
-            applied = gitutil.apply_patch(project_root, patch)
+        if sid == blocked_sid:
+            task.step_results[sid] = {"status": "blocked", "started": started,
+                                      "ended": ended}
+            wave_blocked = True
+            continue
+        if not patch:
+            task.step_results[sid] = {"status": "ok" if ok else "failed",
+                                      "started": started, "ended": ended}
+            continue
+        applied = gitutil.apply_patch(project_root, patch)
+        if applied:
             gitutil.save_patch_ref(project_root, task.id, sid, patch)
-        task.step_results[sid] = {"status": "ok" if (ok and applied) else "failed",
-                                  "started": started, "ended": ended}
+            task.step_results[sid] = {"status": "ok" if ok else "failed",
+                                      "started": started, "ended": ended}
+            merged_so_far.append(step)
+            continue
+        # Conflict: one agent-merge turn, scoped to just this step's collision
+        # with whatever's already been merged into the tree.
+        tasks._save(task)
+        outcome_turn = _run_merge_agent_turn(env_dir, project_root, task,
+                                             merged_so_far, step, cfg)
+        if outcome_turn == "blocked":
+            task.step_results[sid] = {"status": "blocked", "started": started,
+                                      "ended": tasks._now_iso()}
+            tasks._save(task)
+            return "blocked"
+        gitutil.save_patch_ref(project_root, task.id, sid, patch)
+        task.step_results[sid] = {"status": "ok", "started": started,
+                                  "ended": tasks._now_iso(),
+                                  "output": "merged via agent-resolved conflict"}
+        merged_so_far.append(step)
     tasks._save(task)
     progress.log(env_dir, f"{task.id}: wave {wave[0].get('parallel')} merged "
                           f"({len(wave)} step(s))")
-    return "advance"
+    return "blocked" if wave_blocked else "advance"
 
 
 def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
@@ -1331,7 +1462,8 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
             for sid, wt in worktrees.items():
                 gitutil.remove_worktree(project_root, wt)
 
-        return _merge_wave_patches(env_dir, project_root, task, wave, results, base_ref)
+        return _merge_wave_patches(env_dir, project_root, task, wave, results,
+                                   base_ref, cfg)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -1480,6 +1612,11 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                     outcome = _run_parallel_wave(env_dir, project_root, task,
                                                  pending_wave, cfg, adapter)
                     if outcome in ("blocked", "conflict_unresolved"):
+                        # _merge_wave_patches (inside _run_parallel_wave) loads
+                        # and saves its OWN `state.State` instance when it
+                        # calls `_handle_block` — reload here so `st.phase`
+                        # reflects that before `_run_end` reports it.
+                        st = state.State.load(state_dir)
                         return _run_end(env_dir, st)
                     for s in pending_wave:
                         done_ids.add(s.get("id") or "")

@@ -209,6 +209,18 @@ def apply_patch(cwd: Path, patch_text: str, *, reverse: bool = False) -> bool:
         return False
 
 
+def stage_all(cwd: Path) -> None:
+    """`git add -A` at `cwd` — best-effort, never raises. Used after an
+    agent-merge turn resolves `git apply --3way` conflict markers directly in
+    the working tree, to clear any unmerged/conflicted index entries left
+    behind by the failed apply (so later `checkpoint`/`diff_as_patch` calls on
+    this tree don't trip over stale conflict state). Only stages; never
+    commits."""
+    if not is_repo(cwd):
+        return
+    _run(["add", "-A"], cwd)
+
+
 def save_patch_ref(cwd: Path, task_id: str, step_id: str, patch_text: str) -> None:
     """Persist `patch_text` as a blob object pinned under a hidden ref
     (refs/harn/patches/<task_id>/<step_id>), mirroring how `checkpoint`
