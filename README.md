@@ -248,6 +248,35 @@ optional lines that turn plain prose into something `harn run` executes:
   `config_error` event and `On fail` is treated as unset for that step (its
   failure is just recorded, not retried through a handler).
 
+## Step observability: skill/tool tiers, usage badges, context preview
+
+- **`Skills (required: a; recommended: b, c)`** and **`Tools (required: x;
+  recommended: y)`** — `required` items are always loaded/enforced;
+  `recommended` ones are surfaced to the agent but not force-loaded. The old
+  bare forms still work exactly as before: `Skills (required: a)` (no
+  recommended clause) and `Tools: x, y` (sugar for "all recommended, none
+  required").
+- After a step runs, Studio's step inspector shows a **green/yellow/red
+  badge** on each declared skill/tool chip: green = used, yellow =
+  recommended but unused, red = required but unused.
+- A **required-and-unused** skill/tool triggers exactly one automatic retry of
+  that same step with a reminder appended to its prompt; if it's still unused
+  on the retry, harn itself blocks the run (same as any other block) for a
+  human to resolve. This enforcement only applies to sequential steps — a
+  step running inside a parallel wave still records and shows usage, but is
+  never auto-retried or blocked by it.
+- The step inspector's **"View full context"** button shows the exact prompt
+  a step will receive (or did receive); **"Copy to file"** exports it to a
+  plain text file under `harn_env/state/context_exports/`.
+- The Board's **"⏸ Pause"** button (renamed from Stop, same underlying stop)
+  — steps already marked done stay done; edit the plan and click **▶
+  Resume** to continue only the remaining steps.
+- When a run is **BLOCKED**, the Board shows the question directly, with a
+  text box to answer it, instead of requiring `harn answer` from a terminal
+  (it reuses the same `loop.answer()` the CLI calls). Unchanged: if nobody
+  answers in time (chat, Studio, or CLI), harn still escalates the same
+  question to Telegram after `chat_grace_minutes`.
+
 ## Multiple agents, one shared context
 
 Set `agents = ["claude", "codex", …]`; the first installed one runs. Whichever
@@ -696,6 +725,35 @@ todo → in_progress → review ⇄ changes_requested → done
   retry/handler-переходы с параллелизмом решили не делать. Если оба поля
   заданы одновременно, пишется событие `config_error`, а `On fail`
   игнорируется для этого шага (ошибка просто фиксируется, без хендлера).
+
+### Наблюдаемость шагов: уровни скилов/тулов, бейджи использования, превью контекста
+
+- **`Skills (required: a; recommended: b, c)`** и **`Tools (required: x;
+  recommended: y)`** — `required`-элементы всегда загружаются и проверяются;
+  `recommended` — показываются агенту, но не загружаются принудительно.
+  Старые формы по-прежнему работают: `Skills (required: a)` (без секции
+  recommended) и `Tools: x, y` (сахар для «всё recommended, ничего
+  required»).
+- После выполнения шага инспектор Studio показывает **зелёный/жёлтый/красный
+  бейдж** на каждом чипе скила/тула: зелёный — использован, жёлтый —
+  рекомендован, но не использован, красный — обязателен, но не использован.
+- **Обязательный и неиспользованный** скил/тул запускает ровно один
+  автоматический повтор того же шага с напоминанием в промпте; если и на
+  повторе он не использован — harn сам блокирует прогон (как любой другой
+  блок) для решения человеком. Это применяется только к последовательным
+  шагам — шаг внутри параллельной волны по-прежнему фиксирует и показывает
+  использование, но никогда не повторяется и не блокируется этой проверкой.
+- Кнопка **«View full context»** в инспекторе шага показывает точный промпт,
+  который шаг получит (или получил); **«Copy to file»** экспортирует его в
+  текстовый файл в `harn_env/state/context_exports/`.
+- Кнопка доски **«⏸ Pause»** (переименованный Stop, та же остановка) — уже
+  выполненные шаги остаются выполненными; отредактируйте план и нажмите
+  **▶ Resume**, чтобы продолжить только оставшиеся шаги.
+- Когда прогон **BLOCKED**, доска показывает вопрос прямо там, с полем для
+  ответа, вместо `harn answer` из терминала (используется тот же
+  `loop.answer()`, что и CLI). Без изменений: если никто не ответит вовремя
+  (в чате, Studio или CLI), harn по-прежнему эскалирует тот же вопрос в
+  Telegram после `chat_grace_minutes`.
 
 ### Несколько агентов, один контекст
 
