@@ -155,3 +155,90 @@ def rollback_to(ref: str, cwd: Path, *, apply: bool,
         except OSError:
             pass
     return RollbackResult(True, f"restored {len(files)} file(s) to {ref[:8]}", files)
+
+
+def create_worktree(cwd: Path, base_ref: str, worktree_path: Path) -> bool:
+    """Create a detached worktree at `worktree_path`, checked out at
+    `base_ref`. Best-effort like the rest of this module: returns whether it
+    succeeded, never raises."""
+    if not is_repo(cwd) or not base_ref:
+        return False
+    code, _, _ = _run(["worktree", "add", "--detach", str(worktree_path), base_ref], cwd)
+    return code == 0
+
+
+def remove_worktree(cwd: Path, worktree_path: Path) -> None:
+    """Remove a worktree created by `create_worktree` (best-effort). Also
+    handles the case the worktree directory was already deleted out from
+    under git."""
+    if not is_repo(cwd):
+        return
+    code, _, _ = _run(["worktree", "remove", "--force", str(worktree_path)], cwd)
+    if code != 0:
+        # Directory may already be gone; prune the stale admin entry too.
+        _run(["worktree", "prune"], cwd)
+
+
+def diff_as_patch(worktree_path: Path, base_ref: str) -> str:
+    """Full unified diff of `worktree_path` against `base_ref`, covering
+    staged, unstaged, and untracked-but-new files. Returns "" if there's no
+    diff (or on any git failure)."""
+    if not is_repo(worktree_path) or not base_ref:
+        return ""
+    _run(["add", "-A"], worktree_path)
+    code, out, _ = _run(["diff", "--cached", base_ref], worktree_path)
+    return out + "\n" if code == 0 and out else ""
+
+
+def apply_patch(cwd: Path, patch_text: str, *, reverse: bool = False) -> bool:
+    """Apply `patch_text` to the working tree at `cwd` via `git apply --3way`
+    (reverse-applies if `reverse=True`). Returns whether it applied cleanly;
+    never raises."""
+    if not is_repo(cwd) or not patch_text:
+        return False
+    args = ["apply", "--3way"]
+    if reverse:
+        args.append("--reverse")
+    try:
+        r = subprocess.run(
+            ["git", *args], cwd=cwd, input=patch_text, capture_output=True,
+            text=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def save_patch_ref(cwd: Path, task_id: str, step_id: str, patch_text: str) -> None:
+    """Persist `patch_text` as a blob object pinned under a hidden ref
+    (refs/harn/patches/<task_id>/<step_id>), mirroring how `checkpoint`
+    pins a dangling commit. Best-effort; no-op on failure."""
+    if not is_repo(cwd):
+        return
+    try:
+        r = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=cwd, input=patch_text,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    sha = r.stdout.strip()
+    if r.returncode != 0 or not sha:
+        return
+    _run(["update-ref", f"refs/harn/patches/{task_id}/{step_id}", sha], cwd)
+
+
+def load_patch_ref(cwd: Path, task_id: str, step_id: str) -> str:
+    """Read back a patch saved with `save_patch_ref`, or '' if missing / not
+    a repo / any git failure. Uses raw subprocess (not `_run`) so the patch
+    text round-trips exactly, without `_run`'s trailing-whitespace strip."""
+    if not is_repo(cwd):
+        return ""
+    try:
+        r = subprocess.run(
+            ["git", "cat-file", "-p", f"refs/harn/patches/{task_id}/{step_id}"],
+            cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
