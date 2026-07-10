@@ -20,6 +20,12 @@ Event vocabulary (the `event` field):
   cycle_end    — a task work-cycle completed (submitted for review / done)
   error        — a turn raised (detail=…)
   run_end      — the run/session finished (phase=…)
+  context_read — a skill/service/PRD/guidance body was pulled into a turn's
+                 context (kind=skill|service|prd|guidance, name=…)
+  tool_used    — any MCP tool was invoked during a task's claimed turn
+                 (tool=…, step_id=… when known)
+  config_error — a workflow declaration harn can't safely honor was ignored
+                 (detail=…)
 """
 from __future__ import annotations
 

@@ -1287,7 +1287,7 @@ def _collect_wave(steps: list[dict], first: dict) -> list[dict]:
 
 
 def _replicate_connectors(project_root: Path, worktree_path: Path,
-                          env_dir: Path) -> None:
+                          env_dir: Path, step_id: str = "") -> None:
     """Copy whichever connector files exist at `project_root` into the same
     relative paths under `worktree_path`, so ANY agent CLI run there (Claude,
     Cursor, ...) discovers the harn MCP server exactly like it would in the
@@ -1295,6 +1295,14 @@ def _replicate_connectors(project_root: Path, worktree_path: Path,
     `env.HARN_ENV_DIR` is rewritten to an ABSOLUTE path — `env_dir` is the
     real (non-worktree) harn_env, and a worktree copy has no such directory of
     its own, so a relative value would resolve to nothing there.
+
+    `step_id`, when given, is also written into the copied connector's
+    `env.HARN_STEP_ID` — this is how a parallel-wave member's MCP server
+    subprocess (sharing the ONE main harn_env, per the absolute
+    HARN_ENV_DIR rewrite above) can still tag its `tool_used` events with
+    the correct step id, even though `state.State.current_step` cannot
+    represent more than one concurrently-active step (see Phase 4 spec's
+    enforcement Non-goal).
     """
     for rel in (".mcp.json", ".cursor/mcp.json"):
         src = project_root / rel
@@ -1306,7 +1314,10 @@ def _replicate_connectors(project_root: Path, worktree_path: Path,
             cfg_json = json.loads(src.read_text(encoding="utf-8"))
             harn_server = cfg_json.get("mcpServers", {}).get("harn")
             if harn_server is not None:
-                harn_server.setdefault("env", {})["HARN_ENV_DIR"] = str(env_dir.resolve())
+                env_block = harn_server.setdefault("env", {})
+                env_block["HARN_ENV_DIR"] = str(env_dir.resolve())
+                if step_id:
+                    env_block["HARN_STEP_ID"] = step_id
             dst.write_text(json.dumps(cfg_json, indent=2), encoding="utf-8")
         except (ValueError, OSError):
             shutil.copy(src, dst)  # best-effort: copy verbatim if we can't parse it
@@ -1543,7 +1554,7 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                             detail="On fail is not supported inside a parallel wave (Phase 3 non-goal)")
             wt = tmp_root / (sid or wave_id)
             if gitutil.create_worktree(project_root, base_ref, wt):
-                _replicate_connectors(project_root, wt, env_dir)
+                _replicate_connectors(project_root, wt, env_dir, step_id=sid)
                 worktrees[sid] = wt
             else:
                 events.emit(env_dir, "config_error", task_id=task.id, stage=sid,

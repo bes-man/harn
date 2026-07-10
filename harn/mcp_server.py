@@ -129,6 +129,46 @@ def build_server(start_watch: bool = True):
 
     mcp = FastMCP("harn")
 
+    # Tag every MCP tool call with the currently claimed task (and, for a
+    # sequential step, the currently running step) so studio can later show
+    # which skills/tools a step actually used. Wraps mcp.tool() ONCE here
+    # instead of touching each of the 35+ individual tool functions below.
+    # Step-id resolution: HARN_STEP_ID (set by _replicate_connectors for a
+    # parallel-wave member's worktree-local MCP config, since one wave has N
+    # concurrently-active steps that State.current_step can't represent)
+    # takes priority, falling back to State.current_step (a sequential
+    # step, Task 4). Deliberately a comment, not a docstring — see the
+    # test_guidance.py note above `build_server` about its fixed triple-
+    # quote token-budget sweep.
+    def _record_tool_used(tool_name: str) -> None:
+        try:
+            env = _env_dir()
+            st = state_mod.State.load(env / "state")
+            if not st.current_task:
+                return
+            step_id = os.environ.get("HARN_STEP_ID", "") or st.current_step or ""
+            events_mod.emit(env, "tool_used", task_id=st.current_task,
+                            step_id=step_id or None, tool=tool_name)
+        except Exception:
+            pass
+
+    _orig_tool = mcp.tool
+
+    def _tracked_tool(*deco_args, **deco_kwargs):
+        inner_decorator = _orig_tool(*deco_args, **deco_kwargs)
+
+        def wrap(fn):
+            import functools
+
+            @functools.wraps(fn)
+            def traced(*args, **kwargs):
+                _record_tool_used(fn.__name__)
+                return fn(*args, **kwargs)
+            return inner_decorator(traced)
+        return wrap
+
+    mcp.tool = _tracked_tool
+
     if start_watch:
         # Auto-start the watch dispatcher so Telegram escalation, oracle, and
         # live status work without the user having to run a separate command.
