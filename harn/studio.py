@@ -1219,7 +1219,7 @@ function renderBoard(){
     const rt=(BOARD.tasks||[]).find(t=>t.id===BOARD.run.task_id);
     html+=`<div class="runbanner">▶ running <b>${esc(BOARD.run.task_id)}</b>`+
       `${rt?': '+esc(rt.title):''} (pid ${BOARD.run.pid}${BOARD.run.auto?' · auto':''})`+
-      `<button class="ghost" onclick="stopRun()">■ Stop</button></div>`;
+      `<button class="ghost" onclick="stopRun()" title="Steps already done stay done; edit the plan, then ▶ Resume">⏸ Pause</button></div>`;
   }
   BOARD_ORDER.forEach(s=>{
     const list=(groups[s]||[]).slice().sort((a,b)=>a.priority-b.priority);
