@@ -153,6 +153,19 @@ def test_loop_emits_run_stage_and_cycle_events(tmp_path, monkeypatch):
     assert len(rids) == 1 and next(iter(rids)).startswith("r-")
 
 
+def test_sequential_agent_step_records_output_in_ledger(tmp_path, monkeypatch):
+    env = _env_with_task(tmp_path)
+    fake = FakeAdapter(text="did the work")
+    monkeypatch.setattr(loop, "get_adapter", lambda name: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    task = tasks.find(env, "PRJ-001")
+    assert task.step_results["step-000001"]["status"] == "ok"
+    assert "did the work" in task.step_results["step-000001"]["output"]
+
+
 def test_loop_run_end_carries_final_phase(tmp_path, monkeypatch):
     env = _env_with_task(tmp_path)
     fake = FakeAdapter()

@@ -1843,7 +1843,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             else:
                 task.step_results[sid] = {"status": "ok", "started": started,
                                           "ended": tasks._now_iso(),
-                                          "tokens": result.total_tokens}
+                                          "tokens": result.total_tokens,
+                                          "output": (result.text or "")[-4000:]}
                 tasks._save(task)
                 task = tasks.find(env_dir, task.id) or task
             # More steps remain? loop to run the next one.
