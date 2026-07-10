@@ -53,21 +53,29 @@ def _log(msg: str) -> None:
 
 def _context_read(kind: str, name: str) -> None:
     """Record that a skill/service/PRD/guidance body was actually pulled into
-    context, tagged to the currently claimed task (STATE.json's current_task).
+    context, tagged to the currently claimed task (STATE.json's current_task)
+    and, for a sequential step, the currently running step.
 
     Skill/tool NAMES live in every prompt (cheap index), but a body only enters
     the agent's context when it explicitly calls one of these read_* tools —
     that decision happens live inside the agent's own turn, invisible to harn
     unless recorded here. This is the only way to later answer "what actually
     ended up in this task's context" (`harn trace`, the studio board's Context
-    section) instead of just "what was AVAILABLE to load".
+    section) instead of just "what was AVAILABLE to load" — and, via `step_id`,
+    what a Phase 4 post-step usage audit (`loop._audit_step_usage`) needs to
+    tell "used" from "unused" for a step's required/recommended skills.
+
+    step_id resolution mirrors `_record_tool_used` below: `HARN_STEP_ID` (set
+    for a parallel-wave member's worktree-local MCP config) takes priority,
+    falling back to `State.current_step` for a sequential step.
     """
     try:
         env = _env_dir()
         st = state_mod.State.load(env / "state")
         if st.current_task:
+            step_id = os.environ.get("HARN_STEP_ID", "") or st.current_step or ""
             events_mod.emit(env, "context_read", task_id=st.current_task,
-                            kind=kind, name=name)
+                            step_id=step_id or None, kind=kind, name=name)
     except Exception:
         pass
 

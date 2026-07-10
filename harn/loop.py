@@ -600,6 +600,49 @@ def save_context_export(env_dir: Path, task_id: str, step_id: str,
     return p
 
 
+def _audit_step_usage(env_dir: Path, task: "tasks.Task", step: dict) -> dict:
+    """Compare a step's declared required/recommended skills+tools against
+    what actually got used during its window (`tool_used` + `context_read`
+    events scoped to this step's own id, via `step_id`).
+
+    Returns {"skills": {name: "used"|"unused_recommended"|"unused_required"},
+             "tools":  {name: "used"|"unused_recommended"|"unused_required"}}.
+    Task 7 (studio badges) reads this same shape off
+    `task.step_results[sid]["usage"]`."""
+    sid = step.get("id") or ""
+    evs = events.read(env_dir, task_id=task.id)
+    used_skill_names = {e.get("name") for e in evs
+                        if e.get("event") == "context_read"
+                        and e.get("kind") == "skill" and e.get("step_id") == sid}
+    used_tool_names = {e.get("tool") for e in evs
+                       if e.get("event") == "tool_used" and e.get("step_id") == sid}
+
+    def _tier(name: str, required: list, used: set) -> str:
+        if name in used:
+            return "used"
+        if name in required:
+            return "unused_required"
+        return "unused_recommended"
+
+    req_skills = [s for s in (step.get("required") or []) if s]
+    rec_skills = [s for s in (step.get("skills_recommended") or []) if s]
+    req_tools = [t for t in (step.get("tools") or []) if t]
+    rec_tools = [t for t in (step.get("tools_recommended") or []) if t]
+    skills_out = {n: _tier(n, req_skills, used_skill_names)
+                 for n in [*req_skills, *rec_skills]}
+    tools_out = {n: _tier(n, req_tools, used_tool_names)
+                for n in [*req_tools, *rec_tools]}
+    return {"skills": skills_out, "tools": tools_out}
+
+
+_REQUIRED_UNUSED_RETRY_NOTE = (
+    "## You skipped a required skill or tool last time\n"
+    "Your previous attempt at this step did NOT use the following REQUIRED "
+    "skill(s)/tool(s): {names}. You MUST use it/them this time before "
+    "finishing this step."
+)
+
+
 def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> None:
     """Snapshot the working tree right before this stage's turn runs (see
     gitutil.checkpoint) so the studio UI's per-step Rerun control — or
@@ -1660,6 +1703,13 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     tok_costs: dict[str, float] = {}
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
+    # Debounces the post-step required-usage enforcement retry (Phase 4) to
+    # fire at most ONCE per (task, step) within this run() call — in-memory
+    # only, never persisted to the task's JSON, matching `tests_nudged`'s own
+    # per-run debounce idiom right above. Sequential steps only (see the
+    # design spec's parallel-wave Non-goal); `_run_parallel_wave` never
+    # consults this set.
+    enforcement_retried: set[tuple[str, str]] = set()
     last_step_text = ""              # last step's output (for the review summary)
     # In auto mode task files are never mutated, so step progress is tracked
     # in memory instead of the on-disk ledger (task.step_results).
@@ -1875,15 +1925,52 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 print("[harn] Code changed without tests; looping to add them.")
                 continue  # same step, with the nudge as feedback
 
-            # Step done — ledger it and advance to the next step next iteration.
+            # Step done — audit required/recommended usage before ledgering
+            # (sequential steps only; a parallel wave's members are never
+            # retried/blocked by this audit — see the design spec's Non-goal).
             feedback_tail = ""
             if auto:
                 done_ids.add(sid)
             else:
+                usage = _audit_step_usage(env_dir, task, step)
+                unused_required = [n for n, v in {**usage["skills"], **usage["tools"]}.items()
+                                   if v == "unused_required"]
+                retry_key = (task.id, sid)
+                if unused_required and retry_key not in enforcement_retried:
+                    # One retry only: reuse the SAME step, with an explicit
+                    # reminder appended to its prompt as feedback.
+                    enforcement_retried.add(retry_key)
+                    feedback_tail = _REQUIRED_UNUSED_RETRY_NOTE.format(
+                        names=", ".join(unused_required))
+                    task.step_results[sid] = {"status": "running",
+                                              "started": started, "ended": None,
+                                              "usage": usage}
+                    tasks._save(task)
+                    print(f"[harn] {task.id} · {title}: required skill/tool "
+                         f"unused ({', '.join(unused_required)}); retrying once.")
+                    continue  # same step, one retry, with the reminder as feedback
+                if unused_required:
+                    # Already retried once and it's STILL unused — the
+                    # harness itself (not the agent) blocks, exactly like any
+                    # other block, for a human to resolve.
+                    detail = ("Required skill(s)/tool(s) still unused after "
+                             f"one retry of step '{title}' ({sid}): "
+                             f"{', '.join(unused_required)}.")
+                    state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+                    st.block(detail)
+                    st.save(state_dir)
+                    task.step_results[sid] = {"status": "blocked",
+                                              "started": started,
+                                              "ended": tasks._now_iso(),
+                                              "usage": usage}
+                    tasks._save(task)
+                    print(f"[harn] {task.id} · {title}: BLOCKED — {detail}")
+                    return _run_end(env_dir, st)
                 task.step_results[sid] = {"status": "ok", "started": started,
                                           "ended": tasks._now_iso(),
                                           "tokens": result.total_tokens,
-                                          "output": (result.text or "")[-4000:]}
+                                          "output": (result.text or "")[-4000:],
+                                          "usage": usage}
                 tasks._save(task)
                 task = tasks.find(env_dir, task.id) or task
             # More steps remain? loop to run the next one.
