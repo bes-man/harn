@@ -113,3 +113,74 @@ def test_save_custom_tool_payload_rejects_path_traversal_in_script_name(tmp_path
     # tools dir -- it either lands safely inside it or is rejected outright.
     assert not (project_root / "evil.sh").exists()
     assert not (project_root.parent / "evil.sh").exists()
+
+
+def test_draft_tool_chat_payload_calls_one_agent_turn_and_parses_a_draft(tmp_path, monkeypatch):
+    env, project_root = _env(tmp_path)
+
+    class FakeAdapter:
+        name = "fake"
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            class R:
+                ok = True
+                text = (
+                    "Sure, here's a tool that runs your linter:\n\n"
+                    "```json\n"
+                    '{"name": "run_lint", "description": "Run project lint", '
+                    '"params": ["target"], "command": "npm run lint -- {target}"}\n'
+                    "```\n"
+                )
+            return R()
+
+    monkeypatch.setattr(studio, "_pick_adapter", lambda cfg: FakeAdapter())
+    from harn.config import Config
+    result = studio.draft_tool_chat_payload(env, project_root, Config(), {
+        "history": [], "message": "I want a tool that runs my linter",
+    })
+    assert "here's a tool" in result["reply"]
+    assert result["draft"]["name"] == "run_lint"
+    assert result["draft"]["params"] == ["target"]
+
+
+def test_draft_tool_chat_payload_keeps_no_draft_when_reply_has_none(tmp_path, monkeypatch):
+    env, project_root = _env(tmp_path)
+
+    class FakeAdapter:
+        name = "fake"
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            class R:
+                ok = True
+                text = "Can you tell me more about what the tool should do?"
+            return R()
+
+    monkeypatch.setattr(studio, "_pick_adapter", lambda cfg: FakeAdapter())
+    from harn.config import Config
+    result = studio.draft_tool_chat_payload(env, project_root, Config(), {
+        "history": [], "message": "make me a tool",
+    })
+    assert result["draft"] is None
+
+
+def test_draft_tool_chat_payload_includes_full_transcript_in_the_prompt(tmp_path, monkeypatch):
+    env, project_root = _env(tmp_path)
+    captured = {}
+
+    class FakeAdapter:
+        name = "fake"
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            captured["prompt"] = prompt
+            class R:
+                ok = True
+                text = "ok"
+            return R()
+
+    monkeypatch.setattr(studio, "_pick_adapter", lambda cfg: FakeAdapter())
+    from harn.config import Config
+    studio.draft_tool_chat_payload(env, project_root, Config(), {
+        "history": [{"role": "user", "text": "first message"},
+                    {"role": "agent", "text": "first reply"}],
+        "message": "second message",
+    })
+    assert "first message" in captured["prompt"]
+    assert "first reply" in captured["prompt"]
+    assert "second message" in captured["prompt"]

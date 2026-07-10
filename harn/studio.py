@@ -32,6 +32,7 @@ from . import tools as tools_mod
 from . import workflow as workflow_mod
 from . import workflows as workflows_mod
 from .config import Config
+from .loop import _pick_adapter
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +223,61 @@ def delete_custom_tool_payload(env_dir: Path, name: str) -> dict:
     if not tools_mod.delete(env_dir, name):
         return {"ok": False, "error": f"no such custom tool: {name}"}
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Agent-chat tool drafting (Phase 5, Task 5) — one blocking agent turn per
+# Send, never streamed. Each call sends the FULL transcript so far (every
+# prior user/agent message) so the agent keeps the whole conversation in
+# view, exactly like a fresh non-interactive `run_turn` call would need.
+# --------------------------------------------------------------------------- #
+_TOOL_DRAFT_SYSTEM_NOTE = (
+    "You are helping a user design a new custom tool for harn. A custom "
+    "tool is a name + description + list of simple string parameter names "
+    "+ a shell command template using {param} placeholders. Reply "
+    "conversationally, and whenever you have a concrete proposal (even a "
+    "rough first draft), ALSO include it as a fenced ```json code block "
+    "with exactly these keys: name, description, params (a list of "
+    "strings), command (a string with {param} placeholders matching "
+    "params). Keep replies short."
+)
+_DRAFT_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+_DRAFT_REQUIRED_KEYS = {"name", "description", "params", "command"}
+
+
+def draft_tool_chat_payload(env_dir: Path, project_root: Path, cfg: Config,
+                             payload: dict) -> dict:
+    """One turn of the Studio's tool-drafting chat: send the full transcript
+    so far (every prior message, oldest first) plus the new message as a
+    single blocking `adapter.run_turn` call, then look for a fenced
+    ```json draft in the reply. No streaming, no multi-turn loop here — the
+    UI calls this once per Send and re-renders with the result.
+
+    A missing or malformed draft never raises; `draft` is simply None so the
+    chat can keep going until the agent produces something parseable."""
+    history = payload.get("history") or []
+    message = (payload.get("message") or "").strip()
+    if not message:
+        return {"reply": "", "draft": None, "error": "empty message"}
+    transcript = "\n\n".join(
+        f"{'User' if h.get('role') == 'user' else 'Agent'}: {h.get('text', '')}"
+        for h in history
+    )
+    prompt = "\n\n".join(p for p in (
+        _TOOL_DRAFT_SYSTEM_NOTE, transcript, f"User: {message}") if p.strip())
+    adapter = _pick_adapter(cfg)
+    result = adapter.run_turn(prompt, project_root)
+    reply = result.text or ""
+    m = _DRAFT_JSON_RE.search(reply)
+    draft = None
+    if m:
+        try:
+            candidate = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict) and _DRAFT_REQUIRED_KEYS <= candidate.keys():
+            draft = candidate
+    return {"reply": reply, "draft": draft}
 
 
 def apply_skill(env_dir: Path, payload: dict) -> dict:
@@ -811,6 +867,9 @@ def _make_handler(default_env: Path):
                 self._json(save_custom_tool_payload(env, body))
             elif route == "/api/tools/delete":
                 self._json(delete_custom_tool_payload(env, body.get("name", "")))
+            elif route == "/api/tools/chat":
+                cfg = Config.load(env)
+                self._json(draft_tool_chat_payload(env, env.parent, cfg, body))
             elif route == "/api/layout":
                 self._json(apply_layout(env, body))
             elif route == "/api/config":
