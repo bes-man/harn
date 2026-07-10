@@ -1300,6 +1300,15 @@ _HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const $=s=>document.querySelector(s);
+// True when the user is mid-interaction with a form control inside `el`: a
+// focused input/textarea, or an OPEN native <select> (which keeps itself as
+// document.activeElement while its dropdown is showing). Poll-driven re-renders
+// check this so a 1.5s tick never rebuilds the DOM out from under an open
+// dropdown or a half-typed field.
+function isEditing(el){
+  const a=document.activeElement;
+  return !!(a && el && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+}
 // one consistent minimal trash icon, reused for every delete affordance.
 const TRASH_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '+
   'stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline>'+
@@ -1462,7 +1471,10 @@ async function pollBoard(){
   if(tab!=='board') return;
   renderBoard();
   if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
-    renderTaskDetail();
+    // Don't rebuild the inspector out from under an open <select> or a focused
+    // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
+    // steal focus mid-typing. The next tick refreshes once the user is done.
+    if(!isEditing($('#insp'))) renderTaskDetail();
     await pollBlockedQuestion();
   } else{
     boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
@@ -1664,14 +1676,20 @@ function stepChoices(n){
 // the old stage-keyed setModelField/setStageAgent/saveStepModel plumbing.
 // Changing the agent can invalidate the current model, so it's cleared and
 // the inspector re-rendered (same guard the old setStageAgent had).
-function setStepField(field,val){
+function setStepField(field,val,rerender){
   if(!selNode) return;
   selNode[field]=(val||'').trim();
   if(field==='agent'){
     const valid=(agentCaps(selNode.agent||MODELS.default_agent||'').models)||[];
     if(selNode.model && valid.length && !valid.includes(selNode.model)) selNode.model='';
   }
-  checkDirty(); renderInsp();
+  checkDirty();
+  // Only structural changes (a <select> that swaps which fields the inspector
+  // shows, or that changes another field's option list) need a re-render.
+  // Free-text <input>/<textarea> handlers pass rerender=false: re-rendering on
+  // every keystroke rebuilds the very element being typed into and steals its
+  // focus after each character.
+  if(rerender!==false) renderInsp();
 }
 // A <select> of known values + a "Custom…" escape hatch (curated lists go
 // stale as providers ship new models — this keeps typing-it-yourself always
@@ -1687,7 +1705,7 @@ function selectOrCustom(keyid,field,current,options){
   </select>
   <input type="text" placeholder="custom ${esc(field)}" value="${esc(isCustom?current:'')}"
     style="margin-top:4px;${isCustom?'':'display:none'}" id="mc-${esc(keyid)}-${field}"
-    oninput="setStepField('${field}',this.value)"/>`;
+    oninput="setStepField('${field}',this.value,false)"/>`;
   return sel;
 }
 function onModelSelect(keyid,field,sel){
@@ -2281,7 +2299,7 @@ function renderInsp(){
     return `
     <label>Command <span class="mut">(shell, runs in the project root — no LLM, no tokens)</span></label>
     <textarea style="min-height:70px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px"
-      oninput="setStepField('command',this.value)" placeholder="npm test">${esc(n.command||'')}</textarea>
+      oninput="setStepField('command',this.value,false)" placeholder="npm test">${esc(n.command||'')}</textarea>
     <label>On fail <span class="mut">(dispatch this agent step, then retry the command)</span></label>
     <select onchange="setStepField('on_fail',this.value)">${onFailOpts}</select>
     ${runBtns}
@@ -2370,7 +2388,14 @@ function renderInsp(){
 function upd(k,v){
   if(!selNode) return; const old=selNode.title;
   selNode[k]=v; checkDirty();
-  if(k==='title'){ if(L[old]){ L[v]=L[old]; if(v!==old) delete L[old]; } renderFlow(); }
+  if(k==='title'){
+    if(L[old]){ L[v]=L[old]; if(v!==old) delete L[old]; }
+    // Update the selected node's on-canvas label directly instead of a full
+    // renderFlow() — the latter also re-runs renderInsp(), which rebuilds the
+    // title <input> being typed into and drops focus after each character.
+    const lbl=document.querySelector('#surface .node.sel .ttl span:last-child');
+    if(lbl) lbl.textContent=v;
+  }
 }
 function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); renderFlow(); }
 function toggleReq(name){
