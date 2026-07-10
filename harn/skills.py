@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import tasks as _tasks
+
 _FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
@@ -76,25 +78,33 @@ def append_learning(env_dir: Path, name: str, content: str,
     This is how harn accumulates project knowledge: an answer or a discovered
     convention is saved into the matching skill so future agents read it instead
     of asking again. Returns the SKILL.md path.
+
+    Locked (`_claim_lock`) around the FULL read-modify-write cycle (create-if-
+    absent, read current body, append, write back) — two parallel-wave agents
+    calling this for the same skill at the same instant would otherwise both
+    read the same pre-append body and the second write would silently drop the
+    first agent's entry. This is new risk as of Phase 3 (multiple real agent
+    processes, not just one).
     """
     name = name.strip().lower().replace(" ", "-")
     content = content.strip()
     skill_dir = env_dir / "skills" / name
     md = skill_dir / "SKILL.md"
-    if not md.exists():
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        desc = description.strip() or f"{name} standards and conventions for this project."
-        md.write_text(
-            f"---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n",
-            encoding="utf-8",
-        )
-    text = md.read_text(encoding="utf-8", errors="replace").rstrip()
-    entry = f"- {content}"
-    if _LEARNED_HEADING in text:
-        text += "\n" + entry + "\n"
-    else:
-        text += f"\n\n{_LEARNED_HEADING}\n{entry}\n"
-    md.write_text(text, encoding="utf-8")
+    with _tasks._claim_lock(env_dir):
+        if not md.exists():
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            desc = description.strip() or f"{name} standards and conventions for this project."
+            md.write_text(
+                f"---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n",
+                encoding="utf-8",
+            )
+        text = md.read_text(encoding="utf-8", errors="replace").rstrip()
+        entry = f"- {content}"
+        if _LEARNED_HEADING in text:
+            text += "\n" + entry + "\n"
+        else:
+            text += f"\n\n{_LEARNED_HEADING}\n{entry}\n"
+        md.write_text(text, encoding="utf-8")
     return md
 
 

@@ -623,38 +623,73 @@ def log_started(task: Task, agent: str, rework: bool = False) -> None:
 
 
 def set_scratchpad(task: Task, notes: str) -> None:
-    """Replace the agent's continuity note (carried to its next iteration)."""
-    task.scratchpad = notes.strip()
-    _save(task)
+    """Replace the agent's continuity note (carried to its next iteration).
+
+    Locked (read-modify-write, under `_claim_lock`): two parallel-wave agents
+    could otherwise both read a stale copy of `task`, each overwrite
+    `scratchpad` independently, and the second `_save` silently discard
+    whatever the first one wrote elsewhere on the task (e.g. a concurrently
+    appended decision). Re-loading from disk INSIDE the lock (not trusting the
+    caller's possibly-stale `task` object) is what actually closes the race —
+    locking only the final write, with the read left outside, would not.
+    """
+    text = notes.strip()
+    env_dir = task.path.parent.parent
+    with _claim_lock(env_dir):
+        fresh = _load(task.path)
+        fresh.scratchpad = text
+        _save(fresh)
+        task.scratchpad = text
 
 
 def record_decision(task: Task, decision: str, rationale: str = "",
                     agent: str | None = None) -> None:
-    """Append a decision the agent made. Oracle will VERIFY it, not assume it."""
+    """Append a decision the agent made. Oracle will VERIFY it, not assume it.
+
+    Locked (read-modify-write): see `set_scratchpad` docstring — the fix is
+    the same shape (reload fresh under the lock, mutate, save, then sync the
+    caller's in-memory `task` so callers reading `task.decisions` right after
+    see the true post-write state).
+    """
     if not decision.strip():
         return
-    task.decisions.append(Decision(
+    entry = Decision(
         decision=decision.strip(),
         rationale=rationale.strip(),
         ts=_now_iso(),
         agent=agent,
-    ))
-    _save(task)
+    )
+    env_dir = task.path.parent.parent
+    with _claim_lock(env_dir):
+        fresh = _load(task.path)
+        fresh.decisions.append(entry)
+        _save(fresh)
+        task.decisions = fresh.decisions
 
 
 def record_change(task: Task, summary: str, detail: str = "",
                   agent: str | None = None) -> None:
     """Append a release-notes-style change entry (what shipped + optional
-    decisions/standards). Append-only; timestamped; used to assemble docs."""
+    decisions/standards). Append-only; timestamped; used to assemble docs.
+
+    Locked (read-modify-write): same race/fix shape as `set_scratchpad` and
+    `record_decision` above — two agents finishing parallel steps of the same
+    task could each call this within the same instant.
+    """
     if not summary.strip():
         return
-    task.changelog.append(ChangeEntry(
+    entry = ChangeEntry(
         ts=_now_iso(),
         summary=summary.strip(),
         detail=detail.strip(),
         agent=agent,
-    ))
-    _save(task)
+    )
+    env_dir = task.path.parent.parent
+    with _claim_lock(env_dir):
+        fresh = _load(task.path)
+        fresh.changelog.append(entry)
+        _save(fresh)
+        task.changelog = fresh.changelog
 
 
 def clear_scratchpad(task: Task) -> None:
