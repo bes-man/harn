@@ -936,6 +936,14 @@ _HTML = r"""<!DOCTYPE html>
     50%{box-shadow:0 0 0 2px var(--accent),0 0 16px 2px #7c8cff88}}
   .node .stat{margin-top:7px;font-size:10.5px;color:var(--muted);
     font-family:ui-monospace,Menlo,monospace;border-top:1px solid var(--line);padding-top:5px}
+  /* Phase 3 "lane" — translucent backdrop grouping a wave of parallel steps.
+     Non-interactive (pointer-events:none) and painted behind .node (z-index
+     0 vs 1) so dragging/selecting/clicking members is completely unaffected. */
+  .lane{position:absolute;z-index:0;pointer-events:none;border:1px dashed var(--accent);
+    border-radius:14px;background:rgba(124,140,255,.07)}
+  .lane-chip{position:absolute;top:5px;left:12px;font-size:10.5px;font-weight:600;
+    color:var(--accent);background:var(--panel);border:1px solid var(--accent);
+    border-radius:999px;padding:2px 9px;white-space:nowrap}
   /* terminal "Run workflow" block — the last node in the flow, not draggable */
   .node.terminal{cursor:default;width:280px;border-color:var(--accent);
     background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%)}
@@ -1549,6 +1557,7 @@ function posFor(n,i){ return L[n.title] || {x:120, y:40+i*170}; }
 function renderFlow(){
   const surf=$('#surface');
   [...surf.querySelectorAll('.node')].forEach(e=>e.remove());
+  [...surf.querySelectorAll('.lane')].forEach(e=>e.remove());
   const nums=numbers();
   const busy=!!BOARD.run;
   const selTaskId=runStepTaskId();
@@ -1588,10 +1597,76 @@ function renderFlow(){
   term.style.left='120px'; term.style.top=(maxBottom+40)+'px';
   renderFlowTerminal(term);
   surf.appendChild(term);
+  renderLanes();
   fitSurface(); redrawEdges();
   applyProgress();
   renderInsp();
   renderPlanBanner();
+}
+/* ---------- Phase 3: parallel-wave grouping (gesture -> field bridge) ---------- */
+// On drag-end (see the pointerup handler below) the dropped node's Y position
+// is compared against its neighbours; contiguous enabled steps within
+// PARALLEL_Y_THRESH of each other become one "wave" sharing a `parallel`
+// group id. This is a one-way bridge: Y position -> `parallel` field. The
+// field (never Y) is what's saved/executed — see the design doc's "Gesture ->
+// field bridge" section. Re-run on every drag-end so aligning/misaligning
+// updates the field (and therefore the lane) immediately, before Save.
+const PARALLEL_Y_THRESH=30;
+function deriveParallelGroups(){
+  const steps=S.workflow.nodes.filter(n=>n.kind==='step' && n.enabled!==false);
+  const bands=[]; // [{y:lastMemberY, members:[node,...]}]
+  steps.forEach(n=>{
+    const y=posFor(n, S.workflow.nodes.indexOf(n)).y;
+    const band=bands[bands.length-1];
+    if(band && Math.abs(y-band.y)<=PARALLEL_Y_THRESH){ band.members.push(n); band.y=y; }
+    else bands.push({y, members:[n]});
+  });
+  bands.forEach(band=>{
+    if(band.members.length>=2){
+      const existing=band.members.map(n=>(n.parallel||'').trim()).find(Boolean);
+      const gid=existing || ('wave-'+Math.random().toString(16).slice(2,8));
+      band.members.forEach(n=>n.parallel=gid);
+    } else {
+      band.members.forEach(n=>n.parallel='');
+    }
+  });
+}
+function parallelGroupMembers(gid){
+  return S.workflow.nodes.filter(n=>n.kind==='step' && (n.parallel||'').trim()===gid);
+}
+function makeSequential(gid){
+  parallelGroupMembers(gid).forEach(n=>n.parallel='');
+  checkDirty(); renderFlow();
+}
+// Draws each wave's translucent backdrop BEHIND its member nodes (z-index 0
+// vs .node's z-index 1, and pointer-events:none) so dragging/selecting a
+// member is unaffected. Uses actual rendered DOM rects (post-layout) rather
+// than raw L[] coordinates, since node height varies with content.
+function renderLanes(){
+  const surf=$('#surface');
+  const groups={};
+  S.workflow.nodes.forEach((n,i)=>{
+    if(n.kind==='step' && n.enabled!==false && (n.parallel||'').trim())
+      (groups[n.parallel.trim()]=groups[n.parallel.trim()]||[]).push(i);
+  });
+  const firstNode=surf.querySelector('.node');
+  Object.entries(groups).forEach(([gid,idxs])=>{
+    if(idxs.length<2) return;
+    const els=idxs.map(i=>surf.querySelector(`.node[data-i="${i}"]`)).filter(Boolean);
+    if(els.length<2) return;
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    els.forEach(el=>{
+      minX=Math.min(minX, el.offsetLeft); minY=Math.min(minY, el.offsetTop);
+      maxX=Math.max(maxX, el.offsetLeft+el.offsetWidth); maxY=Math.max(maxY, el.offsetTop+el.offsetHeight);
+    });
+    const pad=16, headerH=22;
+    const lane=document.createElement('div');
+    lane.className='lane';
+    lane.style.left=(minX-pad)+'px'; lane.style.top=(minY-pad-headerH)+'px';
+    lane.style.width=(maxX-minX+pad*2)+'px'; lane.style.height=(maxY-minY+pad*2+headerH)+'px';
+    lane.innerHTML=`<div class="lane-chip">&#8741; parallel &middot; ${esc(gid)}</div>`;
+    surf.insertBefore(lane, firstNode||surf.firstChild);
+  });
 }
 function fitSurface(){
   let mx=1200,my=900;
@@ -1601,16 +1676,30 @@ function fitSurface(){
   });
   const s=$('#surface'); s.style.width=mx+'px'; s.style.height=my+'px';
 }
+// Collapses consecutive same-group step nodes into one "wave unit" so edges
+// fan OUT from the step before a wave to every member, and re-converge from
+// every member into the step after — a plain linear chain is just every unit
+// having exactly one member, so this subsumes the old behavior unchanged.
 function redrawEdges(){
   const nodes=[...document.querySelectorAll('.node')].sort((a,b)=>a.dataset.i-b.dataset.i);
+  const units=[];
+  nodes.forEach(el=>{
+    const n=S.workflow.nodes[+el.dataset.i];
+    const gid=(n && n.kind==='step' && n.enabled!==false && (n.parallel||'').trim()) || '';
+    const last=units[units.length-1];
+    if(gid && last && last.gid===gid) last.els.push(el);
+    else units.push({gid, els:[el]});
+  });
   let d='';
-  for(let i=0;i<nodes.length-1;i++){
-    const a=nodes[i], b=nodes[i+1];
+  const edge=(a,b)=>{
     const x1=a.offsetLeft+a.offsetWidth/2, y1=a.offsetTop+a.offsetHeight;
     const x2=b.offsetLeft+b.offsetWidth/2, y2=b.offsetTop;
     const dy=Math.max(30,Math.abs(y2-y1)/2);
-    d+=`<path class="edge" d="M${x1} ${y1} C ${x1} ${y1+dy} ${x2} ${y2-dy} ${x2} ${y2}"/>`
+    return `<path class="edge" d="M${x1} ${y1} C ${x1} ${y1+dy} ${x2} ${y2-dy} ${x2} ${y2}"/>`
       +`<circle cx="${x2}" cy="${y2}" r="3" fill="#3a4150"/>`;
+  };
+  for(let u=0;u<units.length-1;u++){
+    units[u].els.forEach(a=>units[u+1].els.forEach(b=>{ d+=edge(a,b); }));
   }
   $('#edges').innerHTML=d;
 }
@@ -1629,7 +1718,7 @@ function autoArrange(){
 function addStep(){
   let my=40; document.querySelectorAll('.node').forEach(e=>my=Math.max(my,e.offsetTop+e.offsetHeight));
   const n={title:uniqueTitle('New step'),body:'',required:[],tools:[],kind:'step',enabled:true,
-    id:'',agent:'',model:'',effort:'',temperature:'',type:'',command:'',on_fail:''};
+    id:'',agent:'',model:'',effort:'',temperature:'',type:'',command:'',on_fail:'',parallel:''};
   L[n.title]={x:120,y:my+50};
   S.workflow.nodes.push(n); selNode=n; bodyMode='write'; checkDirty(); renderFlow(); saveLayout();
 }
@@ -1676,7 +1765,7 @@ window.addEventListener('pointermove',e=>{
 window.addEventListener('pointerup',()=>{
   if(drag){
     drag.el.classList.remove('drag');
-    if(drag.moved){ resortByPosition(); renderFlow(); saveLayout(); checkDirty(); } // reorder → renumber
+    if(drag.moved){ resortByPosition(); deriveParallelGroups(); renderFlow(); saveLayout(); checkDirty(); } // reorder → renumber → re-band waves
     drag=null;
   }
   if(pan){ $('#canvas').style.cursor=''; pan=null; }
@@ -1831,6 +1920,21 @@ function renderInsp(){
       <div>${selectOrCustom(n.id||'new','temperature',n.temperature||'',ch.temperatures)}</div>
     </div>${runBtns}${runNote}`;
   })():'';
+  // Step-type-agnostic (applies whether Type is agent or command): a note +
+  // escape hatch for steps dragged into a parallel wave (see deriveParallelGroups
+  // / renderLanes above). Group membership is driven purely by the `parallel`
+  // field, so this reads the same source of truth the canvas lane draws from.
+  const parallelNote=(isStep && (n.parallel||'').trim())?(()=>{
+    const gid=n.parallel.trim();
+    const others=parallelGroupMembers(gid).length-1;
+    return `
+    <div class="mut" style="font-size:11.5px;margin-top:14px;padding:10px 12px;
+      border:1px solid var(--accent);border-radius:8px;background:rgba(124,140,255,.08);line-height:1.6">
+      &#8741; Part of parallel group <b style="color:var(--text)">${esc(gid)}</b> — runs concurrently
+      with ${others} other step${others===1?'':'s'}.
+      <div style="margin-top:8px"><button onclick="makeSequential('${esc(gid)}')">Make sequential</button></div>
+    </div>`;
+  })():'';
   $('#insp').innerHTML=`
     <h2>${isStep?'Step':'Note'}</h2>
     <div class="row" style="justify-content:space-between">
@@ -1849,6 +1953,7 @@ function renderInsp(){
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
+    ${parallelNote}
     ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
   `;
 }
