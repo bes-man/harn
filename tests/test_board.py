@@ -29,6 +29,20 @@ def test_board_payload_lists_full_task_detail(tmp_path):
     assert "scratchpad" in row and "review_log" in row and "decisions" in row
 
 
+def test_board_payload_includes_step_usage_when_present(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    t.step_results["s1"] = {"status": "ok", "usage": {
+        "skills": {"standards": "used", "testing": "unused_recommended"},
+        "tools": {"run_tests": "unused_required"}}}
+    tasks._save(t)
+    payload = studio.board_payload(env)
+    row = next(r for r in payload["tasks"] if r["id"] == t.id)
+    assert row["step_results"]["s1"]["usage"]["skills"]["standards"] == "used"
+    assert row["step_results"]["s1"]["usage"]["skills"]["testing"] == "unused_recommended"
+    assert row["step_results"]["s1"]["usage"]["tools"]["run_tests"] == "unused_required"
+
+
 def test_set_task_workflow_assigns_known_preset(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")

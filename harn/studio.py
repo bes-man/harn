@@ -905,8 +905,19 @@ _HTML = r"""<!DOCTYPE html>
   .chip{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--chip);
     border:1px solid var(--line);color:var(--muted)}
   .chip.req{background:var(--chipOn);border-color:#3a4f7a;color:#cdd7f5}
+  .chip.rec{border-style:dashed}
   .node .tools{margin-top:7px;font-size:11px;color:var(--muted);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .toolbadge{padding:1px 2px;border-bottom:2px solid transparent;border-radius:2px}
+  /* Phase 4 Task 7: green/yellow/red usage badges on skill+tool chips, driven
+     by task.step_results[sid]["usage"] (Task 6's post-step audit). Overrides
+     the chip/tog/toolbadge base border-color regardless of how many other
+     classes are already on the element (req/rec/on), hence !important. The
+     "unused required" pulse reuses the same `blink` keyframes already defined
+     for `.node.st-active` above rather than a new animation. */
+  .badge-used{border-color:#2ecc71 !important}
+  .badge-unused-recommended{border-color:#f1c40f !important}
+  .badge-unused-required{border-color:#e74c3c !important;animation:blink 1.2s ease-in-out infinite}
   .grip{width:6px;cursor:col-resize;background:var(--line)}
   .grip:hover,.grip.act{background:var(--accent)}
   .insp{background:var(--panel);overflow:auto;padding:16px}
@@ -1422,6 +1433,19 @@ function selTaskStepResult(stepId){
   const t=taskId&&(BOARD.tasks||[]).find(x=>x.id===taskId);
   return (t&&t.step_results&&t.step_results[stepId])||null;
 }
+// Phase 4 Task 7: green/yellow/red usage badge for one skill/tool chip, from
+// the same step's `usage` audit Task 6 writes into step_results (only present
+// once the step has actually run — a step with no run yet, or no id at all,
+// just gets no badge class, same as `selTaskStepResult` returning null above).
+function usageBadgeClass(stepId, kind, name){
+  const res=stepId&&selTaskStepResult(stepId);
+  const usage=res&&res.usage&&res.usage[kind];
+  const tier=usage&&usage[name];
+  if(tier==='used') return 'badge-used';
+  if(tier==='unused_required') return 'badge-unused-required';
+  if(tier==='unused_recommended') return 'badge-unused-recommended';
+  return '';
+}
 function lastRunOutputBlock(n){
   const res=n.id&&selTaskStepResult(n.id);
   if(!res) return `<label>Last run output</label><div class="toolDoc runlog" id="cmdOutput">(not run yet)</div>`;
@@ -1634,8 +1658,12 @@ function renderFlow(){
     el.dataset.i=i;
     el.style.left=p.x+'px'; el.style.top=p.y+'px';
     const num = nums[i]!=null ? nums[i] : '•';
-    const reqChips=(n.required||[]).map(s=>`<span class="chip req">${esc(s)}</span>`).join('');
-    const tools=(n.tools||[]).length?`<div class="tools">⚙ ${(n.tools||[]).map(esc).join(', ')}</div>`:'';
+    const reqChips=(n.required||[]).map(s=>`<span class="chip req ${usageBadgeClass(n.id,'skills',s)}">${esc(s)}</span>`).join('');
+    const recChips=(n.skills_recommended||[]).map(s=>`<span class="chip rec ${usageBadgeClass(n.id,'skills',s)}" title="recommended skill">${esc(s)}</span>`).join('');
+    const toolBadge=(t,required)=>`<span class="toolbadge ${usageBadgeClass(n.id,'tools',t)}" title="${required?'required':'recommended'} tool">${esc(t)}</span>`;
+    const toolNames=[...(n.tools||[]).map(t=>toolBadge(t,true)),
+                      ...(n.tools_recommended||[]).map(t=>toolBadge(t,false))];
+    const tools=toolNames.length?`<div class="tools">⚙ ${toolNames.join(', ')}</div>`:'';
     const onoff=n.kind==='step'
       ? `<div class="nbtn ${n.enabled!==false?'on':''}" title="enable/disable"
            onclick="toggleEnabled(${i});event.stopPropagation()">${n.enabled!==false?'●':'○'}</div>` : '';
@@ -1646,8 +1674,9 @@ function renderFlow(){
           <button class="stepbtn rerun" ${busy||!hasCheckpoint?'disabled':''} title="${hasCheckpoint?'Rerun this step — restores to right before its last attempt first':'No checkpoint yet — run this step once first'}" onclick="rerunStep('${esc(n.id)}');event.stopPropagation()">↻</button>
         </div>`
       : '';
+    const allChips=reqChips+recChips;
     el.innerHTML=`${stepBtns}${onoff}<div class="ttl"><span class="num">${esc(num)}</span><span>${esc(n.title)}</span></div>
-      <div class="chips">${reqChips|| (n.kind==='step'?'<span class="chip">no required skills</span>':'')}</div>${tools}`;
+      <div class="chips">${allChips|| (n.kind==='step'?'<span class="chip">no required skills</span>':'')}</div>${tools}`;
     surf.appendChild(el);
     maxBottom=Math.max(maxBottom, p.y+140);
   });
@@ -1914,13 +1943,21 @@ function renderInsp(){
   const isStep=n.kind==='step';
   const toggles=skillNames().map(name=>{
     const on=(n.required||[]).includes(name);
-    return `<span class="tog ${on?'on':''}" onclick="toggleReq('${esc(name)}')">${esc(name)}</span>`;
+    return `<span class="tog ${on?'on':''} ${on?usageBadgeClass(n.id,'skills',name):''}" onclick="toggleReq('${esc(name)}')">${esc(name)}</span>`;
   }).join('');
   const reqLinks=(n.required||[]).map(name=>`<a class="link" onclick="editSkill('${esc(name)}')">edit ${esc(name)} »</a>`).join(' · ');
   const toolTogs=allTools().map(t=>{
     const on=(n.tools||[]).includes(t);
-    return `<span class="tog ${on?'on':''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
+    return `<span class="tog ${on?'on':''} ${on?usageBadgeClass(n.id,'tools',t):''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
+  // Recommended skills/tools (Task 1's `recommended:` tier) have no editing UI
+  // yet — surfaced here read-only, purely so their usage badge (Task 7) is
+  // visible somewhere; toggling them on/off is a separate, not-yet-built
+  // feature and out of this task's additive scope.
+  const recSkillChips=(n.skills_recommended||[]).map(name=>
+    `<span class="chip rec ${usageBadgeClass(n.id,'skills',name)}" title="recommended skill">${esc(name)}</span>`).join('');
+  const recToolChips=(n.tools_recommended||[]).map(t=>
+    `<span class="chip rec ${usageBadgeClass(n.id,'tools',t)}" title="recommended tool">${esc(t)}</span>`).join('');
   // Shown on EVERY step: pick the AGENT + MODEL this step runs with, and
   // Run/Rerun it in isolation — no more "which pipeline stage is this"
   // gating; any step can be run on its own via loop.run_step (by id).
@@ -2018,10 +2055,14 @@ function renderInsp(){
     <label>Skills required at this step <span class="mut">(click to toggle)</span></label>
     <div class="skillgrid">${toggles||'<span class="mut">no skills yet</span>'}</div>
     <div style="margin-top:8px">${reqLinks}</div>
+    ${recSkillChips?`<label>Recommended skills <span class="mut">(surfaced, not force-loaded)</span></label>
+    <div class="skillgrid">${recSkillChips}</div>`:''}
     <label>Tools at this step <span class="mut">(click to toggle · add below)</span></label>
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
+    ${recToolChips?`<label>Recommended tools</label>
+    <div class="skillgrid">${recToolChips}</div>`:''}
     ${parallelNote}
     ${viewContextBtn}
     ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
