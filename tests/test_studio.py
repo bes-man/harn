@@ -21,7 +21,9 @@ def test_parse_extracts_nodes_and_required(tmp_path):
     # a step's required skills are lifted into structured fields
     pre = next(n for n in parsed["nodes"] if "Pre-task" in n["title"])
     assert "standards" in pre["required"] and "constraints" in pre["required"]
-    assert pre["tools"]            # Tools line parsed
+    # bare "Tools: ..." line is sugar for all-recommended/none-required
+    assert pre["tools"] == []
+    assert pre["tools_recommended"]    # Tools line parsed
     assert pre["kind"] == "step" and pre["enabled"] is True
     # the step number is NOT part of the title (it's positional)
     assert not pre["title"][0].isdigit()

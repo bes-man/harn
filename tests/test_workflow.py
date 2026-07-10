@@ -395,8 +395,8 @@ def test_old_bare_tools_line_still_parses_as_all_recommended(tmp_path):
         encoding="utf-8")
     parsed = workflow.parse(env)
     node = parsed["nodes"][0]
-    assert node["tools"] == ["run_tests", "read_design"]
-    assert node["tools_recommended"] == []
+    assert node["tools"] == []
+    assert node["tools_recommended"] == ["run_tests", "read_design"]
     assert node["skills_recommended"] == []
 
 

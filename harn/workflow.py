@@ -242,8 +242,9 @@ def parse(env_dir: Path) -> dict:
                    `Skills (required: a, b)` line (today's only form) leaves
                    `skills_recommended` at its default `[]`.
       • `tools` / `tools_recommended` — from `Tools (required: a; recommended: b)`.
-                   The legacy bare `Tools: a, b` line (no parens) is unchanged:
-                   it still populates `tools`, with `tools_recommended` left `[]`.
+                   The legacy bare `Tools: a, b` line (no parens) is sugar for
+                   "all recommended, none required": it populates
+                   `tools_recommended`, leaving `tools` at its default `[]`.
     The `Skills (required: …)` / `Tools: …` / `Id:` / `Agent:` / `Model:` /
     `Effort:` / `Temperature:` / `Type:` / `Command:` / `On fail:` /
     `Parallel:` lines are lifted into fields. A legacy `Stage: …` line (from the removed
@@ -307,12 +308,11 @@ def parse(env_dir: Path) -> dict:
         if tl:
             cur["_decl"] = True
             if tl.group(3) is not None:
-                # old bare "Tools: a, b" form — unchanged backward-compat behavior:
-                # populates the required `tools` list, exactly as before this task
-                # (NOT tools_recommended — see test_old_bare_tools_line_still_parses_
-                # as_all_recommended, whose assertions are the actual spec despite its name).
-                cur["tools"] = [t.strip() for t in tl.group(3).split(",") if t.strip()]
-                cur["tools_recommended"] = []
+                # old bare "Tools: a, b" form is sugar for "all recommended, none
+                # required" (backward compat — existing WORKFLOW.md files parse
+                # identically to before, with no new hard-enforcement opt-in).
+                cur["tools"] = []
+                cur["tools_recommended"] = [t.strip() for t in tl.group(3).split(",") if t.strip()]
             else:
                 cur["tools"] = [t.strip() for t in (tl.group(1) or "").split(",")
                                 if t.strip()]
