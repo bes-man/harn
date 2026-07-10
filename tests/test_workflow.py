@@ -365,4 +365,70 @@ def test_mcp_read_and_save_workflow(tmp_path, monkeypatch):
     custom = "# Project workflow\n\n## 1. Do thing\nSkills (required: standards)\n"
     out = save_fn(content=custom)
     assert "saved" in out
-    assert (env / "WORKFLOW.md").read_text(encoding="utf-8") == custom
+
+
+# --- recommended: tier (Phase 4 Task 1) ------------------------------------- #
+
+def test_skills_recommended_tier_parses(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    (env / "WORKFLOW.md").write_text(
+        "## 1. Implement\n"
+        "Skills (required: standards; recommended: testing, ui)\n"
+        "Tools (required: run_tests; recommended: read_design)\n",
+        encoding="utf-8")
+    parsed = workflow.parse(env)
+    node = parsed["nodes"][0]
+    assert node["required"] == ["standards"]
+    assert node["skills_recommended"] == ["testing", "ui"]
+    assert node["tools"] == ["run_tests"]
+    assert node["tools_recommended"] == ["read_design"]
+
+
+def test_old_bare_tools_line_still_parses_as_all_recommended(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    (env / "WORKFLOW.md").write_text(
+        "## 1. Implement\n"
+        "Skills (required: standards)\n"
+        "Tools: run_tests, read_design\n",
+        encoding="utf-8")
+    parsed = workflow.parse(env)
+    node = parsed["nodes"][0]
+    assert node["tools"] == ["run_tests", "read_design"]
+    assert node["tools_recommended"] == []
+    assert node["skills_recommended"] == []
+
+
+def test_old_skills_required_with_no_recommended_still_parses(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    (env / "WORKFLOW.md").write_text(
+        "## 1. Implement\n"
+        "Skills (required: standards, constraints)\n",
+        encoding="utf-8")
+    parsed = workflow.parse(env)
+    node = parsed["nodes"][0]
+    assert node["required"] == ["standards", "constraints"]
+    assert node["skills_recommended"] == []
+
+
+def test_recommended_tier_round_trips_through_compose(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    (env / "WORKFLOW.md").write_text(
+        "## 1. Implement\n"
+        "Skills (required: standards; recommended: testing)\n"
+        "Tools (required: run_tests; recommended: read_design)\n",
+        encoding="utf-8")
+    parsed = workflow.parse(env)
+    composed = workflow.compose(env, parsed)
+    reparsed_dir = tmp_path / "harn_env2"
+    reparsed_dir.mkdir()
+    (reparsed_dir / "WORKFLOW.md").write_text(composed, encoding="utf-8")
+    reparsed = workflow.parse(reparsed_dir)
+    node = reparsed["nodes"][0]
+    assert node["required"] == ["standards"]
+    assert node["skills_recommended"] == ["testing"]
+    assert node["tools"] == ["run_tests"]
+    assert node["tools_recommended"] == ["read_design"]

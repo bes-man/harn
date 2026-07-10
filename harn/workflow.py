@@ -34,7 +34,9 @@ _SNAP_END = "<!-- harn:skills-snapshot:end -->"
 # Per-step required skills are declared on a `Skills (required: a, b)` line.
 # Anchored to the WHOLE line so an inline mention of the syntax inside prose
 # (e.g. a note section explaining the format) is NOT mistaken for a declaration.
-_REQ_RE = re.compile(r"^\s*Skills\s*\(required:\s*([^)]*)\)\s*$", re.IGNORECASE)
+_REQ_RE = re.compile(
+    r"^\s*Skills\s*\(required:\s*([^;)]*)(?:;\s*recommended:\s*([^)]*))?\)\s*$",
+    re.IGNORECASE)
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
 # Per-step execution fields: which CLI runs this step under `harn run`, with
 # which model/effort/temperature, and the stable id that survives renames
@@ -186,7 +188,9 @@ def refresh_skills(env_dir: Path) -> Path:
     return p
 
 
-_TOOLS_RE = re.compile(r"^\s*Tools:\s*(.*)$", re.IGNORECASE)
+_TOOLS_RE = re.compile(
+    r"^\s*Tools\s*(?:\(required:\s*([^;)]*)(?:;\s*recommended:\s*([^)]*))?\)|:\s*(.*))$",
+    re.IGNORECASE)
 _DISABLED_RE = re.compile(r"^\s*Disabled:\s*true\s*$", re.IGNORECASE)
 _STEP_NUM_RE = re.compile(r"^(\d+)\.\s+(.*)$")
 
@@ -195,7 +199,8 @@ def parse(env_dir: Path) -> dict:
     """Parse WORKFLOW.md into an editable structure for the visual editor:
 
         {"preamble": "<text before the first ## heading>",
-         "nodes": [{"title", "body", "kind", "enabled", "required", "tools",
+         "nodes": [{"title", "body", "kind", "enabled", "required",
+                    "skills_recommended", "tools", "tools_recommended",
                     "id", "agent", "model", "effort", "temperature",
                     "type", "command", "on_fail", "parallel"}]}
 
@@ -230,6 +235,15 @@ def parse(env_dir: Path) -> dict:
                    concurrently (Phase 3); unlike `on_fail` this is not a
                    reference to another step, so it needs no id-resolution
                    and round-trips verbatim through `compose()`.
+      • `required` / `skills_recommended` — from `Skills (required: a, b; \
+                   recommended: c, d)`. `required` skills are always loaded;
+                   `recommended` ones are surfaced but not force-loaded (Phase 4).
+                   The `; recommended: …` clause is optional; a plain
+                   `Skills (required: a, b)` line (today's only form) leaves
+                   `skills_recommended` at its default `[]`.
+      • `tools` / `tools_recommended` — from `Tools (required: a; recommended: b)`.
+                   The legacy bare `Tools: a, b` line (no parens) is unchanged:
+                   it still populates `tools`, with `tools_recommended` left `[]`.
     The `Skills (required: …)` / `Tools: …` / `Id:` / `Agent:` / `Model:` /
     `Effort:` / `Temperature:` / `Type:` / `Command:` / `On fail:` /
     `Parallel:` lines are lifted into fields. A legacy `Stage: …` line (from the removed
@@ -266,7 +280,8 @@ def parse(env_dir: Path) -> dict:
             raw = h.group(1).strip()
             m = _STEP_NUM_RE.match(raw)
             cur = {"title": (m.group(2).strip() if m else raw),
-                   "required": [], "tools": [], "enabled": True,
+                   "required": [], "skills_recommended": [],
+                   "tools": [], "tools_recommended": [], "enabled": True,
                    "id": "", "agent": "", "model": "", "effort": "",
                    "temperature": "", "type": "", "command": "", "on_fail": "",
                    "parallel": "",
@@ -284,11 +299,25 @@ def parse(env_dir: Path) -> dict:
             cur["_decl"] = True
             cur["required"] = [s.strip() for s in req.group(1).split(",")
                                if re.fullmatch(r"[a-z0-9_-]+", s.strip())]
+            rec_raw = req.group(2) or ""
+            cur["skills_recommended"] = [s.strip() for s in rec_raw.split(",")
+                                         if re.fullmatch(r"[a-z0-9_-]+", s.strip())]
             continue
         tl = _TOOLS_RE.match(line)
         if tl:
             cur["_decl"] = True
-            cur["tools"] = [t.strip() for t in tl.group(1).split(",") if t.strip()]
+            if tl.group(3) is not None:
+                # old bare "Tools: a, b" form — unchanged backward-compat behavior:
+                # populates the required `tools` list, exactly as before this task
+                # (NOT tools_recommended — see test_old_bare_tools_line_still_parses_
+                # as_all_recommended, whose assertions are the actual spec despite its name).
+                cur["tools"] = [t.strip() for t in tl.group(3).split(",") if t.strip()]
+                cur["tools_recommended"] = []
+            else:
+                cur["tools"] = [t.strip() for t in (tl.group(1) or "").split(",")
+                                if t.strip()]
+                cur["tools_recommended"] = [t.strip() for t in (tl.group(2) or "").split(",")
+                                            if t.strip()]
             continue
         if _STAGE_RE.match(line):
             cur["_decl"] = True      # legacy line: swallow, don't put in body
@@ -376,11 +405,23 @@ def compose(env_dir: Path, parsed: dict) -> str:
             out.append("Disabled: true")
         if kind == "step":
             req = [s for s in n.get("required", []) if s]
-            out.append(f"Skills (required: {', '.join(req)})" if req
-                       else "Skills (required: )")
+            rec = [s for s in n.get("skills_recommended", []) if s]
+            skills_line = f"Skills (required: {', '.join(req)}" if req else "Skills (required:"
+            if rec:
+                skills_line += f"; recommended: {', '.join(rec)}"
+            skills_line += ")" if req or rec else " )"
+            out.append(skills_line)
         tools = [t for t in n.get("tools", []) if t]
-        if tools:
-            out.append(f"Tools: {', '.join(tools)}")
+        tools_rec = [t for t in n.get("tools_recommended", []) if t]
+        if tools or tools_rec:
+            if tools:
+                tools_line = f"Tools (required: {', '.join(tools)}"
+                if tools_rec:
+                    tools_line += f"; recommended: {', '.join(tools_rec)}"
+                tools_line += ")"
+                out.append(tools_line)
+            else:
+                out.append(f"Tools: {', '.join(tools_rec)}")
         for key, label in (("id", "Id"), ("agent", "Agent"), ("model", "Model"),
                            ("effort", "Effort"), ("temperature", "Temperature"),
                            ("type", "Type"), ("command", "Command"),
