@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
-from harn import studio, tasks, workflows, ENV_DIRNAME
+from harn import state, studio, tasks, workflows, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -105,3 +105,50 @@ def test_launch_then_stop_round_trip(tmp_path):
         r = studio.stop_task(env, {})
         assert r["ok"] is True
         assert studio.board_payload(env)["run"] is None
+
+
+# --- blocked question view + answer (studio-side of ask_user/BLOCKED) ----- #
+
+def test_blocked_question_payload_returns_question_when_blocked(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id)
+    st.block("Should I use approach A or B? I recommend A because...")
+    st.save(state_dir)
+    payload = studio.blocked_question_payload(env, task.id)
+    assert payload["question"] == "Should I use approach A or B? I recommend A because..."
+
+
+def test_blocked_question_payload_returns_none_when_not_blocked(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    payload = studio.blocked_question_payload(env, task.id)
+    assert payload["question"] is None
+
+
+def test_answer_route_calls_loop_answer_and_clears_the_block(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id)
+    st.block("Pick one.")
+    st.save(state_dir)
+    result = studio.answer_payload(env, task.id, "Go with A.")
+    assert result.get("ok") is True
+    reloaded = state.State.load(state_dir)
+    assert reloaded.phase != state.BLOCKED
+    assert reloaded.last_answer == "Go with A."
+
+
+def test_answer_payload_rejects_empty_text(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id)
+    st.block("Pick one.")
+    st.save(state_dir)
+    result = studio.answer_payload(env, task.id, "   ")
+    assert "error" in result
+    # the block is untouched
+    assert state.State.load(state_dir).phase == state.BLOCKED

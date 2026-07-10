@@ -26,6 +26,7 @@ from . import attachments as attachments_mod
 from . import events as events_mod
 from . import runner as runner_mod
 from . import skills as skills_mod
+from . import state as state_mod
 from . import tasks as tasks_mod
 from . import workflow as workflow_mod
 from . import workflows as workflows_mod
@@ -413,6 +414,32 @@ def board_payload(env_dir: Path) -> dict:
     return payload
 
 
+def blocked_question_payload(env_dir: Path, task_id: str) -> dict:
+    """The pending BLOCKED question for this env, if any, so the Board tab
+    can show it and let a human answer without leaving studio. The question
+    text is the agent's own free-text prose (context, options, and its
+    recommendation all embedded as written) — rendered verbatim, not parsed
+    into buttons, since there is no separate structured options list
+    anywhere in harn. `task_id` is accepted for route symmetry with the
+    other per-task endpoints, but state is per-env (one active task at a
+    time), so it's currently unused for the lookup itself."""
+    st = state_mod.State.load(env_dir / "state")
+    if st.phase == state_mod.BLOCKED and st.question:
+        return {"question": st.question}
+    return {"question": None}
+
+
+def answer_payload(env_dir: Path, task_id: str, text: str) -> dict:
+    """Answer a pending BLOCKED question from studio, reusing the SAME
+    `loop.answer()` the `harn answer` CLI command calls — no BLOCKED-clearing
+    logic is reimplemented here."""
+    if not text.strip():
+        return {"error": "answer text is empty"}
+    from . import loop as loop_mod
+    loop_mod.answer(env_dir, text, source="studio")
+    return {"ok": True}
+
+
 def set_task_workflow(env_dir: Path, payload: dict) -> dict:
     """Assign (or clear) a task's workflow preset. Empty -> project default."""
     task_id = (payload.get("task_id") or "").strip()
@@ -683,6 +710,8 @@ def _make_handler(default_env: Path):
                 self._json(tools_catalog_payload(env))
             elif route == "/api/board":
                 self._json(board_payload(env))
+            elif route == "/api/tasks/blocked_question":
+                self._json(blocked_question_payload(env, self._query("task") or ""))
             elif route == "/api/models":
                 self._json(models_payload(env))
             elif route == "/api/task_plan":
@@ -730,6 +759,8 @@ def _make_handler(default_env: Path):
                 self._json(launch_task(env, body))
             elif route == "/api/tasks/stop":
                 self._json(stop_task(env, body))
+            elif route == "/api/tasks/answer":
+                self._json(answer_payload(env, body.get("task", ""), body.get("text", "")))
             elif route == "/api/tasks/run_stage":
                 self._json(launch_stage(env, body))
             elif route == "/api/tasks/run_step":
@@ -823,6 +854,12 @@ _HTML = r"""<!DOCTYPE html>
   .runbanner{display:flex;align-items:center;gap:10px;background:var(--panel2);
     border:1px solid var(--accent);border-radius:8px;padding:8px 10px;margin-bottom:12px;font-size:12.5px}
   .runbanner button{margin-left:auto}
+  .blockedq{background:#3a2a10;border:1px solid var(--danger);padding:10px;
+    border-radius:6px;margin-bottom:12px}
+  .blockedq pre{white-space:pre-wrap;max-height:200px;overflow-y:auto;
+    font:12.5px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:8px 0}
+  .blockedq textarea{width:100%;margin-top:6px;background:var(--panel);color:var(--text);
+    border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit}
   /* ---- task-plan edit mode (Board -> Edit this task's plan) ---- */
   .planbanner{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:20;
     display:flex;align-items:center;gap:10px;background:var(--panel2);
@@ -1057,7 +1094,10 @@ _HTML = r"""<!DOCTYPE html>
       <button onclick="zoomBy(1.2)">＋</button></div>
   </div>
   <div class="grip" id="grip"></div>
-  <div class="insp" id="insp"><div class="empty">Select a node to edit it.</div></div>
+  <div class="insp">
+    <div id="blockedBanner" style="display:none"></div>
+    <div id="insp"><div class="empty">Select a node to edit it.</div></div>
+  </div>
 </main>
 <script>
 const $=s=>document.querySelector(s);
@@ -1207,10 +1247,53 @@ async function pollBoard(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
   if(tab!=='board') return;
   renderBoard();
-  if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)) renderTaskDetail();
-  else{ boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>'; }
+  if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
+    renderTaskDetail();
+    await pollBlockedQuestion();
+  } else{
+    boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
+    BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
+    const el=$('#blockedBanner'); if(el){ el.style.display='none'; el.innerHTML=''; }
+  }
 }
-function selectTask(id){ boardSel=id; renderBoard(); renderTaskDetail(); }
+let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null;
+async function pollBlockedQuestion(){
+  if(!boardSel) return;
+  const el=$('#blockedBanner');
+  if(!el) return;
+  let r;
+  try{ r=await (await fetch(api(`/api/tasks/blocked_question?task=${encodeURIComponent(boardSel)}`))).json(); }
+  catch(e){ return; }
+  // Re-render ONLY when the question (or selected task) actually changed —
+  // this poll fires every 1.5s, and blindly overwriting the banner's innerHTML
+  // every tick would wipe out whatever the human is mid-typing in the answer
+  // box before they get a chance to hit Submit.
+  if(r.question){
+    if(BLOCKED_Q_TASK===boardSel && BLOCKED_Q_TEXT===r.question && el.style.display==='block') return;
+    BLOCKED_Q_TASK=boardSel; BLOCKED_Q_TEXT=r.question;
+    el.style.display='block';
+    el.innerHTML=`<div class="blockedq"><b>Blocked — needs your answer:</b>`+
+      `<pre>${esc(r.question)}</pre>`+
+      `<textarea id="answerBox" rows="3" placeholder="Your answer..."></textarea>`+
+      `<button onclick="submitAnswer()">Submit answer</button></div>`;
+  } else {
+    BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
+    el.style.display='none'; el.innerHTML='';
+  }
+}
+async function submitAnswer(){
+  const box=$('#answerBox');
+  const text=box?box.value:'';
+  if(!text.trim()){ alert('Enter an answer first.'); return; }
+  const r=await post_('/api/tasks/answer',{task:boardSel, text});
+  if(r.error){ alert(r.error); return; }
+  const el=$('#blockedBanner'); if(el){ el.style.display='none'; el.innerHTML=''; }
+  await pollBoard();
+}
+function selectTask(id){
+  boardSel=id; BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
+  renderBoard(); renderTaskDetail(); pollBlockedQuestion();
+}
 function renderBoard(){
   const v=$('#listView');
   const groups={}; (BOARD.tasks||[]).forEach(t=>(groups[t.status]=groups[t.status]||[]).push(t));
