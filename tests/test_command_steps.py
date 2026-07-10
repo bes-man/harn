@@ -7,7 +7,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from harn import loop, tasks, workflows, scaffold, events, ENV_DIRNAME
+from harn import loop, state, tasks, workflows, scaffold, events, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from .conftest import make_task
 
@@ -284,3 +284,31 @@ def test_failing_command_step_stage_end_reports_ok_false_with_summary(tmp_path, 
     ends = [e for e in evs if e["event"] == "stage_end" and e["stage"] == "step-t1"]
     assert ends[0]["ok"] is False
     assert "boom" in ends[0]["summary"]
+
+
+def test_current_step_set_during_sequential_turn_and_cleared_after(tmp_path, monkeypatch):
+    """Phase 4: `state.State.current_step` must be set to the running step's
+    id for the DURATION of a sequential (non-parallel, non-command) step's
+    agent turn, and cleared again once the turn returns — so Task 5/6's
+    tool-usage tagging and enforcement can scope events to the step that
+    produced them."""
+    state_dir = tmp_path / ENV_DIRNAME / "state"
+    seen = {}
+
+    class ObservingAdapter(RecordingAdapter):
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                    temperature=None):
+            seen["current_step"] = state.State.load(state_dir).current_step
+            return super().run_turn(prompt, cwd, timeout=timeout, model=model,
+                                    effort=effort, temperature=temperature)
+
+    env, t = _project(tmp_path, [
+        _step("Implement", id="step-agent"),
+    ])
+    fake = ObservingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert seen["current_step"] == "step-agent"   # set DURING the turn
+    assert state.State.load(state_dir).current_step is None  # cleared after

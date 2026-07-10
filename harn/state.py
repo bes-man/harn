@@ -23,6 +23,9 @@ PHASES = {PLANNING, READY, EXECUTING, VERIFYING, UI_VERIFYING, BLOCKED, REVIEW,
 class State:
     phase: str = PLANNING
     current_task: str | None = None
+    current_step: str | None = None  # set right before a SEQUENTIAL step's turn;
+                                      # never set for parallel-wave members (see
+                                      # Phase 4 spec's enforcement Non-goal)
     question: str | None = None      # set when phase == BLOCKED
     blocked_since: float | None = None
     last_answer: str | None = None

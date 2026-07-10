@@ -94,6 +94,39 @@ def test_two_parallel_steps_run_concurrently_and_both_merge(tmp_path, monkeypatc
     assert fresh.step_results["s-fe"]["status"] == "ok"
 
 
+def test_current_step_never_set_for_a_wave_member(tmp_path, monkeypatch):
+    """Phase 4 Non-goal: `state.State.current_step` scopes a SEQUENTIAL step's
+    turn only. A parallel wave runs N steps concurrently sharing ONE on-disk
+    `state.State`, so a single `current_step` field cannot represent "N steps
+    active at once" — asserting it must stay None for the whole run proves
+    `_run_parallel_wave` never touches it (Task 5 threads step identity to
+    wave members a different way, not via `current_step`)."""
+    from harn import state as state_mod
+
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    state_dir = env / "state"
+    seen_current_steps = []
+
+    class ObservingWritingAdapter(WritingAdapter):
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                    temperature=None):
+            seen_current_steps.append(state_mod.State.load(state_dir).current_step)
+            return super().run_turn(prompt, cwd, timeout=timeout, model=model,
+                                    effort=effort, temperature=temperature)
+
+    fake = ObservingWritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 2
+    assert seen_current_steps == [None, None]  # never set for either wave member
+    assert state_mod.State.load(state_dir).current_step is None  # still None after the run
+
+
 def test_connectors_replicated_into_each_worktree_with_absolute_env_dir(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Backend", id="s-be", parallel="wave-1"),

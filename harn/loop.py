@@ -1812,12 +1812,16 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                                           "started": started, "ended": None}
                 tasks._save(task)
             _checkpoint_stage(project_root, task, sid)
+            st.current_step = sid
+            st.save(state_dir)
             result = _run_turn(
                 step_adapter, env_dir,
                 _build_step_prompt(env_dir, cfg, task, step, feedback_tail, auto=auto),
                 project_root, task_id=task.id, stage=sid, step_title=title,
                 overrides=_step_overrides(cfg, step),
                 tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+            st.current_step = None
+            st.save(state_dir)
             last_step_text = result.text or ""
             print(result.text[-2000:] if result.text else "(no output)")
             if not auto and result.usage_str():

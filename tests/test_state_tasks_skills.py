@@ -32,6 +32,20 @@ def test_state_roundtrip(tmp_path: Path):
     assert loaded.iterations == 3
 
 
+def test_current_step_round_trips_through_save_load(tmp_path: Path):
+    st = state.State(current_task="t1", current_step="s2")
+    st.save(tmp_path)
+    reloaded = state.State.load(tmp_path)
+    assert reloaded.current_step == "s2"
+
+
+def test_current_step_defaults_to_none(tmp_path: Path):
+    st = state.State(current_task="t1")
+    st.save(tmp_path)
+    reloaded = state.State.load(tmp_path)
+    assert reloaded.current_step is None
+
+
 def test_next_task_priority(tmp_path: Path):
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME
