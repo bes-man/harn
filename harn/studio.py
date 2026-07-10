@@ -178,22 +178,40 @@ def save_custom_tool_payload(env_dir: Path, payload: dict) -> dict:
     MCP tool name here (mcp_server.tool_catalog() is the source of truth for
     the ~35 built-ins); a collision with an existing CUSTOM tool, or an
     invalid name/param, is independently rejected by tools_mod.save()
-    itself, which raises ValueError — both checks gate every Save."""
+    itself, which raises ValueError — both checks gate every Save.
+
+    When the studio's Upload flow supplies an uploaded script
+    (script_name + content_b64, base64-encoded file bytes), the script is
+    written alongside the tool's JSON definition so the tool's `command`
+    (e.g. "bash lint.sh") can find it at the agent's next MCP session —
+    custom tools are only re-registered when a new session starts, never
+    picked up by one already running."""
     from . import mcp_server
     name = (payload.get("name") or "").strip()
     description = payload.get("description") or ""
     params = payload.get("params") or []
     command = payload.get("command") or ""
     source = payload.get("source") or "chat"
+    script_name = payload.get("script_name") or ""
+    content_b64 = payload.get("content_b64") or ""
     if not command.strip():
         return {"ok": False, "error": "command is empty"}
     built_in = set(mcp_server.tool_catalog().keys())
     if name in built_in:
         return {"ok": False, "error": f"'{name}' is already a built-in harn tool"}
     try:
-        tools_mod.save(env_dir, name, description, params, command, source=source)
+        p = tools_mod.save(env_dir, name, description, params, command, source=source)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+    if script_name and content_b64:
+        script_name = Path(script_name).name  # strip any path components (traversal guard)
+        if not script_name or script_name in (".", ".."):
+            return {"ok": False, "error": "invalid script_name"}
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            return {"ok": False, "error": "content_b64 is not valid base64"}
+        (p.parent / script_name).write_bytes(data)
     return {"ok": True}
 
 
@@ -1159,6 +1177,7 @@ let PROG={stages:{},totals:{},active:null,ended:false};
 // one task's OWN plan snapshot instead (opened via the Board's "Edit this
 // task's plan" button) — same canvas component, different load/save target.
 let PLAN_MODE=null;
+let FLOW_SEL_TASK_ID=null;   // selected task id, survives DOM re-renders
 
 /* multi-project: the env comes from ?env=<path>; a new tab with a different
    ?env opens another project against the same server. */
@@ -1182,14 +1201,21 @@ function checkDirty(){
 }
 
 let TOOL_DOCS={};   // name -> full MCP docstring; fetched once, static per install
+let CUSTOM_TOOLS=[]; // [{name,description,params,command,source}]; refreshed alongside TOOL_DOCS
+async function loadToolsData(force){
+  if(!force && Object.keys(TOOL_DOCS).length) return;
+  try{
+    const r=await (await fetch(api('/api/tools'))).json();
+    TOOL_DOCS=r.tools||{};
+    CUSTOM_TOOLS=r.custom||[];
+  }catch(e){}
+}
 async function load(){
   const r=await fetch(api('/api/state')); S=await r.json();
   L=Object.assign({}, S.layout||{});
   snapshotWorkflow(); clearDirty();
   setStatus(S.skills.length+' skills · '+S.workflow.nodes.filter(n=>n.kind==='step').length+' steps');
-  if(!Object.keys(TOOL_DOCS).length){
-    try{ TOOL_DOCS=(await (await fetch(api('/api/tools'))).json()).tools||{}; }catch(e){}
-  }
+  await loadToolsData(false);
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){}
   await ensureModelsLoaded();
   renderWorkflows(); render(); loadConfig(); pollProgress();
@@ -1270,14 +1296,21 @@ async function setToggle(key,val){
     body:JSON.stringify({key,value:val})});
 }
 /* ---------- live run animation (events.jsonl) ---------- */
+let pollPrevRun=null;   // track run state transitions across poll cycles
 async function pollProgress(){
   try{ PROG=await (await fetch(api('/api/progress'))).json(); }catch(e){ return; }
   if(tab==='flow'){
     applyProgress();
-    // Update the terminal block in place (not a full renderFlow rebuild) so
-    // polling every 1.5s never disrupts a drag or steals focus elsewhere.
+    // Re-render the terminal block when: actively running (live status),
+    // or the run state just transitioned (started/finished).  When idle
+    // AND stable, skip — replacing innerHTML every 1.5s would destroy
+    // the <select> mid-interaction and prevent the native dropdown from
+    // opening.
     const term=document.querySelector('.node.terminal');
-    if(term) renderFlowTerminal(term);
+    if(term && (BOARD.run || !!BOARD.run !== !!pollPrevRun)){
+      renderFlowTerminal(term);
+    }
+    pollPrevRun=BOARD.run;
   }
 }
 
@@ -1632,9 +1665,11 @@ function flowAllTasks(){ return BOARD.tasks||[]; }
 function flowSelectedTaskId(){
   const sel=flowTaskSel();
   if(sel&&sel.value&&flowAllTasks().some(t=>t.id===sel.value)) return sel.value;
+  if(FLOW_SEL_TASK_ID&&flowAllTasks().some(t=>t.id===FLOW_SEL_TASK_ID)) return FLOW_SEL_TASK_ID;
   const runnable=flowAllTasks().find(t=>RUNNABLE_STATUSES.includes(t.status));
   const first=runnable||flowAllTasks()[0];
-  return first?first.id:null;
+  FLOW_SEL_TASK_ID=first?first.id:null;
+  return FLOW_SEL_TASK_ID;
 }
 function flowSelectedTask(){ const id=flowSelectedTaskId(); return id&&(BOARD.tasks||[]).find(t=>t.id===id); }
 
@@ -1680,7 +1715,7 @@ function renderFlowTerminal(el){
   const isRunnable=task&&RUNNABLE_STATUSES.includes(task.status);
   el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
     <div class="mut" style="font-size:11px">Runs the active workflow (<b>${esc(S.active||'default')}</b>) end-to-end against the task you pick.</div>
-    <select id="flowTaskSel" onchange="renderFlow()">${opts}</select>
+    <select id="flowTaskSel" onchange="FLOW_SEL_TASK_ID=this.value;renderFlow()">${opts}</select>
     <button class="primary" onclick="runWholeWorkflow()" ${isRunnable?'':'disabled'}
       title="${isRunnable?'':'This task is '+esc(task?task.status:'')+' — not runnable. Rerun from scratch to reopen it.'}">▶ Run</button>
     ${hasBaseline?`<button class="ghost" onclick="rerunWholeWorkflow()" title="Restore to before this task's very first attempt and reopen it, then run it again">↻ Rerun from scratch</button>`:''}`;
@@ -2435,7 +2470,46 @@ function renderTools(){
       `<div class="ds">${esc(first)}</div></div>`;
     v.appendChild(r); });
   if(!tools.length) v.innerHTML+='<div class="empty">No tools yet — add tools on a step (Flow tab).</div>';
+  v.innerHTML+=renderCustomToolsSection();
   if(toolSel&&tools.includes(toolSel)) renderToolEditor(); else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
+}
+/* ---------- custom tools: upload / delete (Phase 5) ---------- */
+function renderCustomToolsSection(){
+  const rows=CUSTOM_TOOLS.map(t=>
+    `<div class="skillrow"><div style="width:100%">`+
+    `<div class="nm">${esc(t.name)} <span class="mut" style="font-weight:400">(${esc(t.source)})</span></div>`+
+    `<div class="ds">${esc(t.description)}</div>`+
+    `<button class="ghost" onclick="deleteCustomTool('${esc(t.name)}')" style="margin-top:4px">Delete</button>`+
+    `</div></div>`).join('');
+  return `<h2 style="margin-top:18px">CUSTOM TOOLS</h2>`+
+    (rows||'<div class="empty">None yet.</div>')+
+    `<button class="ghost" style="margin-top:8px" onclick="$('#toolUploadInput').click()">＋ Upload tool</button>`+
+    `<input type="file" id="toolUploadInput" style="display:none" onchange="uploadToolFile(this)"/>`;
+}
+async function uploadToolFile(input){
+  const file=input.files&&input.files[0]; if(!file)return;
+  const name=prompt('Tool name (a-z0-9_ only):'); if(!name){ input.value=''; return; }
+  const description=prompt('Description:')||'';
+  const paramsRaw=prompt('Comma-separated param names (or leave blank):')||'';
+  const params=paramsRaw.split(',').map(s=>s.trim()).filter(Boolean);
+  const dataUrl=await new Promise((res,rej)=>{
+    const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file);
+  });
+  const content_b64=dataUrl.split(',')[1]||'';
+  const argList=params.map(p=>'{'+p+'}').join(' ');
+  const r=await post_('/api/tools/save',{name,description,params,
+    command:`bash ${file.name} ${argList}`.trim(), source:'upload', script_name:file.name, content_b64});
+  if(!r.ok){ alert(r.error||'save failed'); return; }
+  input.value='';
+  await loadToolsData(true);
+  renderTools();
+  alert('Saved. This tool will be available to the agent starting its NEXT session — not the one currently running.');
+}
+async function deleteCustomTool(name){
+  if(!confirm('Delete "'+name+'"?'))return;
+  await post_('/api/tools/delete',{name});
+  await loadToolsData(true);
+  renderTools();
 }
 function renderToolEditor(){
   const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(toolSel));

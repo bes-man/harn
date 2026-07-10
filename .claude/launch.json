@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "harn-studio",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "harn", "ui", "--port", "9871", "--no-open", "/private/tmp/claude-501/-Users-maximus-projects-harn/9a873927-1883-43d6-b2fe-cbc70d427704/scratchpad/demo_project"],
+      "port": 9871
+    }
+  ]
+}
