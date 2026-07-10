@@ -10,7 +10,8 @@ from .conftest import make_task
 def _step(**kw):
     base = {"kind": "step", "title": "Implement", "body": "One focused change.",
             "id": "step-aaaaaa", "agent": "", "model": "", "effort": "",
-            "temperature": "", "required": [], "tools": [], "enabled": True}
+            "temperature": "", "required": [], "skills_recommended": [],
+            "tools": [], "tools_recommended": [], "enabled": True}
     base.update(kw)
     return base
 
@@ -81,3 +82,51 @@ def test_build_step_prompt_appends_feedback_tail(tmp_path):
     p = loop._build_step_prompt(env, Config.load(env), t, _step(),
                                 feedback_tail="2 tests failed")
     assert "2 tests failed" in p
+
+
+def test_build_step_prompt_surfaces_recommended_skills_only(tmp_path):
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    step = _step(skills_recommended=["css-tricks"])
+    prompt = loop._build_step_prompt(env, Config.load(env), t, step)
+    assert "css-tricks" in prompt
+    assert "Required skills for THIS step" not in prompt
+
+
+def test_build_step_prompt_surfaces_recommended_tools_only(tmp_path):
+    # Bare `Tools:` backward-compat case: workflow.py populates
+    # tools_recommended (not tools) — the prompt must still mention them,
+    # not silently drop the line.
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    step = _step(tools_recommended=["ask_user"])
+    prompt = loop._build_step_prompt(env, Config.load(env), t, step)
+    assert "Recommended tools for this step (optional): ask_user" in prompt
+    assert "Tools for this step: " not in prompt
+
+
+def test_build_step_prompt_distinguishes_required_and_recommended(tmp_path):
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    step = _step(required=["standards"], skills_recommended=["css-tricks"],
+                 tools=["ask_user"], tools_recommended=["web_search"])
+    prompt = loop._build_step_prompt(env, Config.load(env), t, step)
+    # both tiers present, both named
+    assert "standards" in prompt
+    assert "css-tricks" in prompt
+    assert "ask_user" in prompt
+    assert "web_search" in prompt
+    # distinct wording per tier
+    assert "Required skills for THIS step" in prompt
+    assert "Also consider loading (optional): css-tricks" in prompt
+    assert "Tools for this step: ask_user" in prompt
+    assert "Recommended tools for this step (optional): web_search" in prompt

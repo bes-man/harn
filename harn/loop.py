@@ -523,16 +523,32 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
         "## Available skills (load only what you need)\n"
         "Read a skill via `read_skill` ONLY when needed:\n" + skills.index(env_dir))
     req = [s for s in (step.get("required") or []) if s]
-    if req:
-        parts.append("## Required skills for THIS step\nLoad these now via "
-                     "`read_skill`: " + ", ".join(req))
+    skills_rec = [s for s in (step.get("skills_recommended") or []) if s]
+    if req or skills_rec:
+        skills_block = ""
+        if req:
+            skills_block = ("## Required skills for THIS step\nLoad these now "
+                            "via `read_skill`: " + ", ".join(req))
+        if skills_rec:
+            rec_line = ("Also consider loading (optional): "
+                       + ", ".join(skills_rec))
+            skills_block = (skills_block + "\n" + rec_line if skills_block
+                            else "## Skills for THIS step\n" + rec_line)
+        parts.append(skills_block)
     parts.append(f"## Current task — {task.id} (status: {task.status})\n"
                  + _task_spec(task))
     tools = [t for t in (step.get("tools") or []) if t]
+    tools_rec = [t for t in (step.get("tools_recommended") or []) if t]
+    tools_lines = ""
+    if tools:
+        tools_lines = "\n\nTools for this step: " + ", ".join(tools)
+    if tools_rec:
+        tools_lines += ("\n\nRecommended tools for this step (optional): "
+                        + ", ".join(tools_rec))
     parts.append(
         f"## THIS STEP: {step.get('title', '')}\n"
         + (step.get("body") or "").strip()
-        + ("\n\nTools for this step: " + ", ".join(tools) if tools else "")
+        + tools_lines
         + "\n\nDo ONLY this step's work, then end your turn — the next step "
           "runs as a separate session with this task's updated state.")
     if onfail_context:
