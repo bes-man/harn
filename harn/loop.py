@@ -1477,6 +1477,15 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
     try:
         for step in wave:
             sid = step.get("id") or ""
+            # Non-goal (design spec): `On fail:` combined with concurrency is
+            # too combinatorial for Phase 3. Same treatment as an `on_fail`
+            # pointing at a command step (Phase 2, above in `run_step`) — log
+            # a config_error and otherwise run as if `on_fail` were unset. No
+            # handler-dispatch code exists on this path at all, so "unset" is
+            # the natural behavior; this just surfaces the mistake.
+            if str(step.get("on_fail") or "").strip():
+                events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
+                            detail="On fail is not supported inside a parallel wave (Phase 3 non-goal)")
             wt = tmp_root / (sid or wave_id)
             if gitutil.create_worktree(project_root, base_ref, wt):
                 _replicate_connectors(project_root, wt, env_dir)

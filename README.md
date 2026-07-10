@@ -220,6 +220,34 @@ todo → in_progress → review ⇄ changes_requested → done
 See [`harn_example/tasks/AUTH-42.json`](./harn_example/tasks/AUTH-42.json)
 for a `done` task with its full review log and carried-forward notes.
 
+## Workflow steps: agent vs command, on-fail, parallel
+
+`harn_env/WORKFLOW.md` is the plan every task walks (edit by hand or via
+`harn ui`'s visual Studio canvas). Each step is a Markdown heading with a few
+optional lines that turn plain prose into something `harn run` executes:
+
+- **`Type: command`** — a shell command instead of an agent turn (default
+  `Type: agent`). Pair it with **`Command: <shell>`** (runs in the project
+  root, no LLM, no tokens) and, optionally, **`On fail: <step title>`** — on a
+  non-zero exit/timeout, that target step runs once as a recovery agent turn,
+  then the failing command is retried.
+- **`Parallel: <group>`** — steps sharing the same group id run concurrently
+  instead of one at a time. In Studio, just drag step blocks to the same
+  horizontal (Y) level on the canvas — contiguous steps at the same height are
+  auto-grouped into a shared group id (shown as a `∥` lane); the `Parallel:`
+  field is what actually drives execution, the canvas position is only the
+  editing gesture. Under the hood, each step in the group runs in its own
+  isolated git worktree checked out from a shared checkpoint; once every
+  member finishes, their diffs are merged back into your working tree one at a
+  time (a same-file conflict triggers one agent turn to resolve it) — harn
+  still never creates commits, so the result is just an ordinary uncommitted
+  diff.
+- **`On fail:` is not supported inside a parallel group** — combining
+  retry/handler-jump semantics with concurrency was left out on purpose.
+  Setting both `Parallel:` and `On fail:` on the same step logs a
+  `config_error` event and `On fail` is treated as unset for that step (its
+  failure is just recorded, not retried through a handler).
+
 ## Multiple agents, one shared context
 
 Set `agents = ["claude", "codex", …]`; the first installed one runs. Whichever
@@ -647,6 +675,27 @@ todo → in_progress → review ⇄ changes_requested → done
 Комментарий → `changes_requested` (агент переделывает). Принятие → `done` с
 секцией **«Notes for future agents»**. История ревью дописывается в сам файл
 задачи, поэтому контекст путешествует вместе с ней.
+
+### Шаги воркфлоу: agent/command, on-fail, parallel
+
+`harn_env/WORKFLOW.md` — план, по которому идёт каждая задача (правьте руками
+или через визуальный Studio-канвас `harn ui`). У шага есть необязательные
+строки:
+- **`Type: command`** — шаг-команда вместо хода агента (по умолчанию
+  `Type: agent`), с **`Command: <shell>`** и опциональным
+  **`On fail: <step title>`** (при ошибке один раз запускает целевой шаг как
+  агента-починщика, затем команда повторяется).
+- **`Parallel: <group>`** — шаги с одним `group` id выполняются одновременно.
+  В Studio для этого достаточно перетащить блоки на один Y-уровень канваса —
+  поле `Parallel` и есть источник истины, позиция на канвасе лишь жест
+  редактирования. Каждый шаг группы выполняется в своём изолированном git
+  worktree от общего чекпоинта; после завершения все патчи по очереди
+  сливаются в ваше рабочее дерево (конфликт в одном файле решает один ход
+  агента-мерджера) — коммиты harn по-прежнему не создаёт.
+- **`On fail:` внутри `Parallel`-группы не поддерживается** — совмещать
+  retry/handler-переходы с параллелизмом решили не делать. Если оба поля
+  заданы одновременно, пишется событие `config_error`, а `On fail`
+  игнорируется для этого шага (ошибка просто фиксируется, без хендлера).
 
 ### Несколько агентов, один контекст
 

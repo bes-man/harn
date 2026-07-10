@@ -8,7 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from harn import loop, tasks, workflows, scaffold, gitutil, ENV_DIRNAME
+from harn import events, loop, tasks, workflows, scaffold, gitutil, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from .conftest import make_task
 
@@ -418,3 +418,22 @@ def test_run_does_not_crash_when_a_wave_member_turn_raises(tmp_path, monkeypatch
     code, out, _ = gitutil._run(["worktree", "list", "--porcelain"], tmp_path)
     assert out.count("worktree ") == 1
     assert "prunable" not in out
+
+
+def test_onfail_inside_a_wave_is_a_config_error(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Tests", id="s-t", type="command", command="false",
+              parallel="wave-1", on_fail="s-fix"),
+        _step("Build", id="s-build", parallel="wave-1"),
+        _step("Fix", id="s-fix"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    evs = events.read(env)
+    errs = [e for e in evs if e["event"] == "config_error" and e.get("stage") == "s-t"]
+    assert errs, "expected a config_error for on_fail set inside a parallel wave"
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-t"]["status"] == "failed"  # recorded, not retried
