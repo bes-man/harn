@@ -193,3 +193,24 @@ def test_explain_shows_command_not_a_phantom_agent_model(tmp_path):
     line = next(ln for ln in text.splitlines() if "Tests" in ln)
     assert "command: npm test" in line
     assert "/ default" not in line and "/ claude" not in line
+
+
+def test_explain_annotates_parallel_wave_steps(tmp_path):
+    """A step with a non-empty `parallel` field is a member of a parallel
+    wave — explain() should flag that inline so `harn explain` communicates
+    it, not just sequential 1./2./3. numbering."""
+    from harn.config import Config
+    from harn import workflow, scaffold as scaffold_mod, ENV_DIRNAME as _ENV
+    scaffold_mod.setup(tmp_path)
+    env = tmp_path / _ENV
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Tests")
+    step["parallel"] = "wave-a"
+    workflow.save_parsed(env, parsed)
+    text = loop.explain(env, Config.load(env))
+    wave_line = next(ln for ln in text.splitlines() if "Tests" in ln)
+    assert "[∥ wave: wave-a]" in wave_line
+    other_lines = [ln for ln in text.splitlines()
+                   if "Tests" not in ln and ln.strip().startswith(tuple("0123456789"))]
+    assert other_lines, "expected other numbered steps to compare against"
+    assert all("∥ wave" not in ln for ln in other_lines)

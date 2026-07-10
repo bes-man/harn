@@ -62,6 +62,9 @@ def explain(env_dir: Path, cfg: Config) -> str:
             agent = (s.get("agent") or "").strip() or default_agent
             model = (s.get("model") or "").strip() or default_model
             detail = f"({agent} / {model})"
+        wave = (s.get("parallel") or "").strip()
+        if wave:
+            detail = f"{detail} [∥ wave: {wave}]"
         lines.append(f"  {n}. [{mark}] {s.get('title', '')} {detail}")
     if n == 0:
         lines.append("  (no steps defined in WORKFLOW.md)")
@@ -1390,6 +1393,18 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
                  if results.get(step.get("id") or "") is not None
                  and not results[step.get("id") or ""][1]),
                 wave[0].get("id") or "")
+            # `_handle_block`'s terminal "blocked" branch is the one path that
+            # deliberately leaves BLOCKED.md on disk (so a human/Telegram
+            # reply can still land against it later). But that stale marker
+            # would otherwise be re-read by a LATER wave member's own
+            # `_handle_block` call (e.g. inside `_run_merge_agent_turn` for a
+            # genuinely conflicting patch further down this same wave),
+            # mis-ledgering that unrelated step as "blocked" too. The block is
+            # already durably recorded in `st`/`state.State` above (and `run()`
+            # reloads state from disk after this wave returns), so it's safe
+            # to clear the marker file here — only the on-disk trip-wire goes
+            # away, not the recorded block itself.
+            state.clear_block_marker(state_dir)
         # 'resumed' / 'auto': someone already answered (or auto-decided)
         # before we got here — nothing left to defer, merge normally below.
 

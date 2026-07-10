@@ -287,6 +287,65 @@ def test_parallel_step_block_defers_to_sequential_rerun(tmp_path, monkeypatch):
     assert fresh.step_results.get("s-fe", {}).get("status") == "ok"
 
 
+def test_stale_block_marker_does_not_leak_into_a_later_conflict_resolution(tmp_path, monkeypatch):
+    """Regression: a wave with BOTH a blocking member AND a LATER member whose
+    patch genuinely conflicts on merge. Attributing the block to the blocking
+    member must clear the on-disk BLOCKED.md marker — otherwise the later
+    conflict's own merge-agent turn (`_run_merge_agent_turn` -> `_handle_block`)
+    re-reads the SAME stale marker and gets mis-ledgered as "blocked" too,
+    even though that turn never asked a question of its own."""
+    (tmp_path / "shared.txt").write_text("original\n")
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+        _step("Api", id="s-api", parallel="wave-1"),
+    ])
+    state_dir = env / "state"
+
+    class BlockThenConflictAdapter:
+        name = "fake"
+        def __init__(self): self.calls = []
+        def available(self): return True
+        def run_turn(self, prompt, cwd, **kw):
+            self.calls.append({"prompt": prompt, "cwd": str(cwd)})
+            if "Merge conflict" in prompt:
+                # The merge-agent turn resolving s-api's conflict — this turn
+                # never asks a question, so it must NOT be reported blocked.
+                Path(cwd, "shared.txt").write_text("merged resolution\n")
+                return AgentResult(ok=True, text="resolved the conflict")
+            if "Backend" in prompt:
+                state_dir.mkdir(parents=True, exist_ok=True)
+                (state_dir / "BLOCKED.md").write_text("## Question\nWhich DB?\n")
+                return AgentResult(ok=True, text="...")
+            if "Frontend" in prompt:
+                Path(cwd, "shared.txt").write_text("edited by frontend\n")
+                return AgentResult(ok=True, text="done")
+            # Api: edits the same line from the SAME original base as
+            # Frontend — genuinely conflicts once Frontend's patch has
+            # already been applied to the shared tree.
+            Path(cwd, "shared.txt").write_text("edited by api\n")
+            return AgentResult(ok=True, text="done")
+
+    fake = BlockThenConflictAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    phase = loop.run(tmp_path, env)
+
+    from harn import state as state_mod
+    assert phase == state_mod.BLOCKED  # Backend's block still wins overall
+
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-be"]["status"] == "blocked"
+    # THE regression: s-api's genuine merge conflict must be resolved on its
+    # own merits, not inherit Backend's block via the stale on-disk marker.
+    assert fresh.step_results["s-api"]["status"] == "ok"
+    assert fresh.step_results["s-fe"]["status"] == "ok"
+    assert (tmp_path / "shared.txt").read_text() == "merged resolution\n"
+    # The merge-agent turn for s-api's conflict actually ran (proves we got
+    # far enough to dispatch it, instead of short-circuiting as "blocked").
+    assert any("Merge conflict" in c["prompt"] for c in fake.calls)
+
+
 def test_merge_never_creates_a_git_commit_even_on_conflict(tmp_path, monkeypatch):
     """harn's standing invariant: it never commits on the user's behalf.
     Applying wave patches, and dispatching a merge-agent turn to resolve a
