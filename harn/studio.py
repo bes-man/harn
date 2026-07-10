@@ -28,6 +28,7 @@ from . import runner as runner_mod
 from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
+from . import tools as tools_mod
 from . import workflow as workflow_mod
 from . import workflows as workflows_mod
 from .config import Config
@@ -162,8 +163,47 @@ def tools_catalog_payload(env_dir: Path) -> dict:
     is unaffected by how much explanation a human browsing the UI needs."""
     from . import mcp_server, tool_notes
     catalog = mcp_server.tool_catalog()
+    custom = [
+        {"name": t.name, "description": t.description, "params": t.params,
+         "command": t.command, "source": t.source}
+        for t in tools_mod.discover(env_dir)
+    ]
     return {"tools": {name: tool_notes.merged(name, doc)
-                      for name, doc in catalog.items()}}
+                      for name, doc in catalog.items()},
+            "custom": custom}
+
+
+def save_custom_tool_payload(env_dir: Path, payload: dict) -> dict:
+    """Persist a new custom tool. Rejects a name collision with a BUILT-IN
+    MCP tool name here (mcp_server.tool_catalog() is the source of truth for
+    the ~35 built-ins); a collision with an existing CUSTOM tool, or an
+    invalid name/param, is independently rejected by tools_mod.save()
+    itself, which raises ValueError — both checks gate every Save."""
+    from . import mcp_server
+    name = (payload.get("name") or "").strip()
+    description = payload.get("description") or ""
+    params = payload.get("params") or []
+    command = payload.get("command") or ""
+    source = payload.get("source") or "chat"
+    if not command.strip():
+        return {"ok": False, "error": "command is empty"}
+    built_in = set(mcp_server.tool_catalog().keys())
+    if name in built_in:
+        return {"ok": False, "error": f"'{name}' is already a built-in harn tool"}
+    try:
+        tools_mod.save(env_dir, name, description, params, command, source=source)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+def delete_custom_tool_payload(env_dir: Path, name: str) -> dict:
+    """Remove a custom tool. Returns ok:False (not a raised error) when the
+    name doesn't exist, matching delete_skill's forgiving style elsewhere in
+    this file."""
+    if not tools_mod.delete(env_dir, name):
+        return {"ok": False, "error": f"no such custom tool: {name}"}
+    return {"ok": True}
 
 
 def apply_skill(env_dir: Path, payload: dict) -> dict:
@@ -749,6 +789,10 @@ def _make_handler(default_env: Path):
                 self._json(apply_skill(env, body))
             elif route == "/api/skill/delete":
                 self._json(delete_skill(env, body))
+            elif route == "/api/tools/save":
+                self._json(save_custom_tool_payload(env, body))
+            elif route == "/api/tools/delete":
+                self._json(delete_custom_tool_payload(env, body.get("name", "")))
             elif route == "/api/layout":
                 self._json(apply_layout(env, body))
             elif route == "/api/config":
