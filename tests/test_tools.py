@@ -87,6 +87,50 @@ def test_execute_quotes_a_param_that_looks_like_a_second_command(tmp_path):
     assert "; rm -rf /tmp/should-not-run" in out
 
 
+def test_save_rejects_invalid_param_name(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    bad_param = "foo); import os; os.system('x'); def _("
+    try:
+        tools.save(env, "run_lint", "desc", [bad_param], "echo {foo}")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert bad_param in str(exc)
+    # fail closed: no partial write
+    assert tools.discover(env) == []
+
+
+def test_save_rejects_injection_shaped_param_name(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    bad_param = "x, y): pass\ndef evil("
+    try:
+        tools.save(env, "run_lint", "desc", [bad_param], "echo hi")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert repr(bad_param) in str(exc)
+    assert tools.discover(env) == []
+
+
+def test_save_succeeds_with_valid_params(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    p = tools.save(env, "make_thing", "desc", ["title", "target_dir"],
+                   "echo {title} {target_dir}")
+    assert p.exists()
+    found = tools.read(env, "make_thing")
+    assert found.params == ["title", "target_dir"]
+
+
+def test_is_safe_param_name():
+    assert tools.is_safe_param_name("title") is True
+    assert tools.is_safe_param_name("target_dir") is True
+    assert tools.is_safe_param_name("foo); evil(") is False
+    assert tools.is_safe_param_name("x, y): pass\ndef evil(") is False
+    assert tools.is_safe_param_name("") is False
+    assert tools.is_safe_param_name("Title") is False
+
+
 def test_execute_reports_command_not_found(tmp_path):
     env = tmp_path / "harn_env"
     env.mkdir()

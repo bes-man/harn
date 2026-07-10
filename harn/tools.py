@@ -19,6 +19,17 @@ from pathlib import Path
 _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 
+def is_safe_param_name(name: str) -> bool:
+    """True iff `name` is safe to splice into generated Python source as a
+    function parameter (e.g. Task 2's `def _custom_tool({param}: str = ''):`
+    exec-based registration). Same character class as tool names themselves
+    — restrictive on purpose, since this is the last line of defense against
+    code injection via an attacker-controlled param name (uploaded tool
+    definition, agent-drafted tool, or an imported tool bundle from another
+    harn user)."""
+    return bool(_NAME_RE.fullmatch(name))
+
+
 @dataclass
 class CustomTool:
     name: str
@@ -75,6 +86,11 @@ def save(env_dir: Path, name: str, description: str, params: list[str],
     name = name.strip()
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"invalid tool name: {name!r} (must match [a-z0-9_]+)")
+    for param in params:
+        if not is_safe_param_name(param):
+            raise ValueError(
+                f"invalid param name: {param!r} (must match [a-z0-9_]+)"
+            )
     if name_taken(env_dir, name):
         raise ValueError(f"a custom tool named '{name}' already exists")
     d = _tools_dir(env_dir)
