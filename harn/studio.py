@@ -2530,6 +2530,7 @@ function renderTools(){
     v.appendChild(r); });
   if(!tools.length) v.innerHTML+='<div class="empty">No tools yet — add tools on a step (Flow tab).</div>';
   v.innerHTML+=renderCustomToolsSection();
+  v.innerHTML+=renderToolChatPanel();
   if(toolSel&&tools.includes(toolSel)) renderToolEditor(); else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
 }
 /* ---------- custom tools: upload / delete (Phase 5) ---------- */
@@ -2567,6 +2568,49 @@ async function uploadToolFile(input){
 async function deleteCustomTool(name){
   if(!confirm('Delete "'+name+'"?'))return;
   await post_('/api/tools/delete',{name});
+  await loadToolsData(true);
+  renderTools();
+}
+/* ---------- custom tools: agent-chat drafting (Phase 5 Task 6) ---------- */
+let TOOL_CHAT_HISTORY=[];   // [{role,text}], reset on panel open/tool save
+let TOOL_CHAT_DRAFT=null;
+function renderToolChatPanel(){
+  const msgs=TOOL_CHAT_HISTORY.map(h=>
+    `<div class="ds"><b>${h.role==='user'?'You':'Agent'}:</b> ${esc(h.text)}</div>`).join('');
+  const draftHtml=TOOL_CHAT_DRAFT
+    ? `<div class="skillrow"><div style="width:100%">`+
+      `<div class="nm">${esc(TOOL_CHAT_DRAFT.name)}</div>`+
+      `<div class="ds">${esc(TOOL_CHAT_DRAFT.description)}</div>`+
+      `<div class="ds">params: ${esc((TOOL_CHAT_DRAFT.params||[]).join(', ')||'(none)')}</div>`+
+      `<div class="ds">command: ${esc(TOOL_CHAT_DRAFT.command)}</div>`+
+      `<button onclick="saveToolDraft()">Save</button></div></div>`
+    : `<div class="empty">No draft yet — describe the tool below.</div>`;
+  return `<h2 style="margin-top:18px">DESCRIBE A NEW TOOL TO THE AGENT</h2>`+
+    `<div id="toolChatMsgs">${msgs}</div>`+
+    `<textarea id="toolChatInput" rows="2" placeholder="What should this tool do?"></textarea>`+
+    `<button onclick="sendToolChat()">Send</button>`+
+    `<h4>Draft</h4>${draftHtml}`;
+}
+async function sendToolChat(){
+  const input=$('#toolChatInput');
+  const message=input.value.trim();
+  if(!message)return;
+  TOOL_CHAT_HISTORY.push({role:'user', text:message});
+  input.value='';
+  renderTools();
+  const r=await post_('/api/tools/chat',{history:TOOL_CHAT_HISTORY.slice(0,-1), message});
+  TOOL_CHAT_HISTORY.push({role:'agent', text:r.reply||''});
+  if(r.draft) TOOL_CHAT_DRAFT=r.draft;
+  renderTools();
+}
+async function saveToolDraft(){
+  if(!TOOL_CHAT_DRAFT)return;
+  const r=await post_('/api/tools/save',{
+    name:TOOL_CHAT_DRAFT.name, description:TOOL_CHAT_DRAFT.description,
+    params:TOOL_CHAT_DRAFT.params, command:TOOL_CHAT_DRAFT.command, source:'chat'});
+  if(!r.ok){ alert(r.error||'save failed'); return; }
+  alert('Saved. This tool will be available to the agent starting its NEXT session — not the one currently running.');
+  TOOL_CHAT_HISTORY=[]; TOOL_CHAT_DRAFT=null;
   await loadToolsData(true);
   renderTools();
 }
