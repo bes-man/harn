@@ -417,7 +417,7 @@ def cmd_trace(args) -> int:
             bits.append(task)
         if stage:
             bits.append(stage)
-        for k in ("verdict", "outcome", "phase", "source", "kind", "name"):
+        for k in ("verdict", "outcome", "phase", "source", "kind", "name", "tool", "step_id"):
             if e.get(k):
                 bits.append(f"{k}={e[k]}")
         if e.get("dur_ms") is not None:
