@@ -474,7 +474,19 @@ def launch_step(env_dir: Path, payload: dict) -> dict:
     """Start (or rerun) exactly ONE workflow step for one task in the
     background — the Flow tab's per-step Run/Rerun controls. `rerun=True`
     first restores the working tree to that step's git checkpoint (see
-    gitutil.checkpoint / loop.run_step), discarding its last attempt."""
+    gitutil.checkpoint / loop.run_step), discarding its last attempt.
+
+    A step that's part of a parallel wave (non-empty `parallel` field) needs a
+    DIFFERENT undo than a normal step's checkpoint restore: that checkpoint is
+    the whole wave's SHARED starting point (see `loop._run_parallel_wave`), so
+    restoring straight to it would silently discard every sibling step's
+    already-merged edit too. For a parallel step, Rerun instead calls
+    `loop.rollback_parallel_step` HERE (synchronously, in the studio process,
+    before the background rerun is launched) — it reverse-applies just this
+    step's own saved patch, touching no sibling, and only falls back to
+    reverting the whole wave if that's no longer possible. That fallback is
+    never silent: its `note` is passed through in this route's response so the
+    UI can surface it as an alert (see `rerunStep()` in the client script)."""
     task_id = (payload.get("task_id") or "").strip()
     step_id = (payload.get("step_id") or "").strip()
     task = tasks_mod.find(env_dir, task_id)
@@ -482,11 +494,24 @@ def launch_step(env_dir: Path, payload: dict) -> dict:
         return {"ok": False, "error": f"no task {task_id}"}
     plan = workflows_mod.load_task_plan(env_dir, task_id) \
         or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
-    known = {n.get("id") for n in plan.get("nodes", []) if n.get("kind") == "step"}
-    if step_id not in known:
+    nodes = plan.get("nodes", [])
+    step = next((n for n in nodes if n.get("kind") == "step"
+                and n.get("id") == step_id), None)
+    if step is None:
         return {"ok": False, "error": f"unknown step '{step_id}'"}
-    return runner_mod.launch(env_dir.parent, env_dir, task_id,
-                             step=step_id, rerun=bool(payload.get("rerun")))
+    rerun = bool(payload.get("rerun"))
+    note = ""
+    if rerun and (step.get("parallel") or "").strip():
+        from . import loop as loop_mod
+        rb = loop_mod.rollback_parallel_step(env_dir.parent, env_dir,
+                                             task_id, step_id)
+        if rb.get("mode") == "whole-wave-fallback":
+            note = rb.get("note", "")
+    result = runner_mod.launch(env_dir.parent, env_dir, task_id,
+                               step=step_id, rerun=rerun)
+    if note:
+        result = {**result, "note": note}
+    return result
 
 
 def launch_stage(env_dir: Path, payload: dict) -> dict:
@@ -1503,6 +1528,10 @@ async function rerunStep(stepId){
     'tree to right before that step\'s last attempt (git), discarding it, then runs it again.'))return;
   const r=await post_('/api/tasks/run_step',{task_id:taskId,step_id:stepId,rerun:true});
   if(!r.ok){ alert(r.error||'failed to start'); return; }
+  // A parallel-wave step whose independent rollback wasn't possible falls
+  // back to reverting the WHOLE wave (see loop.rollback_parallel_step) —
+  // that's never allowed to happen silently, so surface it here.
+  if(r.note){ alert(r.note); }
   await pollBoard(); renderFlow();
 }
 function skillNames(){ return S.skills.map(s=>s.name); }

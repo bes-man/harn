@@ -1111,7 +1111,15 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         return {"ok": entry.get("status") == "ok", "step_id": step_id, "title": title,
                 "output": entry.get("output", "")}
 
-    if rerun:
+    if rerun and not (step.get("parallel") or "").strip():
+        # A parallel-wave member's `stage_checkpoints[step_id]` entry is the
+        # WAVE's shared base ref (every member is stamped with the same one —
+        # see `_run_parallel_wave`), not "right before THIS step's own last
+        # attempt." Restoring to it here would wipe out every sibling's
+        # already-merged edit too. For a parallel step, the caller is expected
+        # to have already undone just this step's own contribution via
+        # `rollback_parallel_step` (studio calls it before requesting this
+        # rerun) — so skip the checkpoint-based restore entirely in that case.
         ref = task.stage_checkpoints.get(step_id)
         if ref:
             gitutil.rollback_to(ref, project_root, apply=True)
@@ -1145,6 +1153,57 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
 
     return {"ok": bool(result.ok), "step_id": step_id, "title": title,
             "text": result.text}
+
+
+def rollback_parallel_step(project_root: Path, env_dir: Path, task_id: str,
+                           step_id: str) -> dict:
+    """Undo ONE parallel-wave step's contribution to the merged main tree,
+    independently of its siblings (the design spec's "Independent rollback").
+
+    Loads the step's own saved patch (`gitutil.save_patch_ref`, written by
+    `_merge_wave_patches` when the wave merged) and reverse-applies it against
+    the CURRENT main tree (`gitutil.apply_patch(..., reverse=True)`, i.e.
+    `git apply --3way --reverse`). If nothing has touched the same lines since
+    the merge, this cleanly removes exactly that step's edits — every
+    sibling's own merged patch is never touched.
+
+    If the reverse-apply isn't possible (no patch was ever recorded for this
+    step, or the patch no longer reverses cleanly because someone edited the
+    same lines after the merge), falls back to the guaranteed-safe path:
+    restore the WHOLE wave's shared base checkpoint via `gitutil.rollback_to`.
+    `base_ref` is read from `task.stage_checkpoints[step_id]` — every member
+    of a wave is stamped with that SAME shared ref when the wave runs (see
+    `_run_parallel_wave`), reusing the exact per-step-checkpoint mechanism
+    `run_step`'s own (non-parallel) rerun path already relies on. This
+    fallback always succeeds (barring no git repo / no checkpoint at all) but
+    discards every sibling's merged work too, so the result carries a `note`
+    the caller (studio) MUST surface — this is a safety net, not a silent
+    substitute for the single-step rollback the caller asked for.
+
+    Returns `{"ok": True, "mode": "single-step"}` on a clean reverse-apply, or
+    `{"ok": bool, "mode": "whole-wave-fallback", "note": str}` when the
+    fallback fired.
+    """
+    task = tasks.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "mode": "single-step",
+                "error": f"no task '{task_id}'"}
+
+    patch = gitutil.load_patch_ref(project_root, task.id, step_id)
+    if patch and gitutil.apply_patch(project_root, patch, reverse=True):
+        return {"ok": True, "mode": "single-step"}
+
+    base_ref = task.stage_checkpoints.get(step_id, "")
+    result = gitutil.rollback_to(base_ref, project_root, apply=True)
+    return {
+        "ok": result.ok,
+        "mode": "whole-wave-fallback",
+        "note": "Single-step rollback was no longer possible for this step "
+                "(its saved patch no longer reverses cleanly against the "
+                "current tree) — reverted the WHOLE parallel wave to its "
+                "starting point instead, undoing every sibling step's edits "
+                "along with this one.",
+    }
 
 
 def _run_end(env_dir: Path, st: "state.State") -> str:
@@ -1400,6 +1459,19 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
 
     wave_id = wave[0].get("parallel") or "wave"
     base_ref = gitutil.checkpoint(project_root, task.id, f"{wave_id}-base")
+    # Stamp every member's OWN `stage_checkpoints[step_id]` with the wave's
+    # shared base ref (not `_checkpoint_stage`, which would key it under
+    # `f"{wave_id}-base"` instead of the step's own id). This is what lets
+    # `rollback_parallel_step`'s whole-wave fallback find "the wave's starting
+    # point" by looking up any one member's own step id — the SAME lookup
+    # convention `run_step`'s existing rerun path already uses for ordinary
+    # (non-parallel) steps, just pointed at a ref several steps share.
+    if base_ref:
+        for step in wave:
+            sid = step.get("id") or ""
+            if sid:
+                task.stage_checkpoints[sid] = base_ref
+        tasks._save(task)
     tmp_root = Path(tempfile.mkdtemp(prefix=f"harn-wave-{wave_id}-"))
     worktrees: dict[str, Path] = {}
     try:

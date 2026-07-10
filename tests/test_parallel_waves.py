@@ -326,6 +326,74 @@ def test_merge_never_creates_a_git_commit_even_on_conflict(tmp_path, monkeypatch
     assert (tmp_path / "shared.txt").read_text() == "merged resolution\n"
 
 
+def test_rollback_one_parallel_step_leaves_sibling_untouched(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    assert (tmp_path / "output_s-be.txt").exists()
+    assert (tmp_path / "output_s-fe.txt").exists()
+
+    r = loop.rollback_parallel_step(tmp_path, env, t.id, "s-be")
+    assert r["ok"] is True and r["mode"] == "single-step"
+    assert not (tmp_path / "output_s-be.txt").exists()
+    assert (tmp_path / "output_s-fe.txt").exists()  # sibling untouched
+
+
+def test_rollback_falls_back_to_whole_wave_when_patch_no_longer_reverses(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    # someone edits the SAME lines the step's patch touches, after the merge
+    (tmp_path / "output_s-be.txt").write_text("edited again after merge, incompatible\n")
+
+    r = loop.rollback_parallel_step(tmp_path, env, t.id, "s-be")
+    assert r["mode"] == "whole-wave-fallback"
+    assert "note" in r and r["note"]
+
+
+def test_rollback_unknown_task_reports_error(tmp_path):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+    ])
+    r = loop.rollback_parallel_step(tmp_path, env, "NOPE", "s-be")
+    assert r["ok"] is False
+
+
+def test_run_step_rerun_of_parallel_step_does_not_use_shared_wave_checkpoint(tmp_path, monkeypatch):
+    """A parallel step's `stage_checkpoints` entry is the WAVE's shared base
+    (see `_run_parallel_wave`) — `run_step`'s normal rerun-time restore
+    (rollback to `stage_checkpoints[step_id]`) must NOT fire for a parallel
+    step, or it would wipe out every sibling's already-merged edit too.
+    Independent rollback for a parallel step is `rollback_parallel_step`'s
+    job (studio calls it BEFORE requesting this rerun), not `run_step`'s own
+    checkpoint restore.
+    """
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    assert (tmp_path / "output_s-fe.txt").exists()
+
+    r = loop.run_step(tmp_path, env, t.id, "s-be", rerun=True)
+    assert r["ok"] is True
+    # sibling's merged output must survive a parallel step's own rerun
+    assert (tmp_path / "output_s-fe.txt").exists()
+
+
 def test_run_does_not_crash_when_a_wave_member_turn_raises(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Backend", id="s-be", parallel="wave-1"),
