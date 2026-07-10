@@ -194,3 +194,46 @@ def test_no_worktrees_or_refs_leaked_after_a_wave_runs(tmp_path, monkeypatch):
     code, out, _ = gitutil._run(["worktree", "list", "--porcelain"], tmp_path)
     # only the main worktree should remain
     assert out.count("worktree ") == 1
+
+
+class CrashingAdapter(WritingAdapter):
+    """One wave member's `run_turn` raises (simulating an adapter crash) —
+    the CRITICAL regression this test pins down: `_run_parallel_wave` must
+    neither leak worktree admin metadata nor let the exception propagate out
+    of `loop.run()`."""
+    def __init__(self, crash_on: str):
+        super().__init__()
+        self.crash_on = crash_on
+
+    def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                temperature=None):
+        if Path(cwd).name == self.crash_on:
+            raise RuntimeError(f"adapter blew up in {self.crash_on}")
+        return super().run_turn(prompt, cwd, timeout=timeout, model=model,
+                                effort=effort, temperature=temperature)
+
+
+def test_run_does_not_crash_when_a_wave_member_turn_raises(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = CrashingAdapter(crash_on="s-fe")
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    # Must not raise — a crashing adapter degrades to a failed step instead
+    # of propagating out of run() (matches the "never let a turn crash the
+    # dispatcher" convention used elsewhere in loop.py, e.g. oracle_review).
+    phase = loop.run(tmp_path, env)
+    assert phase is not None
+
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-be"]["status"] == "ok"
+    assert fresh.step_results["s-fe"]["status"] == "failed"
+
+    # No leaked worktree admin metadata (the Critical defect this test pins
+    # down): only the main worktree should remain, and none flagged prunable.
+    code, out, _ = gitutil._run(["worktree", "list", "--porcelain"], tmp_path)
+    assert out.count("worktree ") == 1
+    assert "prunable" not in out

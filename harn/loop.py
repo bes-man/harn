@@ -1301,21 +1301,35 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                 step_adapter = _adapter_for_step(cfg, step, default_adapter)
                 prompt = _build_step_prompt(env_dir, cfg, task, step,
                                            parallel_note=_PARALLEL_NOTE)
-                result = _run_turn(step_adapter, env_dir, prompt, wt,
-                                  task_id=task.id, stage=sid, step_title=title,
-                                  overrides=_step_overrides(cfg, step),
-                                  tok_totals={}, tok_costs={}, cfg=cfg)
-                ok = result.ok
+                try:
+                    result = _run_turn(step_adapter, env_dir, prompt, wt,
+                                      task_id=task.id, stage=sid, step_title=title,
+                                      overrides=_step_overrides(cfg, step),
+                                      tok_totals={}, tok_costs={}, cfg=cfg)
+                    ok = result.ok
+                except Exception:
+                    # _run_turn already emitted the `error` event before
+                    # re-raising. A raising adapter must not crash the whole
+                    # run() — degrade this member to a failed step instead,
+                    # the same "never let a turn crash the dispatcher"
+                    # convention used by oracle_review/reconcile_headless.
+                    ok = False
             patch = gitutil.diff_as_patch(wt, base_ref)
             return sid, (ok, patch)
 
         results: dict = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave)) as ex:
-            for sid, outcome in ex.map(_run_one, wave):
-                results[sid] = outcome
-
-        for sid, wt in worktrees.items():
-            gitutil.remove_worktree(project_root, wt)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave)) as ex:
+                for sid, outcome in ex.map(_run_one, wave):
+                    results[sid] = outcome
+        finally:
+            # Runs even if something above still managed to raise (defense in
+            # depth) — a wave must never leak worktree admin metadata
+            # (.git/worktrees/<name>/), which `shutil.rmtree(tmp_root)` alone
+            # cannot clean up (that only deletes the checked-out directory,
+            # not git's own bookkeeping for it).
+            for sid, wt in worktrees.items():
+                gitutil.remove_worktree(project_root, wt)
 
         return _merge_wave_patches(env_dir, project_root, task, wave, results, base_ref)
     finally:
