@@ -25,6 +25,7 @@ from . import progress as progress_mod
 from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
+from . import tools as tools_mod
 from .config import Config
 from .feedback import run_feedback
 from .notify import notify
@@ -122,6 +123,32 @@ def _ensure_watch_running(env_dir: Path) -> None:
     except Exception:
         pass  # watch is optional — never block the MCP server
 
+
+
+def _make_tool_function(tool, project_root: Path):
+    """Synthesize a REAL Python function object with one named `str`
+    parameter per `tool.params`, so FastMCP's `Tool.from_function` (which
+    inspects the function's actual signature via `inspect.signature`) can
+    build a correct per-parameter JSON schema. A `**kwargs`-only catch-all
+    cannot do this — FastMCP iterates named parameters, not an opaque
+    kwargs dict. `tool.params` names are already validated by
+    `tools.save`'s `_NAME_RE` check (the same `[a-z0-9_]+` pattern applies
+    to param names, enforced by the caller before this is ever invoked —
+    see the studio save/import handlers in Task 3+), so this exec() only
+    ever runs source built from whitelisted identifier characters.
+    """
+    arg_sig = ", ".join(f"{p}: str = ''" for p in tool.params)
+    call_kwargs = ", ".join(f"'{p}': {p}" for p in tool.params)
+    src = (
+        f"def _custom_tool({arg_sig}) -> str:\n"
+        f"    return _run({{{call_kwargs}}})\n"
+    )
+    ns: dict = {"_run": lambda args: tools_mod.execute(tool, args, project_root)}
+    exec(src, ns)  # noqa: S102 — src is built entirely from validated [a-z0-9_]+ names
+    fn = ns["_custom_tool"]
+    fn.__name__ = tool.name
+    fn.__doc__ = tool.description or f"Custom tool: {tool.name}"
+    return fn
 
 
 # `start_watch=False` is for INTROSPECTION-ONLY callers (`tool_catalog()`) that
@@ -827,6 +854,10 @@ def build_server(start_watch: bool = True):
         tasks_mod._save(t)
         _log(f"{t.id} workflow → {t.workflow or 'default'}")
         return f"{t.id} will run under workflow: {t.workflow or 'default (WORKFLOW.md)'}"
+
+    for custom_tool in tools_mod.discover(_env_dir()):
+        fn = _make_tool_function(custom_tool, _env_dir().parent)
+        mcp.add_tool(fn, name=custom_tool.name, description=custom_tool.description)
 
     return mcp
 
