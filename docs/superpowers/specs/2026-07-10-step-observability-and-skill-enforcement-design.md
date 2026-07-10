@@ -2,7 +2,7 @@
 
 ## Problem
 
-Users need three related things `harn run`/studio don't currently give them:
+Users need four related things `harn run`/studio don't currently give them:
 
 1. **See what the agent is doing, per step** — today's "Run log" is the whole
    background process's raw stdout tail, not scoped to one step; there's no
@@ -15,11 +15,18 @@ Users need three related things `harn run`/studio don't currently give them:
    after a step finishes, see which were actually used (🟢 used, 🟡 unused-but-
    optional, 🔴 required-and-unused) — with a required-and-unused skill/tool
    forcing exactly one automatic re-run before escalating to a human.
+4. **Answer a BLOCKED question from inside studio itself**, without switching
+   to a terminal/chat session — and confirm the existing Telegram-escalation
+   mechanism (posting the question there if nobody answers in time) already
+   covers "send it with the agent's own embedded recommendation," since the
+   question text the agent writes already contains its recommendation as
+   prose.
 
-Pause/resume (originally requested as item 3) is judged ALREADY sufficiently
-supported by the existing engine (ledger-driven resume + task-plan editing +
-Stop/Relaunch) — this phase only makes it a clearly-labeled UI convenience
-(rename Stop's button/messaging), not new engine work.
+Pause/resume (originally requested as item 3 of the original 5-point request)
+is judged ALREADY sufficiently supported by the existing engine (ledger-driven
+resume + task-plan editing + Stop/Relaunch) — this phase only makes it a
+clearly-labeled UI convenience (rename Stop's button/messaging), not new
+engine work.
 
 ## Design
 
@@ -102,6 +109,43 @@ Tools (required: run_tests; recommended: read_design)
   red (required, unused — pulses until resolved, matching the existing
   `st-active` blink convention).
 
+### 6 — Answer a BLOCKED question from studio (+ confirm Telegram escalation)
+
+Today, answering a blocked run requires leaving studio (`harn answer "..."` in
+a terminal, or replying in chat/Telegram). This section closes that gap.
+
+- **What already exists, unchanged by this section**: `ask_user(question,
+  skill="")` (harn/mcp_server.py) writes agent-authored free-text prose (the
+  agent is instructed to embed "context + why, 2-3 options with trade-offs,
+  your recommendation" directly IN the question text — there is no separate
+  structured options list anywhere) and sets `State.phase = BLOCKED` +
+  `State.question`. `_telegram_wait`/`_await_answer` (harn/loop.py) already
+  escalate to Telegram after `Config.chat_grace_minutes` and already send the
+  full question text verbatim — so "send the question with its embedded
+  recommendation to Telegram if nobody answers in time" is ALREADY BUILT and
+  needs no engine change. `harn/cli.py`'s `cmd_answer` already calls
+  `loop.answer(env_dir, text)`, which clears the block and resumes.
+- **What's missing and this section adds**: studio has zero UI for this
+  (confirmed via grep — no route, no display, no submit path). Add:
+  - A studio backend route `GET /api/tasks/blocked_question?task=<id>` that
+    returns `{"question": str}` or `{"question": null}` by loading
+    `state.State` for that task (mirrors how `_await_answer` already detects
+    "answered" by checking whether the phase left BLOCKED) — read-only,
+    reuses the existing 1.5s `pollProgress()` cadence already running in the
+    Board (extend that poll's response payload rather than adding a second
+    poll loop).
+  - When a pending question exists, the Board renders a banner: the question
+    text in a `<pre>`-wrapped read-only block (preserves the agent's embedded
+    line breaks/options/recommendation exactly as written — plain text, not
+    parsed into discrete buttons, since the question is free prose, not
+    structured data) plus a textarea and a "Submit answer" button.
+  - A new studio backend route `POST /api/tasks/answer` with body
+    `{"task": id, "text": str}` that calls the SAME `loop.answer(env_dir,
+    text)` function `cmd_answer` already uses — no new answer-clearing logic,
+    just a second caller of the existing one.
+  - On submit, the banner clears (immediately, optimistically) and the next
+    poll tick confirms the run has resumed.
+
 ## Non-goal: required-skill enforcement inside a parallel wave
 
 `state.State` is a single shared file (`env_dir/state/state.json`), not
@@ -143,3 +187,9 @@ gap matters.
 - Studio: badge colors render correctly for all three states; "View full
   context"/"Copy to file" round-trip (the exported file's content matches
   what was previewed).
+- Answer-from-studio: `GET /api/tasks/blocked_question` returns the question
+  text while a task is BLOCKED and `null` once answered; `POST
+  /api/tasks/answer` clears the block and the task resumes (assert via the
+  same mechanism `test_answer`-style CLI tests already use, just through the
+  HTTP route instead of the CLI); a task that is NOT blocked returns `null`
+  and POSTing to it is a no-op/error, not a crash.
