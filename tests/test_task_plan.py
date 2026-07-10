@@ -85,3 +85,46 @@ def test_task_plan_roundtrip_via_studio(tmp_path):
     assert r["ok"] is True
     assert next(n for n in workflows.load_task_plan(env, t.id)["nodes"]
                 if n["kind"] == "step")["model"] == "opus"
+
+
+def test_step_prompt_payload_returns_the_real_prompt(tmp_path):
+    from harn import studio
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.load_task_plan(env, t.id)
+    step = next(n for n in plan["nodes"] if n["kind"] == "step")
+    payload = studio.step_prompt_payload(env, t.id, step["id"])
+    assert "error" not in payload
+    assert step["title"] in payload["prompt"]
+    # No side effects — the ledger is untouched.
+    fresh = tasks.find(env, t.id)
+    assert step["id"] not in fresh.step_results
+
+
+def test_step_prompt_payload_errors_for_unknown_task_or_step(tmp_path):
+    from harn import studio
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    assert "error" in studio.step_prompt_payload(env, "no-such-task", "s1")
+    assert "error" in studio.step_prompt_payload(env, t.id, "no-such-step")
+
+
+def test_step_prompt_export_payload_writes_a_file(tmp_path):
+    from harn import studio
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.load_task_plan(env, t.id)
+    step = next(n for n in plan["nodes"] if n["kind"] == "step")
+    prompt = studio.step_prompt_payload(env, t.id, step["id"])["prompt"]
+    r = studio.step_prompt_export_payload(env, t.id, step["id"], prompt)
+    assert "error" not in r
+    from pathlib import Path
+    p = Path(r["path"])
+    assert p.exists() and p.read_text(encoding="utf-8") == prompt
+
+
+def test_step_prompt_export_payload_rejects_empty_text(tmp_path):
+    from harn import studio
+    env = _env(tmp_path)
+    r = studio.step_prompt_export_payload(env, "t1", "s1", "   ")
+    assert "error" in r

@@ -576,6 +576,30 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
     return "\n\n".join(p for p in parts if p.strip())
 
 
+def preview_step_prompt(env_dir: Path, cfg: Config, task: "tasks.Task",
+                        step: dict) -> str:
+    """Return the EXACT prompt a real turn for this step would receive, with
+    zero side effects (no turn is run, no event emitted, no ledger touched).
+    Powers studio's "View full context" button and the `harn` CLI's future
+    preview command — both need to show a human the same text the agent
+    will actually see, before or after the fact."""
+    return _build_step_prompt(env_dir, cfg, task, step)
+
+
+def save_context_export(env_dir: Path, task_id: str, step_id: str,
+                        text: str) -> Path:
+    """Write a previewed/inspected step prompt to a plain text file a human
+    can download or open directly, per the "even copy it to a separate
+    file" requirement. Filename includes a timestamp so repeated exports of
+    the same step never collide."""
+    out_dir = env_dir / "state" / "context_exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = tasks._now_iso().replace(":", "-").replace(".", "-")
+    p = out_dir / f"{task_id}_{step_id}_{stamp}.txt"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
 def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> None:
     """Snapshot the working tree right before this stage's turn runs (see
     gitutil.checkpoint) so the studio UI's per-step Rerun control — or

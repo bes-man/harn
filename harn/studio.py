@@ -442,6 +442,40 @@ def task_plan_payload(env_dir: Path, task_id: str) -> dict:
     return {"ok": True, "plan": plan, "task_id": task_id}
 
 
+def step_prompt_payload(env_dir: Path, task_id: str, step_id: str) -> dict:
+    """The EXACT prompt a step would receive (or did receive), with zero side
+    effects — powers the Flow tab's "View full context" button. Reuses
+    `task_plan_payload`'s own plan-lookup fallback (task's saved snapshot,
+    else the preset's) and `launch_step`'s node-matching convention."""
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"error": f"no such task: {task_id}"}
+    plan = workflows_mod.load_task_plan(env_dir, task_id) \
+        or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
+    if plan is None:
+        return {"error": "no plan"}
+    nodes = plan.get("nodes", [])
+    step = next((n for n in nodes if n.get("kind") == "step"
+                and n.get("id") == step_id), None)
+    if step is None:
+        return {"error": f"no such step: {step_id}"}
+    cfg = Config.load(env_dir)
+    from . import loop as loop_mod
+    text = loop_mod.preview_step_prompt(env_dir, cfg, task, step)
+    return {"prompt": text}
+
+
+def step_prompt_export_payload(env_dir: Path, task_id: str, step_id: str,
+                                text: str) -> dict:
+    """Write a previewed prompt to a plain text file the human can open or
+    download directly — the "Copy to file" action on the preview panel."""
+    if not text.strip():
+        return {"error": "nothing to export"}
+    from . import loop as loop_mod
+    path = loop_mod.save_context_export(env_dir, task_id, step_id, text)
+    return {"path": str(path), "name": path.name}
+
+
 def save_task_plan_route(env_dir: Path, payload: dict) -> dict:
     """Persist edits made while a task's plan (not a preset) is open in the
     canvas — writes ONLY that task's snapshot file, never the preset. Echoes
@@ -653,6 +687,9 @@ def _make_handler(default_env: Path):
                 self._json(models_payload(env))
             elif route == "/api/task_plan":
                 self._json(task_plan_payload(env, self._query("task") or ""))
+            elif route == "/api/task_plan/step_prompt":
+                task_id, step_id = self._query("task"), self._query("step")
+                self._json(step_prompt_payload(env, task_id or "", step_id or ""))
             elif route == "/api/attachments/file":
                 task_id, name = self._query("task"), self._query("name")
                 data = attachments_mod.read_bytes(env, task_id, name)
@@ -707,6 +744,10 @@ def _make_handler(default_env: Path):
                 self._json(save_task_plan_route(env, body))
             elif route == "/api/defaults":
                 self._json(save_defaults(env, body))
+            elif route == "/api/task_plan/step_prompt/export":
+                self._json(step_prompt_export_payload(
+                    env, body.get("task", ""), body.get("step", ""),
+                    body.get("text", "")))
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -1542,6 +1583,28 @@ async function rerunStep(stepId){
   if(r.note){ alert(r.note); }
   await pollBoard(); renderFlow();
 }
+/* ---------- preview/export a step's exact prompt (no side effects) ---------- */
+async function viewFullContext(stepId){
+  const taskId=runStepTaskId();
+  if(!taskId){ alert('Select a runnable task first.'); return; }
+  const r=await (await fetch(api(`/api/task_plan/step_prompt?task=${encodeURIComponent(taskId)}&step=${encodeURIComponent(stepId)}`))).json();
+  if(r.error){ alert(r.error); return; }
+  const w=window.open('', '_blank');
+  w.document.title='Full context — '+stepId;
+  w.document.body.style.cssText='white-space:pre-wrap;font-family:monospace;padding:16px;';
+  w.document.body.textContent=r.prompt;
+  const btn=w.document.createElement('button');
+  btn.textContent='Copy to file';
+  btn.style.cssText='position:fixed;top:8px;right:8px;';
+  btn.onclick=async ()=>{
+    const rr=await fetch(api('/api/task_plan/step_prompt/export'),{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task:taskId, step:stepId, text:r.prompt})});
+    const j=await rr.json();
+    if(j.error) alert(j.error); else alert('Saved to '+j.path);
+  };
+  w.document.body.prepend(btn);
+}
 function skillNames(){ return S.skills.map(s=>s.name); }
 function allTools(){ const s=new Set(); S.workflow.nodes.forEach(n=>(n.tools||[]).forEach(t=>s.add(t))); return [...s].sort(); }
 function render(){ if(tab==='flow')renderFlow(); else if(tab==='skills')renderSkills(); else renderTools(); }
@@ -1935,6 +1998,12 @@ function renderInsp(){
       <div style="margin-top:8px"><button onclick="makeSequential('${esc(gid)}')">Make sequential</button></div>
     </div>`;
   })():'';
+  // Preview/export the EXACT prompt this step would (or did) receive — no
+  // side effects, calls loop.preview_step_prompt via the studio API.
+  const viewContextBtn=(isStep && n.id)?`
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" onclick="viewFullContext('${esc(n.id)}')">View full context</button>
+    </div>` : '';
   $('#insp').innerHTML=`
     <h2>${isStep?'Step':'Note'}</h2>
     <div class="row" style="justify-content:space-between">
@@ -1954,6 +2023,7 @@ function renderInsp(){
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
     ${parallelNote}
+    ${viewContextBtn}
     ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
   `;
 }
