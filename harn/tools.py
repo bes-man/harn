@@ -9,10 +9,12 @@ a project's test command.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import shlex
 import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,3 +136,78 @@ def execute(tool: CustomTool, args: dict[str, str], cwd: Path,
         return f"timeout after {timeout}s"
     except FileNotFoundError as exc:
         return f"command not found: {exc}"
+
+
+def export_bundle(tool: CustomTool) -> bytes:
+    """Export `tool` as a single portable file. A tool with no sibling
+    script (source == 'chat', or an 'upload' tool whose command doesn't
+    reference any file actually present alongside it) exports as plain JSON
+    bytes -- the exact file save() already wrote. An 'upload' tool with a
+    sibling script exports as a zip (stdlib zipfile) containing both the
+    JSON and the script, so a single download always reconstructs the tool
+    exactly on the importing side."""
+    json_bytes = tool.path.read_bytes()
+    # A script upload always names its file explicitly in `command` (e.g.
+    # "bash lint.sh"), so bundle any OTHER file in the tool's directory that
+    # `command` references by name -- this avoids bundling unrelated files
+    # that happen to live in the same tools/ directory.
+    referenced = [
+        p for p in sorted(tool.path.parent.iterdir())
+        if p.is_file() and p != tool.path and p.name in tool.command
+    ]
+    if not referenced:
+        return json_bytes
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"{tool.name}.json", json_bytes)
+        for p in referenced:
+            zf.writestr(p.name, p.read_bytes())
+    return buf.getvalue()
+
+
+def import_bundle(env_dir: Path, data: bytes, filename: str) -> CustomTool:
+    """Inverse of export_bundle(). Detects json-vs-zip by content (NOT by
+    `filename`, which is attacker-controlled and untrusted -- it's used only
+    for a friendlier error message, never to decide parsing behavior).
+
+    SECURITY: `data` originates from another harn user's export and is
+    therefore untrusted input, exactly like an uploaded tool script. This
+    function persists the tool ONLY via the existing tools_mod.save(), which
+    independently re-validates the tool name and every param name
+    ([a-z0-9_]+) and rejects a name collision -- it does NOT write the tool's
+    JSON to disk directly. save() raises ValueError on any of those
+    rejections, which this function lets propagate to the caller unchanged.
+
+    A zip bundle's script entry name is sanitized to its basename before
+    being written to disk (Path(name).name, rejecting anything that reduces
+    to '' , '.', or '..') -- the same path-traversal guard already applied
+    to direct script uploads in studio.save_custom_tool_payload(), so a
+    crafted zip entry name like '../../evil.sh' cannot escape the tools
+    directory."""
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        try:
+            json_name = next(n for n in zf.namelist() if n.endswith(".json"))
+        except StopIteration:
+            raise ValueError(f"{filename}: zip bundle has no .json tool definition")
+        parsed = json.loads(zf.read(json_name))
+        p = save(
+            env_dir, parsed.get("name", ""), parsed.get("description", ""),
+            parsed.get("params", []), parsed.get("command", ""),
+            source=parsed.get("source", "upload"),
+        )
+        for n in zf.namelist():
+            if n == json_name:
+                continue
+            safe_name = Path(n).name  # strip any path components (traversal guard)
+            if not safe_name or safe_name in (".", ".."):
+                continue
+            (p.parent / safe_name).write_bytes(zf.read(n))
+        return read(env_dir, parsed["name"])
+    parsed = json.loads(data)
+    save(
+        env_dir, parsed.get("name", ""), parsed.get("description", ""),
+        parsed.get("params", []), parsed.get("command", ""),
+        source=parsed.get("source", "chat"),
+    )
+    return read(env_dir, parsed["name"])

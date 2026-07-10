@@ -216,6 +216,68 @@ def save_custom_tool_payload(env_dir: Path, payload: dict) -> dict:
     return {"ok": True}
 
 
+def import_custom_tool_bundle_payload(env_dir: Path, payload: dict) -> dict:
+    """Import a custom tool exported by another harn user (Phase 5, Task 7).
+    `content_b64` is the raw bytes of the exported file (plain-JSON export
+    or a zip bundle), base64-encoded by the browser's FileReader before the
+    POST -- exactly like the existing upload-script flow in
+    save_custom_tool_payload().
+
+    SECURITY: this is attacker-controlled input from another user's
+    machine. The built-in-name collision check below mirrors
+    save_custom_tool_payload()'s own check (mcp_server.tool_catalog() is
+    only importable here, not from tools.py, which mcp_server.py itself
+    imports) so an import can't shadow a built-in tool any more than a
+    fresh Save can. The actual persistence -- and the injection-shaped
+    name/param rejection -- happens inside tools_mod.import_bundle(), which
+    routes through the SAME tools_mod.save() gate as every other tool
+    creation path; this function does not write the tool's JSON or any
+    sibling script itself."""
+    from . import mcp_server
+    try:
+        data = base64.b64decode(payload.get("content_b64") or "", validate=True)
+    except Exception:
+        return {"ok": False, "error": "content_b64 is not valid base64"}
+    filename = payload.get("filename") or ""
+    try:
+        parsed_name = _peek_bundle_name(data)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    built_in = set(mcp_server.tool_catalog().keys())
+    if parsed_name in built_in:
+        return {"ok": False, "error": f"'{parsed_name}' is already a built-in harn tool"}
+    try:
+        tool = tools_mod.import_bundle(env_dir, data, filename)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "name": tool.name}
+
+
+def _peek_bundle_name(data: bytes) -> str:
+    """Read just the `name` field out of an export bundle (json or zip)
+    without persisting anything -- used only for the built-in-name
+    pre-check above. Any parse failure here is surfaced as a ValueError
+    with a friendly message; the actual import (and its authoritative
+    validation) still happens via tools_mod.import_bundle()."""
+    import io
+    import zipfile
+    try:
+        if zipfile.is_zipfile(io.BytesIO(data)):
+            zf = zipfile.ZipFile(io.BytesIO(data))
+            try:
+                json_name = next(n for n in zf.namelist() if n.endswith(".json"))
+            except StopIteration:
+                raise ValueError("zip bundle has no .json tool definition")
+            parsed = json.loads(zf.read(json_name))
+        else:
+            parsed = json.loads(data)
+        return parsed.get("name", "")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"could not parse tool bundle: {exc}")
+
+
 def delete_custom_tool_payload(env_dir: Path, name: str) -> dict:
     """Remove a custom tool. Returns ok:False (not a raised error) when the
     name doesn't exist, matching delete_skill's forgiving style elsewhere in
@@ -783,10 +845,13 @@ def _make_handler(default_env: Path):
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             return (q.get(key) or [""])[0]
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str,
+                  extra_headers: dict | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -840,6 +905,17 @@ def _make_handler(default_env: Path):
                     self._send(404, b"not found", "text/plain"); return
                 ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
                 self._send(200, data, ctype)
+            elif route == "/api/tools/export":
+                name = self._query("name") or ""
+                tool = tools_mod.read(env, name)
+                if tool is None:
+                    self._send(404, b"not found", "text/plain"); return
+                data = tools_mod.export_bundle(tool)
+                is_zip = data[:2] == b"PK"
+                fname = f"{name}.zip" if is_zip else f"{name}.json"
+                ctype = "application/zip" if is_zip else "application/json"
+                self._send(200, data, ctype, extra_headers={
+                    "Content-Disposition": f'attachment; filename="{fname}"'})
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -867,6 +943,8 @@ def _make_handler(default_env: Path):
                 self._json(save_custom_tool_payload(env, body))
             elif route == "/api/tools/delete":
                 self._json(delete_custom_tool_payload(env, body.get("name", "")))
+            elif route == "/api/tools/import":
+                self._json(import_custom_tool_bundle_payload(env, body))
             elif route == "/api/tools/chat":
                 cfg = Config.load(env)
                 self._json(draft_tool_chat_payload(env, env.parent, cfg, body))
@@ -2539,12 +2617,15 @@ function renderCustomToolsSection(){
     `<div class="skillrow"><div style="width:100%">`+
     `<div class="nm">${esc(t.name)} <span class="mut" style="font-weight:400">(${esc(t.source)})</span></div>`+
     `<div class="ds">${esc(t.description)}</div>`+
+    `<button class="ghost" onclick="location.href=api('/api/tools/export?name='+encodeURIComponent('${esc(t.name)}'))" style="margin-top:4px">Export</button>`+
     `<button class="ghost" onclick="deleteCustomTool('${esc(t.name)}')" style="margin-top:4px">Delete</button>`+
     `</div></div>`).join('');
   return `<h2 style="margin-top:18px">CUSTOM TOOLS</h2>`+
     (rows||'<div class="empty">None yet.</div>')+
     `<button class="ghost" style="margin-top:8px" onclick="$('#toolUploadInput').click()">＋ Upload tool</button>`+
-    `<input type="file" id="toolUploadInput" style="display:none" onchange="uploadToolFile(this)"/>`;
+    `<input type="file" id="toolUploadInput" style="display:none" onchange="uploadToolFile(this)"/>`+
+    `<button class="ghost" style="margin-top:8px" onclick="$('#toolImportInput').click()">＋ Import tool</button>`+
+    `<input type="file" id="toolImportInput" style="display:none" onchange="importToolFile(this)"/>`;
 }
 async function uploadToolFile(input){
   const file=input.files&&input.files[0]; if(!file)return;
@@ -2564,6 +2645,19 @@ async function uploadToolFile(input){
   await loadToolsData(true);
   renderTools();
   alert('Saved. This tool will be available to the agent starting its NEXT session — not the one currently running.');
+}
+async function importToolFile(input){
+  const file=input.files&&input.files[0]; if(!file)return;
+  const dataUrl=await new Promise((res,rej)=>{
+    const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file);
+  });
+  const content_b64=dataUrl.split(',')[1]||'';
+  const r=await post_('/api/tools/import',{filename:file.name,content_b64});
+  if(!r.ok){ alert(r.error||'import failed'); return; }
+  input.value='';
+  await loadToolsData(true);
+  renderTools();
+  alert('Imported "'+r.name+'". Available to the agent starting its next session.');
 }
 async function deleteCustomTool(name){
   if(!confirm('Delete "'+name+'"?'))return;
