@@ -50,6 +50,7 @@ _TEMP_RE = re.compile(r"^\s*Temperature:\s*(\S+)\s*$", re.IGNORECASE)
 _TYPE_RE = re.compile(r"^\s*Type:\s*(\S+)\s*$", re.IGNORECASE)
 _COMMAND_RE = re.compile(r"^\s*Command:\s*(.+)$", re.IGNORECASE)
 _ONFAIL_RE = re.compile(r"^\s*On fail:\s*(.+?)\s*$", re.IGNORECASE)
+_PARALLEL_RE = re.compile(r"^\s*Parallel:\s*(\S+)\s*$", re.IGNORECASE)
 _VALID_TYPES = {"", "agent", "command"}
 # Legacy line from the removed fixed-stage system: recognised and DISCARDED.
 _STAGE_RE = re.compile(r"^\s*Stage:\s*([a-z_]+)\s*$", re.IGNORECASE)
@@ -196,7 +197,7 @@ def parse(env_dir: Path) -> dict:
         {"preamble": "<text before the first ## heading>",
          "nodes": [{"title", "body", "kind", "enabled", "required", "tools",
                     "id", "agent", "model", "effort", "temperature",
-                    "type", "command", "on_fail"}]}
+                    "type", "command", "on_fail", "parallel"}]}
 
     Per node:
       • `title`  — the heading WITHOUT its step number (numbers are positional and
@@ -224,9 +225,14 @@ def parse(env_dir: Path) -> dict:
                    reference a step defined LATER in the file — via a
                    title→id map built once all nodes are collected. A
                    dangling reference (title matching no step) resolves to "".
+      • `parallel`— an opaque group id from a `Parallel: <group>` line,
+                   defaulting to "". Steps sharing the same group id run
+                   concurrently (Phase 3); unlike `on_fail` this is not a
+                   reference to another step, so it needs no id-resolution
+                   and round-trips verbatim through `compose()`.
     The `Skills (required: …)` / `Tools: …` / `Id:` / `Agent:` / `Model:` /
-    `Effort:` / `Temperature:` / `Type:` / `Command:` / `On fail:` lines are
-    lifted into fields. A legacy `Stage: …` line (from the removed
+    `Effort:` / `Temperature:` / `Type:` / `Command:` / `On fail:` /
+    `Parallel:` lines are lifted into fields. A legacy `Stage: …` line (from the removed
     fixed-stage system) is recognised and silently discarded on parse. The
     auto-generated skills snapshot block is skipped. `compose()` is the
     inverse.
@@ -263,6 +269,7 @@ def parse(env_dir: Path) -> dict:
                    "required": [], "tools": [], "enabled": True,
                    "id": "", "agent": "", "model": "", "effort": "",
                    "temperature": "", "type": "", "command": "", "on_fail": "",
+                   "parallel": "",
                    "_num": bool(m), "_decl": False}
             body = []
             continue
@@ -327,6 +334,11 @@ def parse(env_dir: Path) -> dict:
             cur["_decl"] = True
             cur["_on_fail_title"] = onfail_m.group(1).strip()  # resolved to an id below
             continue
+        parallel_m = _PARALLEL_RE.match(line)
+        if parallel_m:
+            cur["_decl"] = True
+            cur["parallel"] = parallel_m.group(1).strip()
+            continue
         body.append(line)
     _flush()
     by_title = {n["title"]: n.get("id", "") for n in nodes if n.get("kind") == "step"}
@@ -371,7 +383,8 @@ def compose(env_dir: Path, parsed: dict) -> str:
             out.append(f"Tools: {', '.join(tools)}")
         for key, label in (("id", "Id"), ("agent", "Agent"), ("model", "Model"),
                            ("effort", "Effort"), ("temperature", "Temperature"),
-                           ("type", "Type"), ("command", "Command")):
+                           ("type", "Type"), ("command", "Command"),
+                           ("parallel", "Parallel")):
             val = str(n.get(key) or "").strip()
             if kind == "step" and val:
                 out.append(f"{label}: {val}")

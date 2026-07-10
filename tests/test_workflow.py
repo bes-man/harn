@@ -283,6 +283,51 @@ def test_legacy_stage_line_is_dropped_silently(tmp_path):
     assert "stage" not in step  # the key no longer exists
 
 
+# --- parallel steps (Phase 3) -------------------------------------------- #
+
+def test_parse_defaults_parallel_to_empty(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    for n in parsed["nodes"]:
+        if n["kind"] == "step":
+            assert n["parallel"] == ""
+
+
+def test_parallel_round_trips_through_compose(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    implement = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    verify = next(n for n in parsed["nodes"] if n["title"] == "Verify")
+    implement["parallel"] = "wave-1"
+    workflow.save_parsed(env, parsed)
+
+    reparsed = workflow.parse(env)
+    i2 = next(n for n in reparsed["nodes"] if n["title"] == "Implement")
+    assert i2["parallel"] == "wave-1"
+    v2 = next(n for n in reparsed["nodes"] if n["title"] == "Verify")
+    assert v2["parallel"] == ""
+
+
+def test_compose_writes_parallel_line(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    step = next(n for n in parsed["nodes"] if n["title"] == "Implement")
+    step["parallel"] = "wave-1"
+    text = workflow.compose(env, parsed)
+    assert "Parallel: wave-1" in text
+
+
+def test_parallel_omitted_when_empty(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    workflow.write(env)
+    parsed = workflow.parse(env)
+    text = workflow.compose(env, parsed)
+    assert "Parallel:" not in text
+
+
 # --- setup / onboard wiring ------------------------------------------------ #
 
 def test_setup_writes_workflow_and_lists_it(tmp_path):
