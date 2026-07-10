@@ -13,7 +13,9 @@ agent that runs next picks up with full knowledge of what's done and planned.
 """
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -98,6 +100,18 @@ _AUTO_NOTE = (
     "your reply before proceeding. Do NOT modify any .md files under "
     "`harn_env/` (task files, PROGRESS, notes) — change code only. Work as "
     "carefully and consciously as you can; this is an unattended pass."
+)
+
+# Injected into agent-turn steps that are part of a parallel wave: the sibling
+# steps are running concurrently in their OWN isolated worktree copies, so
+# ask_user (which would stall the whole wave for one thread) is discouraged.
+_PARALLEL_NOTE = (
+    "## You are one of several PARALLEL steps running right now\n"
+    "Other steps in this wave are running CONCURRENTLY in their own isolated "
+    "copies of the repo — you cannot see their in-progress changes, and they "
+    "cannot see yours, until this wave finishes and merges. Avoid `ask_user` "
+    "unless truly blocked: decide autonomously using current best practices "
+    "and record your assumption via `record_decision` so it can be reviewed."
 )
 
 # Feedback fed back to the agent after it tries to block in --auto mode.
@@ -487,7 +501,8 @@ def _adapter_for_step(cfg: Config, step: dict, default: Adapter) -> Adapter:
 
 def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
-                       auto: bool = False, onfail_context: str = "") -> str:
+                       auto: bool = False, onfail_context: str = "",
+                       parallel_note: str = "") -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
     stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
@@ -519,6 +534,8 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
           "runs as a separate session with this task's updated state.")
     if onfail_context:
         parts.append(onfail_context)
+    if parallel_note:
+        parts.append(parallel_note)
     cont = _continuity_block(task)
     if cont:
         parts.append(cont)
@@ -1138,6 +1155,173 @@ def _run_end(env_dir: Path, st: "state.State") -> str:
     return st.phase
 
 
+# --------------------------------------------------------------------------- #
+# Parallel workflow steps (Phase 3): consecutive steps sharing a non-empty
+# `parallel` id run concurrently, each isolated in its own git worktree off a
+# shared checkpoint, with every connector file replicated in so ANY agent
+# CLI's MCP config resolves the harn server — this is what makes a wave
+# provider-agnostic (a step's `Agent:` override can be anything, per-step).
+# --------------------------------------------------------------------------- #
+def _collect_wave(steps: list[dict], first: dict) -> list[dict]:
+    """The contiguous run of steps starting at `first` that share `first`'s
+    `parallel` id. Empty/missing `parallel` → just `[first]` (not a wave).
+
+    Only CONSECUTIVE entries count: a same-group id reappearing later, after a
+    different step breaks the run, starts a NEW (separate) wave — grouping is
+    purely positional, not a global id lookup.
+    """
+    pid = str(first.get("parallel") or "").strip()
+    if not pid:
+        return [first]
+    idx = next((i for i, s in enumerate(steps) if s is first), None)
+    if idx is None:
+        return [first]
+    wave = [first]
+    j = idx + 1
+    while j < len(steps) and str(steps[j].get("parallel") or "").strip() == pid:
+        wave.append(steps[j])
+        j += 1
+    return wave
+
+
+def _replicate_connectors(project_root: Path, worktree_path: Path,
+                          env_dir: Path) -> None:
+    """Copy whichever connector files exist at `project_root` into the same
+    relative paths under `worktree_path`, so ANY agent CLI run there (Claude,
+    Cursor, ...) discovers the harn MCP server exactly like it would in the
+    main tree. For the two MCP-config shapes, the `harn` server's
+    `env.HARN_ENV_DIR` is rewritten to an ABSOLUTE path — `env_dir` is the
+    real (non-worktree) harn_env, and a worktree copy has no such directory of
+    its own, so a relative value would resolve to nothing there.
+    """
+    for rel in (".mcp.json", ".cursor/mcp.json"):
+        src = project_root / rel
+        if not src.exists():
+            continue
+        dst = worktree_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg_json = json.loads(src.read_text(encoding="utf-8"))
+            harn_server = cfg_json.get("mcpServers", {}).get("harn")
+            if harn_server is not None:
+                harn_server.setdefault("env", {})["HARN_ENV_DIR"] = str(env_dir.resolve())
+            dst.write_text(json.dumps(cfg_json, indent=2), encoding="utf-8")
+        except (ValueError, OSError):
+            shutil.copy(src, dst)  # best-effort: copy verbatim if we can't parse it
+    for rel in ("AGENTS.md", "CLAUDE.md"):
+        src = project_root / rel
+        if src.exists():
+            shutil.copy(src, worktree_path / rel)
+
+
+def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
+                        wave: list[dict], results: dict, base_ref: str) -> str:
+    """Apply each wave member's captured patch into the main tree, in wave
+    order, and ledger the outcome.
+
+    NOTE for Task 5 (merge/conflict-resolution): this is a MINIMAL stub —
+    it applies every non-empty patch in order via `gitutil.apply_patch` and
+    always returns "advance". It does NOT detect or resolve conflicts between
+    two wave members' patches (a `git apply` failure here is simply recorded
+    as a "failed" step, not retried or escalated to a merge agent). Task 5
+    owns replacing this body with real conflict detection/resolution and the
+    `ask_user`-driven escalation the design spec describes; the call site
+    (`_run_parallel_wave`) already treats any non-"advance" return the same
+    way `run()` treats a normal step block, so no caller changes should be
+    needed when this is replaced.
+    """
+    for step in wave:
+        sid = step.get("id") or ""
+        outcome = results.get(sid)
+        started = ended = tasks._now_iso()
+        if outcome is None:
+            # Worktree never got created — nothing to merge; record as failed
+            # so it isn't silently treated as done.
+            task.step_results[sid] = {"status": "failed", "started": started,
+                                      "ended": ended,
+                                      "output": "worktree creation failed"}
+            continue
+        ok, patch = outcome
+        applied = True
+        if patch:
+            applied = gitutil.apply_patch(project_root, patch)
+            gitutil.save_patch_ref(project_root, task.id, sid, patch)
+        task.step_results[sid] = {"status": "ok" if (ok and applied) else "failed",
+                                  "started": started, "ended": ended}
+    tasks._save(task)
+    progress.log(env_dir, f"{task.id}: wave {wave[0].get('parallel')} merged "
+                          f"({len(wave)} step(s))")
+    return "advance"
+
+
+def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
+                       wave: list[dict], cfg: Config, default_adapter) -> str:
+    """Run every step in `wave` concurrently, each in its own git worktree
+    checked out from a shared checkpoint, then hand the captured patches to
+    `_merge_wave_patches`.
+
+    Returns "advance" (merged clean), "blocked" (a member's merge/handling
+    escalated — treated like a normal block by the caller), or
+    "conflict_unresolved" (same treatment as "blocked").
+    """
+    import concurrent.futures
+    import tempfile
+
+    wave_id = wave[0].get("parallel") or "wave"
+    base_ref = gitutil.checkpoint(project_root, task.id, f"{wave_id}-base")
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"harn-wave-{wave_id}-"))
+    worktrees: dict[str, Path] = {}
+    try:
+        for step in wave:
+            sid = step.get("id") or ""
+            wt = tmp_root / (sid or wave_id)
+            if gitutil.create_worktree(project_root, base_ref, wt):
+                _replicate_connectors(project_root, wt, env_dir)
+                worktrees[sid] = wt
+            else:
+                events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
+                            detail="failed to create worktree for parallel step")
+
+        def _run_one(step: dict):
+            sid = step.get("id") or ""
+            wt = worktrees.get(sid)
+            if wt is None:
+                return sid, None  # worktree creation failed — nothing to run
+            title = step.get("title", "")
+            if step.get("type") == "command":
+                events.emit(env_dir, "stage_start", task_id=task.id, stage=sid,
+                            agent="command", step_title=title)
+                t0 = time.time()
+                res = run_feedback(step.get("command", ""), wt)
+                events.emit(env_dir, "stage_end", task_id=task.id, stage=sid,
+                            agent="command", step_title=title, ok=res.ok,
+                            dur_ms=int((time.time() - t0) * 1000))
+                ok = res.ok
+            else:
+                step_adapter = _adapter_for_step(cfg, step, default_adapter)
+                prompt = _build_step_prompt(env_dir, cfg, task, step,
+                                           parallel_note=_PARALLEL_NOTE)
+                result = _run_turn(step_adapter, env_dir, prompt, wt,
+                                  task_id=task.id, stage=sid, step_title=title,
+                                  overrides=_step_overrides(cfg, step),
+                                  tok_totals={}, tok_costs={}, cfg=cfg)
+                ok = result.ok
+            patch = gitutil.diff_as_patch(wt, base_ref)
+            return sid, (ok, patch)
+
+        results: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave)) as ex:
+            for sid, outcome in ex.map(_run_one, wave):
+                results[sid] = outcome
+
+        for sid, wt in worktrees.items():
+            gitutil.remove_worktree(project_root, wt)
+
+        return _merge_wave_patches(env_dir, project_root, task, wave, results, base_ref)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
         auto: bool = False, only_task: str | None = None) -> str:
     """Run the loop until DONE, BLOCKED, REVIEW (CLI), or max_iterations.
@@ -1274,6 +1458,18 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             step = pending[0]
             sid = step.get("id") or ""
             title = step.get("title", "")
+
+            wave = _collect_wave(steps, step)
+            if len(wave) >= 2:
+                pending_wave = [s for s in wave if not _step_done(s.get("id"))]
+                if pending_wave:
+                    outcome = _run_parallel_wave(env_dir, project_root, task,
+                                                 pending_wave, cfg, adapter)
+                    if outcome in ("blocked", "conflict_unresolved"):
+                        return _run_end(env_dir, st)
+                    for s in pending_wave:
+                        done_ids.add(s.get("id") or "")
+                continue
 
             if step.get("type") == "command":
                 outcome = _run_command_step(env_dir, project_root, task, step, steps,

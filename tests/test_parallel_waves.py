@@ -1,0 +1,196 @@
+"""Parallel workflow steps (Phase 3): consecutive same-`parallel`-group steps
+run concurrently, each isolated in its own git worktree off a shared
+checkpoint, with every agent connector replicated in so ANY provider's CLI
+finds the harn MCP server and writes into the ONE shared task context."""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+from harn import loop, tasks, workflows, scaffold, gitutil, ENV_DIRNAME
+from harn.adapters.base import AgentResult
+from .conftest import make_task
+
+
+def _git(args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=True)
+
+
+def _step(title, **kw):
+    base = {"kind": "step", "title": title, "body": "", "id": "", "agent": "",
+            "model": "", "effort": "", "temperature": "", "type": "",
+            "command": "", "on_fail": "", "parallel": "", "required": [],
+            "tools": [], "enabled": True}
+    base.update(kw)
+    return base
+
+
+def _project(tmp_path, nodes):
+    _git(["init", "-q"], tmp_path); _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\nrequire_tests = false\n'
+        "[loop]\nmax_iterations = 20\n[notify]\nwait_for_reply = false\n")
+    _git(["add", "-A"], tmp_path); _git(["commit", "-qm", "base"], tmp_path)
+    t = make_task(env, "PRJ-001", title="Feat")
+    workflows.save_task_plan(env, t.id, {"preamble": "", "nodes": nodes})
+    return env, t
+
+
+class WritingAdapter:
+    """Writes a DISTINCT file per call (keyed by cwd's basename) so two
+    concurrent steps never touch the same file — proves real isolation."""
+    name = "fake"
+    def __init__(self):
+        self.calls = []
+    def available(self):
+        return True
+    def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                temperature=None):
+        self.calls.append({"prompt": prompt, "cwd": str(cwd)})
+        out_file = Path(cwd) / f"output_{Path(cwd).name}.txt"
+        out_file.write_text(f"done in {Path(cwd).name}\n")
+        return AgentResult(ok=True, text="did the work")
+
+
+def test_collect_wave_groups_consecutive_same_parallel_id():
+    steps = [_step("A", id="s1"), _step("B", id="s2", parallel="wave-1"),
+             _step("C", id="s3", parallel="wave-1"), _step("D", id="s4")]
+    assert [s["id"] for s in loop._collect_wave(steps, steps[0])] == ["s1"]
+    assert [s["id"] for s in loop._collect_wave(steps, steps[1])] == ["s2", "s3"]
+    assert [s["id"] for s in loop._collect_wave(steps, steps[3])] == ["s4"]
+
+
+def test_collect_wave_does_not_merge_non_consecutive_same_group():
+    steps = [_step("A", id="s1", parallel="wave-1"),
+             _step("B", id="s2"),   # different step in between
+             _step("C", id="s3", parallel="wave-1")]
+    assert [s["id"] for s in loop._collect_wave(steps, steps[0])] == ["s1"]
+    assert [s["id"] for s in loop._collect_wave(steps, steps[2])] == ["s3"]
+
+
+def test_two_parallel_steps_run_concurrently_and_both_merge(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 2
+    cwds = {c["cwd"] for c in fake.calls}
+    assert len(cwds) == 2  # each ran in its OWN worktree, never the same dir
+    assert not any(c["cwd"] == str(tmp_path) for c in fake.calls)  # never the main tree
+
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-be"]["status"] == "ok"
+    assert fresh.step_results["s-fe"]["status"] == "ok"
+
+
+def test_connectors_replicated_into_each_worktree_with_absolute_env_dir(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    (tmp_path / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"harn": {"command": "python3", "args": ["-m", "harn", "mcp"],
+                                 "env": {"HARN_ENV_DIR": "harn_env"}}}}))
+    # Assert INSIDE the adapter call, while the worktree still exists — this is
+    # the moment an agent CLI actually needs the connector file. The worktree
+    # is torn down once the wave finishes (see
+    # test_no_worktrees_or_refs_leaked_after_a_wave_runs), so checking after
+    # `loop.run()` returns would race the cleanup rather than test anything.
+    checked = []
+    class CapturingAdapter(WritingAdapter):
+        def run_turn(self, prompt, cwd, **kw):
+            mcp_json = json.loads((Path(cwd) / ".mcp.json").read_text())
+            checked.append(
+                mcp_json["mcpServers"]["harn"]["env"]["HARN_ENV_DIR"])
+            return super().run_turn(prompt, cwd, **kw)
+    fake = CapturingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(checked) == 2
+    for env_dir_seen in checked:
+        assert env_dir_seen == str(env.resolve())
+
+
+def test_wave_of_one_runs_the_normal_single_step_path(tmp_path, monkeypatch):
+    """A `parallel` id with no consecutive sibling must NOT create a worktree
+    — it's just a regular step, unchanged from Phase 1/2 behavior."""
+    env, t = _project(tmp_path, [
+        _step("Solo", id="s1", parallel="wave-lonely"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["cwd"] == str(tmp_path)  # ran in the MAIN tree, no worktree
+
+
+def test_command_type_step_can_participate_in_a_wave(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Lint", id="s-lint", type="command", command="true", parallel="wave-1"),
+        _step("Build", id="s-build", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-lint"]["status"] == "ok"
+    assert fresh.step_results["s-build"]["status"] == "ok"
+    assert len(fake.calls) == 1  # only the agent step called the adapter
+
+
+def test_wave_can_mix_two_different_agent_providers(tmp_path, monkeypatch):
+    """The core agent-agnostic guarantee: nothing in the wave/worktree/merge
+    code branches on WHICH provider a step uses. Two steps, two distinct
+    (faked) adapters registered under different names, same wave."""
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1", agent="agent-a"),
+        _step("Frontend", id="s-fe", parallel="wave-1", agent="agent-b"),
+    ])
+    agent_a, agent_b = WritingAdapter(), WritingAdapter()
+    agent_a.name, agent_b.name = "agent-a", "agent-b"
+    # "fake" (the project's [harn] default agent, from _project's harn.toml)
+    # must also resolve, since _pick_adapter(cfg) computes a default adapter
+    # up front even though both steps here override it explicitly.
+    registry = {"agent-a": agent_a, "agent-b": agent_b, "fake": agent_a}
+    monkeypatch.setattr(loop, "get_adapter", lambda n: registry[n])
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(agent_a.calls) == 1 and len(agent_b.calls) == 1
+    assert (tmp_path / "output_s-be.txt").exists()
+    assert (tmp_path / "output_s-fe.txt").exists()
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-be"]["status"] == "ok"
+    assert fresh.step_results["s-fe"]["status"] == "ok"
+
+
+def test_no_worktrees_or_refs_leaked_after_a_wave_runs(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Backend", id="s-be", parallel="wave-1"),
+        _step("Frontend", id="s-fe", parallel="wave-1"),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    code, out, _ = gitutil._run(["worktree", "list", "--porcelain"], tmp_path)
+    # only the main worktree should remain
+    assert out.count("worktree ") == 1
