@@ -856,6 +856,18 @@ def build_server(start_watch: bool = True):
         return f"{t.id} will run under workflow: {t.workflow or 'default (WORKFLOW.md)'}"
 
     for custom_tool in tools_mod.discover(_env_dir()):
+        # Defense-in-depth: `tools.save()` validates param names before a tool
+        # ever reaches disk, but `discover()` reads harn_env/tools/*.json
+        # directly with no validation of its own — a hand-edited file, a
+        # future Import feature, or a tool bundle shared by another user could
+        # land an unsafe param name here. `_make_tool_function` splices param
+        # names into a Python source string and `exec()`s it, so re-check
+        # every param here and skip (never crash) a tool that fails.
+        unsafe = [p for p in custom_tool.params if not tools_mod.is_safe_param_name(p)]
+        if unsafe:
+            _log(f"custom tool '{custom_tool.name}' skipped: unsafe param name(s) "
+                 f"{unsafe!r} (must match [a-z0-9_]+)")
+            continue
         fn = _make_tool_function(custom_tool, _env_dir().parent)
         mcp.add_tool(fn, name=custom_tool.name, description=custom_tool.description)
 
