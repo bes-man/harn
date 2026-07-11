@@ -20,6 +20,10 @@ from pathlib import Path
 
 _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
+# Cap on total decompressed size of an import bundle (zip-bomb guard).
+# Matches studio._MAX_ATTACHMENT_BYTES; local single-user admin tool.
+_MAX_BUNDLE_BYTES = 25 * 1024 * 1024
+
 
 def is_safe_param_name(name: str) -> bool:
     """True iff `name` is safe to splice into generated Python source as a
@@ -88,7 +92,17 @@ def save(env_dir: Path, name: str, description: str, params: list[str],
     name = name.strip()
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"invalid tool name: {name!r} (must match [a-z0-9_]+)")
+    # `params` must be a real list of strings BEFORE the per-param loop: a
+    # bare string ('msg') would otherwise iterate into ['m','s','g'], and a
+    # non-iterable (123) would raise an uncaught TypeError. This guards every
+    # creation path, including import (which routes through save()).
+    if not isinstance(params, list):
+        raise ValueError(
+            f"params must be a list of strings, got {type(params).__name__}"
+        )
     for param in params:
+        if not isinstance(param, str):
+            raise ValueError(f"invalid param: {param!r} (must be a string)")
         if not is_safe_param_name(param):
             raise ValueError(
                 f"invalid param name: {param!r} (must match [a-z0-9_]+)"
@@ -178,29 +192,58 @@ def import_bundle(env_dir: Path, data: bytes, filename: str) -> CustomTool:
     JSON to disk directly. save() raises ValueError on any of those
     rejections, which this function lets propagate to the caller unchanged.
 
+    A zip bundle must contain EXACTLY ONE .json member (the tool
+    definition) -- a second .json is rejected outright, since every other
+    member is written raw to disk and discover() treats any tools/*.json as
+    a live custom tool: a smuggled second json would bypass save()'s name +
+    param validation and could shadow a built-in tool name. A NON-json
+    sibling is written only if its sanitized basename is actually referenced
+    in the saved tool's `command` (mirrors export_bundle's "referenced"
+    logic), so a bundle can't smuggle arbitrary files onto disk.
+
     A zip bundle's script entry name is sanitized to its basename before
     being written to disk (Path(name).name, rejecting anything that reduces
     to '' , '.', or '..') -- the same path-traversal guard already applied
     to direct script uploads in studio.save_custom_tool_payload(), so a
     crafted zip entry name like '../../evil.sh' cannot escape the tools
-    directory."""
+    directory. Total decompressed size is capped (_MAX_BUNDLE_BYTES) as a
+    zip-bomb guard."""
     if zipfile.is_zipfile(io.BytesIO(data)):
         zf = zipfile.ZipFile(io.BytesIO(data))
-        try:
-            json_name = next(n for n in zf.namelist() if n.endswith(".json"))
-        except StopIteration:
+        # Zip-bomb guard: reject before extracting anything.
+        total = sum(zi.file_size for zi in zf.infolist())
+        if total > _MAX_BUNDLE_BYTES:
+            mb = _MAX_BUNDLE_BYTES // (1024 * 1024)
+            raise ValueError(
+                f"{filename}: bundle decompresses to more than {mb}MB"
+            )
+        json_members = [n for n in zf.namelist() if n.endswith(".json")]
+        if not json_members:
             raise ValueError(f"{filename}: zip bundle has no .json tool definition")
+        if len(json_members) > 1:
+            # CRITICAL: never write a second tool definition to disk.
+            raise ValueError(
+                f"{filename}: zip bundle must contain exactly one .json tool "
+                f"definition (found {len(json_members)})"
+            )
+        json_name = json_members[0]
         parsed = json.loads(zf.read(json_name))
         p = save(
             env_dir, parsed.get("name", ""), parsed.get("description", ""),
             parsed.get("params", []), parsed.get("command", ""),
             source=parsed.get("source", "upload"),
         )
+        command = parsed.get("command", "")
         for n in zf.namelist():
             if n == json_name:
                 continue
             safe_name = Path(n).name  # strip any path components (traversal guard)
             if not safe_name or safe_name in (".", ".."):
+                continue
+            # Only write a sibling the command actually references -- an
+            # upload-authored tool names its script explicitly (e.g.
+            # "bash lint.sh"). Unreferenced members are dropped, not written.
+            if safe_name not in command:
                 continue
             (p.parent / safe_name).write_bytes(zf.read(n))
         return read(env_dir, parsed["name"])

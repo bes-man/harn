@@ -238,6 +238,9 @@ def import_custom_tool_bundle_payload(env_dir: Path, payload: dict) -> dict:
         data = base64.b64decode(payload.get("content_b64") or "", validate=True)
     except Exception:
         return {"ok": False, "error": "content_b64 is not valid base64"}
+    if len(data) > _MAX_ATTACHMENT_BYTES:
+        mb = _MAX_ATTACHMENT_BYTES // (1024 * 1024)
+        return {"ok": False, "error": f"bundle too large (max {mb}MB)"}
     filename = payload.get("filename") or ""
     try:
         parsed_name = _peek_bundle_name(data)
