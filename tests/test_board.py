@@ -73,6 +73,115 @@ def test_set_task_workflow_unknown_task(tmp_path):
     assert r["ok"] is False
 
 
+def test_set_task_workflow_marks_confirmed(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+    assert t.workflow_confirmed is False
+    studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.workflow_confirmed is True
+
+
+# --- create task + status-change routes (Phase 6 Task 3) ------------------ #
+
+def test_create_task_payload_creates_a_todo_task(tmp_path):
+    env = _env(tmp_path)
+    result = studio.create_task_payload(env, {"title": "Do the thing"})
+    assert result["ok"] is True
+    t = tasks.find(env, result["task_id"])
+    assert t.status == tasks.TODO
+    assert t.title == "Do the thing"
+
+
+def test_create_task_payload_rejects_empty_title(tmp_path):
+    env = _env(tmp_path)
+    result = studio.create_task_payload(env, {"title": "  "})
+    assert result["ok"] is False
+
+
+def test_status_payload_refuses_in_progress_before_flow_confirmed(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
+    assert result["ok"] is False
+    assert "flow" in result["error"].lower()
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.status == tasks.TODO
+
+
+def test_status_payload_launches_a_run_once_flow_confirmed(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+    studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
+
+    launched = {}
+    def fake_launch(pr, ed, task_id, *, auto=False):
+        launched["task_id"] = task_id
+        return {"ok": True, "pid": 12345, "task_id": task_id, "auto": auto}
+    monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
+
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
+    assert result["ok"] is True
+    assert launched["task_id"] == t.id
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.status == "in_progress"
+
+
+def test_status_payload_rolls_back_if_launch_refuses(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+    studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
+
+    def fake_launch(pr, ed, task_id, *, auto=False):
+        return {"ok": False, "error": "a run is already active for OTHER-1"}
+    monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
+
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
+    assert result["ok"] is False
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.status == tasks.TODO   # rolled back, not stuck at in_progress
+
+
+def test_status_payload_plain_transition_does_not_launch(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("launch should not be called for a non-in_progress transition")
+    monkeypatch.setattr(studio.runner_mod, "launch", fail_if_called)
+
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "review"})
+    assert result["ok"] is True
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.status == "review"
+
+
+def test_status_payload_refuses_when_run_active_for_task(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+
+    monkeypatch.setattr(studio.runner_mod, "active",
+                         lambda ed: {"task_id": t.id, "pid": 999})
+
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "review"})
+    assert result["ok"] is False
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.status == tasks.TODO
+
+
+def test_status_payload_unknown_status(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do the thing")
+    result = studio.set_task_status_payload(env, {"task_id": t.id, "status": "bogus"})
+    assert result["ok"] is False
+
+
+def test_status_payload_unknown_task(tmp_path):
+    env = _env(tmp_path)
+    result = studio.set_task_status_payload(env, {"task_id": "NOPE", "status": "review"})
+    assert result["ok"] is False
+
+
 def test_launch_task_starts_background_run(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")

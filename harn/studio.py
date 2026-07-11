@@ -640,8 +640,63 @@ def set_task_workflow(env_dir: Path, payload: dict) -> dict:
     if slug and not any(m["name"] == slug for m in workflows_mod.list_workflows(env_dir)):
         return {"ok": False, "error": f"unknown workflow '{name}'"}
     t.workflow = slug
+    t.workflow_confirmed = True
     tasks_mod._save(t)
     return {"ok": True, "task_id": t.id, "workflow": t.workflow}
+
+
+def create_task_payload(env_dir: Path, payload: dict) -> dict:
+    """Create a new `todo` task from the board's "New task" form."""
+    title = (payload.get("title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "title is required"}
+    description = payload.get("description") or ""
+    workflow = (payload.get("workflow") or "").strip() or None
+    try:
+        priority = int(payload.get("priority") or 10)
+    except (TypeError, ValueError):
+        priority = 10
+    task = tasks_mod.create_task(env_dir, title, description=description,
+                                 workflow=workflow, priority=priority)
+    return {"ok": True, "task_id": task.id}
+
+
+def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
+    """Move a task to a new lifecycle status (drag-drop on the board).
+
+    Moving TO `in_progress` requires the task's flow to already be confirmed
+    (`workflow_confirmed`, set by `set_task_workflow` — see its docstring) and
+    atomically auto-launches a run for it via `runner_mod.launch`, the same
+    call `launch_task` makes; if that launch refuses (e.g. another run is
+    already active) the status change is rolled back so the task never ends
+    up stuck at `in_progress` with nothing actually running. This route never
+    touches `review_log` or calls `accept`/`request_changes` — it is a raw
+    `tasks_mod.set_status` only.
+    """
+    task_id = (payload.get("task_id") or "").strip()
+    new_status = (payload.get("status") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if new_status not in tasks_mod.LIFECYCLE:
+        return {"ok": False, "error": f"unknown status: {new_status!r}"}
+    active = runner_mod.active(env_dir)
+    if active and active.get("task_id") == task_id:
+        return {"ok": False, "error": "a run is active for this task — stop it first"}
+    if new_status == tasks_mod.IN_PROGRESS:
+        if not task.workflow_confirmed:
+            return {"ok": False,
+                    "error": "pick a flow for this task before starting it"}
+        prior_status = task.status
+        tasks_mod.set_status(task, new_status)
+        result = runner_mod.launch(env_dir.parent, env_dir, task_id, auto=False)
+        if not result.get("ok"):
+            tasks_mod.set_status(task, prior_status)   # roll back — atomic with launch
+            return {"ok": False, "error": result.get("error", "launch failed")}
+        return {"ok": True, "task_id": task_id, "status": new_status,
+                "launched": True}
+    tasks_mod.set_status(task, new_status)
+    return {"ok": True, "task_id": task_id, "status": new_status}
 
 
 def task_plan_payload(env_dir: Path, task_id: str) -> dict:
@@ -965,6 +1020,10 @@ def _make_handler(default_env: Path):
                 self._json(apply_layout(env, body))
             elif route == "/api/config":
                 self._json(set_config_flag(env, body))
+            elif route == "/api/tasks/create":
+                self._json(create_task_payload(env, body))
+            elif route == "/api/tasks/status":
+                self._json(set_task_status_payload(env, body))
             elif route == "/api/tasks/workflow":
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/launch":
