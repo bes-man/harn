@@ -2777,21 +2777,36 @@ function renderCustomToolsSection(){
     `</div></div>`).join('');
   return `<h2 style="margin-top:18px">CUSTOM TOOLS</h2>`+
     (rows||'<div class="empty">None yet.</div>')+
-    `<button class="ghost" style="margin-top:8px" onclick="$('#toolUploadInput').click()">＋ Upload tool</button>`+
-    `<input type="file" id="toolUploadInput" style="display:none" onchange="uploadToolFile(this)"/>`+
-    `<button class="ghost" style="margin-top:8px" onclick="$('#toolImportInput').click()">＋ Import tool</button>`+
-    `<input type="file" id="toolImportInput" style="display:none" onchange="importToolFile(this)"/>`;
+    `<button class="ghost" style="margin-top:8px" onclick="$('#toolImportInput').click()">＋ Import</button>`+
+    `<input type="file" id="toolImportInput" style="display:none" onchange="importOrUploadToolFile(this)"/>`;
 }
-async function uploadToolFile(input){
+async function importOrUploadToolFile(input){
   const file=input.files&&input.files[0]; if(!file)return;
-  const name=prompt('Tool name (a-z0-9_ only):'); if(!name){ input.value=''; return; }
-  const description=prompt('Description:')||'';
-  const paramsRaw=prompt('Comma-separated param names (or leave blank):')||'';
-  const params=paramsRaw.split(',').map(s=>s.trim()).filter(Boolean);
   const dataUrl=await new Promise((res,rej)=>{
     const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file);
   });
   const content_b64=dataUrl.split(',')[1]||'';
+  let isBundle=/\.zip$/i.test(file.name);
+  if(!isBundle && /\.json$/i.test(file.name)){
+    try{
+      const text=atob(content_b64);
+      const parsed=JSON.parse(text);
+      isBundle = parsed && typeof parsed==='object' && 'name' in parsed && 'command' in parsed;
+    }catch(e){ isBundle=false; }
+  }
+  if(isBundle){
+    const r=await post_('/api/tools/import',{filename:file.name,content_b64});
+    if(!r.ok){ alert(r.error||'import failed'); return; }
+    input.value='';
+    await loadToolsData(true);
+    renderTools();
+    alert('Imported "'+r.name+'". Available to the agent starting its next session.');
+    return;
+  }
+  const name=prompt('Tool name (a-z0-9_ only):'); if(!name){ input.value=''; return; }
+  const description=prompt('Description:')||'';
+  const paramsRaw=prompt('Comma-separated param names (or leave blank):')||'';
+  const params=paramsRaw.split(',').map(s=>s.trim()).filter(Boolean);
   const argList=params.map(p=>'{'+p+'}').join(' ');
   const r=await post_('/api/tools/save',{name,description,params,
     command:`bash ${file.name} ${argList}`.trim(), source:'upload', script_name:file.name, content_b64});
@@ -2800,19 +2815,6 @@ async function uploadToolFile(input){
   await loadToolsData(true);
   renderTools();
   alert('Saved. This tool will be available to the agent starting its NEXT session — not the one currently running.');
-}
-async function importToolFile(input){
-  const file=input.files&&input.files[0]; if(!file)return;
-  const dataUrl=await new Promise((res,rej)=>{
-    const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file);
-  });
-  const content_b64=dataUrl.split(',')[1]||'';
-  const r=await post_('/api/tools/import',{filename:file.name,content_b64});
-  if(!r.ok){ alert(r.error||'import failed'); return; }
-  input.value='';
-  await loadToolsData(true);
-  renderTools();
-  alert('Imported "'+r.name+'". Available to the agent starting its next session.');
 }
 async function deleteCustomTool(name){
   if(!confirm('Delete "'+name+'"?'))return;
