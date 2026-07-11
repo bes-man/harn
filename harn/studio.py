@@ -2097,7 +2097,16 @@ async function viewFullContext(stepId){
   w.document.body.prepend(btn);
 }
 function skillNames(){ return S.skills.map(s=>s.name); }
-function allTools(){ const s=new Set(); S.workflow.nodes.forEach(n=>(n.tools||[]).forEach(t=>s.add(t))); return [...s].sort(); }
+// Every tool a step could be given: tools already used on some step, PLUS
+// every known built-in MCP tool and every saved custom tool — otherwise a
+// custom tool a user just created has no way to be picked from a step (it
+// only shows up here once some step already references it, a chicken-and-egg
+// gap that made custom tools look impossible to attach to a flow step).
+function allTools(){ const s=new Set();
+  S.workflow.nodes.forEach(n=>(n.tools||[]).forEach(t=>s.add(t)));
+  Object.keys(TOOL_DOCS||{}).forEach(t=>s.add(t));
+  (CUSTOM_TOOLS||[]).forEach(t=>s.add(t.name));
+  return [...s].sort(); }
 function render(){ if(tab==='flow')renderFlow(); else if(tab==='skills')renderSkills(); else renderTools(); }
 let Z=1;   // canvas zoom
 
