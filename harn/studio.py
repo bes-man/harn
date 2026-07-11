@@ -1541,7 +1541,10 @@ const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your 
 async function pollBoard(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
   if(tab!=='board') return;
-  renderBoard();
+  // Don't rebuild the list out from under an open "＋ New task" form (even
+  // before the user has focused a field in it) or a half-typed value inside
+  // it — same guard pattern as the inspector re-render below.
+  if(!NEW_TASK_OPEN && !isEditing($('#listView'))) renderBoard();
   if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
     // Don't rebuild the inspector out from under an open <select> or a focused
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
@@ -1592,10 +1595,17 @@ function selectTask(id){
   boardSel=id; BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
   renderBoard(); renderTaskDetail(); pollBlockedQuestion();
 }
+// Tracks whether the "＋ New task" form is open, independent of DOM focus —
+// a click on "＋ New task" or "Create"/"Cancel" doesn't leave an INPUT/TEXTAREA/
+// SELECT focused, so isEditing() alone can't stop the 1.5s poll from wiping the
+// form back to hidden the instant the user opens it before typing anything.
+let NEW_TASK_OPEN=false;
 function renderBoard(){
   const v=$('#listView');
   const groups={}; (BOARD.tasks||[]).forEach(t=>(groups[t.status]=groups[t.status]||[]).push(t));
-  let html='<h2>BOARD</h2>';
+  let html='<h2>BOARD</h2>'+
+    '<button class="ghost" onclick="showNewTaskForm()" style="margin-bottom:8px">＋ New task</button>'+
+    `<div id="newTaskForm" style="display:${NEW_TASK_OPEN?'block':'none'}"></div>`;
   if(BOARD.run){
     const rt=(BOARD.tasks||[]).find(t=>t.id===BOARD.run.task_id);
     html+=`<div class="runbanner">▶ running <b>${esc(BOARD.run.task_id)}</b>`+
@@ -1616,6 +1626,38 @@ function renderBoard(){
   });
   if(!(BOARD.tasks||[]).length) html+='<div class="empty">No tasks yet — create one from an agent session (create_task).</div>';
   v.innerHTML=html;
+}
+function showNewTaskForm(){
+  NEW_TASK_OPEN=true;
+  const wfOpts=(S.workflows||[]).map(w=>`<option value="${esc(w.name)}">${esc(w.title)}</option>`).join('');
+  const el=$('#newTaskForm');
+  el.style.display='block';
+  el.innerHTML=`
+    <div class="skillrow" style="flex-direction:column;align-items:stretch;gap:6px">
+      <input type="text" id="ntTitle" placeholder="Title"/>
+      <textarea id="ntDesc" placeholder="Description (optional)" rows="2"></textarea>
+      <select id="ntWorkflow"><option value="">default workflow</option>${wfOpts}</select>
+      <input type="number" id="ntPriority" placeholder="Priority (default 10)" value="10"/>
+      <div class="row" style="gap:6px">
+        <button class="primary" onclick="submitNewTask()">Create</button>
+        <button class="ghost" onclick="closeNewTaskForm()">Cancel</button>
+      </div>
+    </div>`;
+}
+function closeNewTaskForm(){
+  NEW_TASK_OPEN=false;
+  $('#newTaskForm').style.display='none';
+}
+async function submitNewTask(){
+  const title=$('#ntTitle').value.trim();
+  if(!title){ alert('Title is required.'); return; }
+  const r=await post_('/api/tasks/create',{
+    title, description:$('#ntDesc').value, workflow:$('#ntWorkflow').value,
+    priority:$('#ntPriority').value});
+  if(!r.ok){ alert(r.error||'create failed'); return; }
+  closeNewTaskForm();
+  await pollBoard();
+  selectTask(r.task_id);
 }
 function renderPipelineDots(t){
   const running=BOARD.run&&BOARD.run.task_id===t.id;
@@ -1669,13 +1711,17 @@ function renderTaskDetail(){
   $('#insp').innerHTML=`
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">${esc(t.id)}</h2>
-      <span class="statusbadge" style="color:${statusColor};border-color:${statusColor}">${esc(t.status)}</span>
+      <select onchange="changeTaskStatus('${esc(t.id)}',this.value)" style="color:${statusColor};border-color:${statusColor};background:transparent">
+        ${['todo','in_progress','review','changes_requested','done'].map(s=>
+          `<option value="${s}" ${t.status===s?'selected':''}>${esc(s)}</option>`).join('')}
+      </select>
     </div>
     <div class="taskTitle">${esc(t.title)}</div>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
     <div class="row" style="margin-top:8px">
       <button class="ghost" onclick="openTaskPlan('${esc(t.id)}')" title="Open this task's own copy of its plan — edits affect only this task">✎ Edit this task's plan</button>
+      <button class="ghost" onclick="FLOW_SEL_TASK_ID='${esc(t.id)}';showTab('flow')" title="Watch this task's flow execute">Open flow ▶</button>
     </div>
     <div class="row" style="margin-top:12px;gap:8px">
       ${running
@@ -1707,6 +1753,11 @@ function renderTaskDetail(){
 async function assignWorkflow(taskId,name){
   await fetch(api('/api/tasks/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({task_id:taskId,workflow:name==='default'?'':name})});
+  await pollBoard();
+}
+async function changeTaskStatus(taskId,status){
+  const r=await post_('/api/tasks/status',{task_id:taskId,status});
+  if(!r.ok){ alert(r.error||'status change failed'); await pollBoard(); return; }
   await pollBoard();
 }
 async function launchTask(taskId,auto){
