@@ -277,6 +277,39 @@ optional lines that turn plain prose into something `harn run` executes:
   answers in time (chat, Studio, or CLI), harn still escalates the same
   question to Telegram after `chat_grace_minutes`.
 
+## Custom tools — extend your agent's toolbox
+
+Beyond the built-in MCP tools, you can add your own **custom tools** the agent
+can call. A custom tool is just a **name + description + parameter list + a
+shell-command template** with `{param}` placeholders — e.g. a `command` of
+`bash lint.sh {path}`. It runs exactly like a `Type: command` workflow step:
+subprocess with each param `shlex`-quoted before substitution (no `shell=True`,
+no shell injection — it's not a new code-execution primitive). Each tool lives
+as one small file, `harn_env/tools/<name>.json`.
+
+Two ways to create one in Studio's **Tools tab** (under **CUSTOM TOOLS**):
+
+- **Upload a script** — pick a script file, then type in a name, a description,
+  and comma-separated param names. harn stores the script alongside the tool and
+  builds the command for you as `bash <script> {param} …`.
+- **Describe it to the agent** — under *"Describe a new tool to the agent"*, a
+  turn-based chat: each **Send** is one message and one agent reply. When the
+  agent has a concrete proposal it fills in a **Draft** (name, description,
+  params, command); review or refine it over more turns, then click **Save**.
+
+Notes:
+
+- **Available next session, not this one.** The MCP server fetches its tool list
+  once, at connect time, so a newly saved or imported tool becomes callable only
+  in the agent's **next** session — the UI reminds you of this on every save.
+- **Names must be unique** — a custom tool can't reuse a built-in MCP tool name
+  or the name of another custom tool (both checks gate every save).
+- **Share tools with Export / Import.** **Export** downloads a single portable
+  file (plain JSON, or a zip if the tool bundles an uploaded script). **Import**
+  loads a file another harn user shared with you; imports are validated (a bundle
+  must be a single tool definition, and its name/params are re-checked) before
+  the tool lands on disk.
+
 ## Multiple agents, one shared context
 
 Set `agents = ["claude", "codex", …]`; the first installed one runs. Whichever
@@ -754,6 +787,40 @@ todo → in_progress → review ⇄ changes_requested → done
   `loop.answer()`, что и CLI). Без изменений: если никто не ответит вовремя
   (в чате, Studio или CLI), harn по-прежнему эскалирует тот же вопрос в
   Telegram после `chat_grace_minutes`.
+
+### Свои инструменты (custom tools) — расширьте набор агента
+
+Помимо встроенных MCP-тулов вы можете добавлять **свои инструменты**, которые
+агент сможет вызывать. Custom tool — это **имя + описание + список параметров +
+шаблон shell-команды** с плейсхолдерами `{param}` (например, `command` вида
+`bash lint.sh {path}`). Он выполняется ровно как шаг `Type: command`:
+subprocess, каждый параметр `shlex`-квотируется перед подстановкой (без
+`shell=True`, без shell-инъекций — это не новый примитив исполнения кода). Каждый
+инструмент — один маленький файл `harn_env/tools/<name>.json`.
+
+Два способа создать его во вкладке **Tools** (раздел **CUSTOM TOOLS**):
+
+- **Загрузить скрипт** — выберите файл скрипта, затем впишите имя, описание и
+  параметры через запятую. harn сохранит скрипт рядом с инструментом и сам
+  соберёт команду вида `bash <script> {param} …`.
+- **Описать инструмент агенту** — в блоке *«Describe a new tool to the agent»*,
+  пошаговый чат: каждый **Send** — одно сообщение и один ответ агента. Когда у
+  агента есть конкретное предложение, он заполняет **Draft** (имя, описание,
+  параметры, команда); уточните за несколько ходов и нажмите **Save**.
+
+Важно:
+
+- **Доступен со следующей сессии, не с текущей.** MCP-сервер запрашивает список
+  тулов один раз, при подключении, поэтому только что сохранённый или
+  импортированный инструмент станет доступен агенту лишь в его **следующей**
+  сессии — UI напоминает об этом при каждом сохранении.
+- **Имена уникальны** — custom tool не может совпасть по имени со встроенным
+  MCP-тулом или с другим custom tool (обе проверки на каждом сохранении).
+- **Обмен через Export / Import.** **Export** скачивает один переносимый файл
+  (JSON или zip, если у инструмента есть загруженный скрипт). **Import**
+  загружает файл, которым поделился другой пользователь harn; импорт проходит
+  валидацию (в бандле должно быть ровно одно определение инструмента, имя и
+  параметры перепроверяются) прежде чем инструмент попадёт на диск.
 
 ### Несколько агентов, один контекст
 
