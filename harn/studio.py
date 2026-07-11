@@ -652,7 +652,7 @@ def task_plan_payload(env_dir: Path, task_id: str) -> dict:
     if task is None:
         return {"ok": False, "error": f"no task {task_id}"}
     plan = workflows_mod.load_task_plan(env_dir, task_id) \
-        or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
+        or workflows_mod.preview_plan(env_dir, task_id, task.workflow)
     if plan is None:
         return {"ok": False, "error": "no plan"}
     return {"ok": True, "plan": plan, "task_id": task_id}
@@ -667,7 +667,7 @@ def step_prompt_payload(env_dir: Path, task_id: str, step_id: str) -> dict:
     if task is None:
         return {"error": f"no such task: {task_id}"}
     plan = workflows_mod.load_task_plan(env_dir, task_id) \
-        or workflows_mod.snapshot_for_task(env_dir, task_id, task.workflow)
+        or workflows_mod.preview_plan(env_dir, task_id, task.workflow)
     if plan is None:
         return {"error": "no plan"}
     nodes = plan.get("nodes", [])

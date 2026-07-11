@@ -25,6 +25,7 @@ layer and the loop both call these functions — never poke the files directly.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -317,6 +318,50 @@ def snapshot_for_task(env_dir: Path, task_id: str, preset: str | None) -> dict:
                           "nodes": wf.get("nodes", [])})
     workflow_mod.ensure_ids(plan)
     save_task_plan(env_dir, task_id, plan)
+    return plan
+
+
+def _stable_preview_ids(plan: dict) -> dict:
+    """Like workflow_mod.ensure_ids, but DETERMINISTIC rather than random:
+    steps without an explicit id get one derived from their position + title,
+    so two independent preview_plan calls for the same (unsaved) content
+    agree on step identity. This matters because studio issues plan-viewing
+    and step-viewing as SEPARATE HTTP requests — e.g. the canvas loads a
+    task's plan via task_plan_payload, the human clicks one step, and the
+    browser then asks step_prompt_payload for that exact step id in a later
+    request. snapshot_for_task's ensure_ids(), by contrast, can safely use
+    random ids because it saves immediately — every later reader sees the
+    same persisted file. preview_plan never persists, so its ids must instead
+    be reproducible from content alone. Mutates and returns plan."""
+    for i, n in enumerate(plan.get("nodes", [])):
+        if n.get("kind") == "step" and not n.get("id"):
+            seed = f"{i}:{n.get('title', '')}"
+            n["id"] = "step-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6]
+    return plan
+
+
+def preview_plan(env_dir: Path, task_id: str, preset: str | None) -> dict:
+    """Read-only twin of snapshot_for_task: if the task already has a frozen
+    snapshot, return it verbatim; otherwise return what a snapshot WOULD
+    contain right now (the currently-selected preset's, or default's, nodes)
+    WITHOUT creating the snapshot file. Powers studio's plan-viewing routes
+    for an unstarted task, so looking at (or previewing a step of) a task's
+    plan before it has run never freezes a stale pick — only actually
+    EXECUTING something (snapshot_for_task's other callers: launch_step,
+    loop.run/run_step) does that.
+
+    Step ids are assigned deterministically (see _stable_preview_ids) rather
+    than via workflow_mod.ensure_ids's random uuids, since nothing here is
+    persisted: two separate preview_plan calls for the same content (e.g.
+    studio's task_plan_payload followed by a step_prompt_payload for a step
+    id it returned) must keep agreeing on which id means which step."""
+    existing = load_task_plan(env_dir, task_id)
+    if existing is not None:
+        return existing
+    wf = (load(env_dir, preset) if preset else None) or _ensure_default(env_dir)
+    plan = copy.deepcopy({"preamble": wf.get("preamble", ""),
+                          "nodes": wf.get("nodes", [])})
+    _stable_preview_ids(plan)
     return plan
 
 
