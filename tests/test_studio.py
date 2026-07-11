@@ -295,6 +295,31 @@ def test_server_skill_delete_endpoint(tmp_path):
         httpd.server_close()
 
 
+def test_server_skill_export_endpoint(tmp_path):
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    from http.server import ThreadingHTTPServer
+    import threading
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), studio._make_handler(env))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        # security skill ships in the template
+        skill_path = env / "skills" / "security" / "SKILL.md"
+        raw_bytes = skill_path.read_bytes()
+        resp = urllib.request.urlopen(base + "/api/skill/export?name=security")
+        assert resp.read() == raw_bytes
+        assert resp.headers.get("Content-Disposition") == 'attachment; filename="security.md"'
+        try:
+            urllib.request.urlopen(base + "/api/skill/export?name=does-not-exist")
+            assert False, "expected 404"
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 # --- canvas layout (drag/drop positions) ----------------------------------- #
 
 def test_layout_round_trip(tmp_path):

@@ -991,6 +991,14 @@ def _make_handler(default_env: Path):
                 ctype = "application/zip" if is_zip else "application/json"
                 self._send(200, data, ctype, extra_headers={
                     "Content-Disposition": f'attachment; filename="{fname}"'})
+            elif route == "/api/skill/export":
+                name = self._query("name") or ""
+                skill = next((s for s in skills_mod.discover(env) if s.name == name), None)
+                if skill is None:
+                    self._send(404, b"not found", "text/plain"); return
+                data = skill.path.read_bytes()
+                self._send(200, data, "text/markdown", extra_headers={
+                    "Content-Disposition": f'attachment; filename="{name}.md"'})
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -2724,6 +2732,7 @@ function renderSkillEditor(){
     ${bodyHtml(300)}
     <div class="row" style="margin-top:12px">
       <button class="primary" onclick="saveSkill(${skillSel})">Save skill</button>
+      <button class="ghost" onclick="location.href=api('/api/skill/export?name='+encodeURIComponent(s.name))">Export</button>
       <span class="status" id="sst"></span>
     </div>
     ${(()=>{ const users=S.workflow.nodes.filter(n=>(n.required||[]).includes(s.name));
