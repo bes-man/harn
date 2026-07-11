@@ -13,18 +13,44 @@ def _env(tmp_path):
     return env
 
 
-def test_create_task_snapshots_default_plan(tmp_path):
+def test_create_task_does_not_snapshot_a_plan(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
-    plan = workflows.load_task_plan(env, t.id)
+    assert workflows.load_task_plan(env, t.id) is None
+
+
+def test_task_has_workflow_confirmed_defaulting_false(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    assert t.workflow_confirmed is False
+
+
+def test_workflow_confirmed_round_trips(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    t.workflow_confirmed = True
+    tasks._save(t)
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.workflow_confirmed is True
+
+
+def test_snapshot_for_task_still_produces_a_plan_on_demand(tmp_path):
+    """create_task no longer freezes the plan eagerly, but snapshot_for_task
+    (called explicitly, e.g. when something starts executing the task) still
+    works exactly as before."""
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Add auth")
+    plan = workflows.snapshot_for_task(env, t.id, t.workflow)
     assert plan is not None
     steps = [n for n in plan["nodes"] if n["kind"] == "step"]
     assert steps and all(n["id"] for n in steps)   # ids stamped
+    assert workflows.load_task_plan(env, t.id) is not None
 
 
 def test_snapshot_is_isolated_from_preset(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     step = next(n for n in plan["nodes"] if n["kind"] == "step")
     step["agent"] = "cursor"
@@ -34,6 +60,7 @@ def test_snapshot_is_isolated_from_preset(tmp_path):
     assert all(n.get("agent", "") == "" for n in global_parsed["nodes"])
     # and a NEW task doesn't inherit the edit
     t2 = tasks.create_task(env, "Other")
+    workflows.snapshot_for_task(env, t2.id, t2.workflow)
     plan2 = workflows.load_task_plan(env, t2.id)
     assert all(n.get("agent", "") == "" for n in plan2["nodes"])
 
@@ -41,6 +68,7 @@ def test_snapshot_is_isolated_from_preset(tmp_path):
 def test_snapshot_idempotent(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     step = next(n for n in plan["nodes"] if n["kind"] == "step")
     step["model"] = "opus"
@@ -53,6 +81,7 @@ def test_snapshot_idempotent(tmp_path):
 def test_activate_task_renders_snapshot_into_workflow_md(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     plan["nodes"] = [n for n in plan["nodes"] if n["kind"] != "step"] + [
         {"kind": "step", "title": "Only step", "body": "do it", "id": "step-aaaaaa",
@@ -91,6 +120,7 @@ def test_step_prompt_payload_returns_the_real_prompt(tmp_path):
     from harn import studio
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     step = next(n for n in plan["nodes"] if n["kind"] == "step")
     payload = studio.step_prompt_payload(env, t.id, step["id"])
@@ -113,6 +143,7 @@ def test_step_prompt_export_payload_writes_a_file(tmp_path):
     from harn import studio
     env = _env(tmp_path)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     step = next(n for n in plan["nodes"] if n["kind"] == "step")
     prompt = studio.step_prompt_payload(env, t.id, step["id"])["prompt"]

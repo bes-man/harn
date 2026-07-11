@@ -173,6 +173,11 @@ class Task:
     # workflow into WORKFLOW.md when the task is picked up, so every agent
     # (Claude/Codex/Cursor) reads the right flow from the one file they all read.
     workflow: str | None = None
+    # Set True the first time the user explicitly picks a flow for this task
+    # (including explicitly re-picking the default) — see workflows_mod's
+    # preview_plan for why "task.workflow is set" alone isn't enough to make
+    # flow selection genuinely mandatory before a task can start.
+    workflow_confirmed: bool = False
     # Per-stage git checkpoints ({stage: commit-ish ref}) — a `git stash
     # create` snapshot of the working tree taken right before that stage's
     # last attempt (see gitutil.checkpoint). "Rerun this stage" restores here
@@ -266,6 +271,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         claimed_at=d.get("claimed_at") or "",
         spec_locked=bool(d.get("spec_locked", False)),
         workflow=d.get("workflow") or None,
+        workflow_confirmed=bool(d.get("workflow_confirmed", False)),
         stage_checkpoints=dict(d.get("stage_checkpoints") or {}),
         step_results=dict(d.get("step_results") or {}),
     )
@@ -294,6 +300,7 @@ def _to_dict(task: Task) -> dict:
         "claimed_at":  task.claimed_at,
         "spec_locked": task.spec_locked,
         "workflow":    task.workflow,
+        "workflow_confirmed": task.workflow_confirmed,
         "stage_checkpoints": task.stage_checkpoints,
         "step_results": task.step_results,
     }
@@ -541,11 +548,6 @@ def create_task(
         workflow=(workflow or None),
     )
     _save(task)
-    try:
-        from . import workflows as workflows_mod
-        workflows_mod.snapshot_for_task(env_dir, task.id, workflow)
-    except Exception:
-        pass   # a failed snapshot must never fail task creation
     return task
 
 

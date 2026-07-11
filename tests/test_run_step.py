@@ -154,6 +154,7 @@ def test_run_step_executes_command_type_without_agent_call(tmp_path, monkeypatch
     root = _repo(tmp_path)
     env = _env(root)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     plan["nodes"] = [{"kind": "step", "title": "Tests", "id": "step-cmd1",
                       "type": "command", "command": "true", "on_fail": "",
@@ -173,6 +174,7 @@ def test_run_step_command_rerun_restores_checkpoint(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     env = _env(root)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     plan["nodes"] = [{"kind": "step", "title": "Touch", "id": "step-cmd2",
                       "type": "command", "command": f"sh -c 'echo x >> {root}/marker.txt'",
@@ -194,6 +196,7 @@ def test_run_step_failing_command_dispatches_live_onfail_handler(tmp_path, monke
     root = _repo(tmp_path)
     env = _env(root)
     t = tasks.create_task(env, "Add auth")
+    workflows.snapshot_for_task(env, t.id, t.workflow)
     plan = workflows.load_task_plan(env, t.id)
     plan["nodes"] = [
         {"kind": "step", "title": "Tests", "id": "step-cmd3",
