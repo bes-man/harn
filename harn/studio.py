@@ -2759,35 +2759,59 @@ async function deleteSkill(i){
 }
 
 /* ---------- tools tab (tools live in steps; edited via the workflow) ---------- */
-let toolSel=null;
+let toolSel=null, customToolSel=null;
 function renderTools(){
   const v=$('#listView'); const tools=allTools();
   v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— used across steps; Save flow to persist</span></h2>';
   tools.forEach(t=>{ const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(t));
     const doc=toolDoc(t); const first=doc.split('\n')[0];
-    const r=document.createElement('div');r.className='skillrow';r.title=doc;
-    r.onclick=()=>{toolSel=t;renderToolEditor();};
+    const r=document.createElement('div');r.className='skillrow'+(toolSel===t?' sel':'');r.title=doc;
+    r.onclick=()=>{toolSel=t;customToolSel=null;renderToolEditor();renderTools();};
     r.innerHTML=`<div style="width:100%"><div class="nm">${esc(t)} <span class="mut" style="font-weight:400">· ${users.length} step(s)</span></div>`+
       `<div class="ds">${esc(first)}</div></div>`;
     v.appendChild(r); });
   if(!tools.length) v.innerHTML+='<div class="empty">No tools yet — add tools on a step (Flow tab).</div>';
   v.innerHTML+=renderCustomToolsSection();
   v.innerHTML+=renderToolChatPanel();
-  if(toolSel&&tools.includes(toolSel)) renderToolEditor(); else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
+  if(customToolSel && CUSTOM_TOOLS.some(t=>t.name===customToolSel)) renderCustomToolEditor();
+  else if(toolSel&&tools.includes(toolSel)) renderToolEditor();
+  else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
 }
 /* ---------- custom tools: upload / delete (Phase 5) ---------- */
 function renderCustomToolsSection(){
   const rows=CUSTOM_TOOLS.map(t=>
-    `<div class="skillrow"><div style="width:100%">`+
+    `<div class="skillrow${customToolSel===t.name?' sel':''}" onclick="customToolSel='${esc(t.name)}';toolSel=null;renderCustomToolEditor();renderTools();"><div style="width:100%">`+
     `<div class="nm">${esc(t.name)} <span class="mut" style="font-weight:400">(${esc(t.source)})</span></div>`+
     `<div class="ds">${esc(t.description)}</div>`+
-    `<button class="ghost" onclick="location.href=api('/api/tools/export?name='+encodeURIComponent('${esc(t.name)}'))" style="margin-top:4px">Export</button>`+
-    `<button class="ghost" onclick="deleteCustomTool('${esc(t.name)}')" style="margin-top:4px">Delete</button>`+
     `</div></div>`).join('');
   return `<h2 style="margin-top:18px">CUSTOM TOOLS</h2>`+
     (rows||'<div class="empty">None yet.</div>')+
     `<button class="ghost" style="margin-top:8px" onclick="$('#toolImportInput').click()">＋ Import</button>`+
     `<input type="file" id="toolImportInput" style="display:none" onchange="importOrUploadToolFile(this)"/>`;
+}
+function renderCustomToolEditor(){
+  const t=CUSTOM_TOOLS.find(x=>x.name===customToolSel);
+  if(!t){ $('#insp').innerHTML='<div class="empty">Select a tool.</div>'; return; }
+  $('#insp').innerHTML=`
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Custom tool</h2>
+      <button class="icon-btn" onclick="deleteCustomTool('${esc(t.name)}')" title="Delete this tool">${TRASH_SVG}</button>
+    </div>
+    <label>Name</label>
+    <div class="toolDoc">${esc(t.name)}</div>
+    <label>Source</label>
+    <div class="toolDoc">${esc(t.source)}</div>
+    <label>Description</label>
+    <div class="toolDoc">${esc(t.description||'(none)')}</div>
+    <label>Params</label>
+    <div class="toolDoc">${esc((t.params||[]).join(', ')||'(none)')}</div>
+    <label>Command</label>
+    <div class="toolDoc" style="font-family:ui-monospace,Menlo,monospace">${esc(t.command||'(none)')}</div>
+    <div class="row" style="margin-top:12px;gap:8px">
+      <button class="primary" onclick="location.href=api('/api/tools/export?name='+encodeURIComponent('${esc(t.name)}'))">Export</button>
+      <button class="ghost" onclick="deleteCustomTool('${esc(t.name)}')">Delete</button>
+    </div>
+    <div class="mut" style="margin-top:14px">Available to the agent starting its next session.</div>`;
 }
 async function importOrUploadToolFile(input){
   const file=input.files&&input.files[0]; if(!file)return;
@@ -2828,6 +2852,7 @@ async function importOrUploadToolFile(input){
 async function deleteCustomTool(name){
   if(!confirm('Delete "'+name+'"?'))return;
   await post_('/api/tools/delete',{name});
+  if(customToolSel===name) customToolSel=null;
   await loadToolsData(true);
   renderTools();
 }
