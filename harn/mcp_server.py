@@ -471,6 +471,14 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             depends_on=depends_on or None,
             workflow=workflow or None,
         )
+        if workflow:
+            # An agent explicitly passing a named workflow is itself the
+            # "explicit action to set task.workflow" the in_progress gate
+            # wants (see studio.set_task_workflow) — a human opening this
+            # task later shouldn't hit the "pick a flow" refusal for a flow
+            # that was already explicitly chosen at creation time.
+            t.workflow_confirmed = True
+            tasks_mod._save(t)
         dep = f" (after {', '.join(t.depends_on)})" if t.depends_on else ""
         wf = f" [workflow: {t.workflow}]" if t.workflow else ""
         return f"Created task {t.id}: {t.path.name}{dep}{wf}"

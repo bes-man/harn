@@ -658,6 +658,13 @@ def create_task_payload(env_dir: Path, payload: dict) -> dict:
         priority = 10
     task = tasks_mod.create_task(env_dir, title, description=description,
                                  workflow=workflow, priority=priority)
+    if workflow is not None:
+        # Explicitly picking a named flow in the create form is itself the
+        # "explicit action to set task.workflow" the in_progress gate wants
+        # (see set_task_workflow's docstring) — don't make the user re-pick
+        # the same flow in the detail panel just because they picked it here.
+        task.workflow_confirmed = True
+        tasks_mod._save(task)
     return {"ok": True, "task_id": task.id}
 
 

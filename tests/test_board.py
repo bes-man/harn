@@ -99,6 +99,79 @@ def test_create_task_payload_rejects_empty_title(tmp_path):
     assert result["ok"] is False
 
 
+def test_create_task_payload_with_explicit_workflow_marks_confirmed(tmp_path):
+    env = _env(tmp_path)
+    workflows.create(env, name="qa", title="QA")
+    result = studio.create_task_payload(env, {"title": "Do the thing", "workflow": "qa"})
+    assert result["ok"] is True
+    t = tasks.find(env, result["task_id"])
+    assert t.workflow == "qa"
+    assert t.workflow_confirmed is True
+
+
+def test_create_task_payload_without_workflow_leaves_unconfirmed(tmp_path):
+    env = _env(tmp_path)
+    result = studio.create_task_payload(env, {"title": "Do the thing", "workflow": ""})
+    assert result["ok"] is True
+    t = tasks.find(env, result["task_id"])
+    assert t.workflow is None
+    assert t.workflow_confirmed is False
+
+
+def test_create_task_payload_with_workflow_can_start_immediately(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    workflows.create(env, name="qa", title="QA")
+    result = studio.create_task_payload(env, {"title": "Do the thing", "workflow": "qa"})
+    task_id = result["task_id"]
+
+    launched = {}
+    def fake_launch(pr, ed, tid, *, auto=False):
+        launched["task_id"] = tid
+        return {"ok": True, "pid": 12345, "task_id": tid, "auto": auto}
+    monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
+
+    status_result = studio.set_task_status_payload(env, {"task_id": task_id, "status": "in_progress"})
+    assert status_result["ok"] is True
+    assert launched["task_id"] == task_id
+    reloaded = tasks.find(env, task_id)
+    assert reloaded.status == "in_progress"
+
+
+def _mcp_tool_fn(env, name, monkeypatch):
+    monkeypatch.setenv("HARN_ENV_DIR", str(env))
+    monkeypatch.setattr("harn.mcp_server._ensure_watch_running", lambda e: None)
+    from harn import mcp_server as ms
+    server = ms.build_server()
+    return next(t.fn for t in server._tool_manager._tools.values() if t.name == name)
+
+
+def test_mcp_create_task_with_explicit_workflow_marks_confirmed(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    workflows.create(env, name="qa", title="QA")
+    create_task = _mcp_tool_fn(env, "create_task", monkeypatch)
+
+    create_task(title="Do the thing", description="## What\ndo it", prds=[],
+                skills=[], task_id="T1", workflow="qa")
+
+    t = tasks.find(env, "T1")
+    assert t is not None
+    assert t.workflow == "qa"
+    assert t.workflow_confirmed is True
+
+
+def test_mcp_create_task_without_workflow_leaves_unconfirmed(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    create_task = _mcp_tool_fn(env, "create_task", monkeypatch)
+
+    create_task(title="Do the thing", description="## What\ndo it", prds=[],
+                skills=[], task_id="T2")
+
+    t = tasks.find(env, "T2")
+    assert t is not None
+    assert t.workflow is None
+    assert t.workflow_confirmed is False
+
+
 def test_status_payload_refuses_in_progress_before_flow_confirmed(tmp_path):
     env = _env(tmp_path)
     t = tasks.create_task(env, "Do the thing")
