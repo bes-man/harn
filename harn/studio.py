@@ -2494,7 +2494,7 @@ function renderInsp(){
       <div>${selectOrCustom(n.id||'new','model',n.model||'',ch.models)}</div>
       <div>${selectOrCustom(n.id||'new','effort',n.effort||'',ch.efforts)}</div>
       <div>${selectOrCustom(n.id||'new','temperature',n.temperature||'',ch.temperatures)}</div>
-    </div>${runBtns}${runNote}`;
+    </div>${runBtns}${lastRunOutputBlock(n)}${runNote}`;
   })():'';
   // Step-type-agnostic (applies whether Type is agent or command): a note +
   // escape hatch for steps dragged into a parallel wave (see deriveParallelGroups
