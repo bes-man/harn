@@ -340,8 +340,14 @@ def draft_tool_chat_payload(env_dir: Path, project_root: Path, cfg: Config,
     )
     prompt = "\n\n".join(p for p in (
         _TOOL_DRAFT_SYSTEM_NOTE, transcript, f"User: {message}") if p.strip())
-    adapter = _pick_adapter(cfg)
-    result = adapter.run_turn(prompt, project_root)
+    agent_name = (payload.get("agent") or "").strip()
+    model_name = (payload.get("model") or "").strip()
+    if agent_name:
+        from .adapters import get_adapter, _REGISTRY
+        adapter = get_adapter(agent_name) if agent_name in _REGISTRY else _pick_adapter(cfg)
+    else:
+        adapter = _pick_adapter(cfg)
+    result = adapter.run_turn(prompt, project_root, model=model_name or None)
     reply = result.text or ""
     m = _DRAFT_JSON_RE.search(reply)
     draft = None
@@ -1309,6 +1315,12 @@ _HTML = r"""<!DOCTYPE html>
   .node.st-active{border-color:var(--accent);animation:blink 1s ease-in-out infinite}
   @keyframes blink{0%,100%{box-shadow:0 0 0 1px var(--accent),0 0 0 0 #7c8cff00}
     50%{box-shadow:0 0 0 2px var(--accent),0 0 16px 2px #7c8cff88}}
+  /* small inline spinner — used while an agent turn is in flight (e.g. tool-chat drafting) */
+  .spinner{display:inline-block;width:13px;height:13px;border-radius:50%;
+    border:2px solid var(--line);border-top-color:var(--accent);
+    animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .thinking{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;padding:4px 0}
   .node .stat{margin-top:7px;font-size:10.5px;color:var(--muted);
     font-family:ui-monospace,Menlo,monospace;border-top:1px solid var(--line);padding-top:5px}
   /* Phase 3 "lane" — translucent backdrop grouping a wave of parallel steps.
@@ -2869,9 +2881,13 @@ async function deleteCustomTool(name){
 /* ---------- custom tools: agent-chat drafting (Phase 5 Task 6) ---------- */
 let TOOL_CHAT_HISTORY=[];   // [{role,text}], reset on panel open/tool save
 let TOOL_CHAT_DRAFT=null;
+let TOOL_CHAT_BUSY=false;   // true while a chat turn is in flight — drives the loader
+let TOOL_CHAT_AGENT='', TOOL_CHAT_MODEL='';   // '' = use the [harn] default
 function renderToolChatPanel(){
   const msgs=TOOL_CHAT_HISTORY.map(h=>
     `<div class="ds"><b>${h.role==='user'?'You':'Agent'}:</b> ${esc(h.text)}</div>`).join('');
+  const thinking=TOOL_CHAT_BUSY
+    ? `<div class="thinking"><span class="spinner"></span> Agent is thinking…</div>` : '';
   const draftHtml=TOOL_CHAT_DRAFT
     ? `<div class="skillrow"><div style="width:100%">`+
       `<div class="nm">${esc(TOOL_CHAT_DRAFT.name)}</div>`+
@@ -2880,23 +2896,47 @@ function renderToolChatPanel(){
       `<div class="ds">command: ${esc(TOOL_CHAT_DRAFT.command)}</div>`+
       `<button onclick="saveToolDraft()">Save</button></div></div>`
     : `<div class="empty">No draft yet — describe the tool below.</div>`;
+  const agentOpts=allAgentNames();
+  const modelOpts=(agentCaps(TOOL_CHAT_AGENT||MODELS.default_agent||'').models)||[];
   return `<h2 style="margin-top:18px">DESCRIBE A NEW TOOL TO THE AGENT</h2>`+
-    `<div id="toolChatMsgs">${msgs}</div>`+
-    `<textarea id="toolChatInput" rows="2" placeholder="What should this tool do?"></textarea>`+
-    `<button onclick="sendToolChat()">Send</button>`+
+    `<div class="row" style="gap:8px;margin-bottom:8px">`+
+    `<select onchange="setToolChatAgent(this.value)" title="Agent for this drafting chat">`+
+    `<option value="">(default: ${esc(MODELS.default_agent||'—')})</option>`+
+    agentOpts.map(a=>`<option value="${esc(a)}" ${TOOL_CHAT_AGENT===a?'selected':''}>${esc(AGENT_LABEL[a]||a)}</option>`).join('')+
+    `</select>`+
+    `<select onchange="TOOL_CHAT_MODEL=this.value" title="Model for this drafting chat" ${modelOpts.length?'':'disabled'}>`+
+    `<option value="">(default model)</option>`+
+    modelOpts.map(m=>`<option value="${esc(m)}" ${TOOL_CHAT_MODEL===m?'selected':''}>${esc(m)}</option>`).join('')+
+    `</select></div>`+
+    `<div id="toolChatMsgs">${msgs}${thinking}</div>`+
+    `<textarea id="toolChatInput" rows="2" placeholder="What should this tool do?" ${TOOL_CHAT_BUSY?'disabled':''}></textarea>`+
+    `<button onclick="sendToolChat()" ${TOOL_CHAT_BUSY?'disabled':''}>${TOOL_CHAT_BUSY?'Thinking…':'Send'}</button>`+
     `<h4>Draft</h4>${draftHtml}`;
 }
+function setToolChatAgent(a){
+  TOOL_CHAT_AGENT=a;
+  const valid=(agentCaps(a||MODELS.default_agent||'').models)||[];
+  if(TOOL_CHAT_MODEL && valid.length && !valid.includes(TOOL_CHAT_MODEL)) TOOL_CHAT_MODEL='';
+  renderTools();
+}
 async function sendToolChat(){
+  if(TOOL_CHAT_BUSY)return;
   const input=$('#toolChatInput');
   const message=input.value.trim();
   if(!message)return;
   TOOL_CHAT_HISTORY.push({role:'user', text:message});
   input.value='';
+  TOOL_CHAT_BUSY=true;
   renderTools();
-  const r=await post_('/api/tools/chat',{history:TOOL_CHAT_HISTORY.slice(0,-1), message});
-  TOOL_CHAT_HISTORY.push({role:'agent', text:r.reply||''});
-  if(r.draft) TOOL_CHAT_DRAFT=r.draft;
-  renderTools();
+  try{
+    const r=await post_('/api/tools/chat',{history:TOOL_CHAT_HISTORY.slice(0,-1), message,
+      agent:TOOL_CHAT_AGENT, model:TOOL_CHAT_MODEL});
+    TOOL_CHAT_HISTORY.push({role:'agent', text:r.reply||''});
+    if(r.draft) TOOL_CHAT_DRAFT=r.draft;
+  } finally {
+    TOOL_CHAT_BUSY=false;
+    renderTools();
+  }
 }
 async function saveToolDraft(){
   if(!TOOL_CHAT_DRAFT)return;
