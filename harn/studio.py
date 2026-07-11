@@ -2800,7 +2800,7 @@ function renderTools(){
       `<div style="width:100%"><div class="nm">${esc(t)} <span class="mut" style="font-weight:400">· ${users.length} step(s)</span></div>`+
       `<div class="ds">${esc(first)}</div></div></div>`;
   }).join('');
-  v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— used across steps; Save flow to persist</span></h2>'+
+  v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— every tool available to add to a step; Save flow to persist step changes</span></h2>'+
     (rows || '<div class="empty">No tools yet — add tools on a step (Flow tab).</div>')+
     renderCustomToolsSection()+
     renderToolChatPanel();
