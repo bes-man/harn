@@ -308,7 +308,9 @@ Notes:
   file (plain JSON, or a zip if the tool bundles an uploaded script). **Import**
   loads a file another harn user shared with you; imports are validated (a bundle
   must be a single tool definition, and its name/params are re-checked) before
-  the tool lands on disk.
+  the tool lands on disk. **Only import tools from people you trust** —
+  validation checks the tool's structure, not its intent, and a valid tool still
+  runs the author's shell command on your machine when the agent invokes it.
 
 ## Multiple agents, one shared context
 
@@ -821,6 +823,9 @@ subprocess, каждый параметр `shlex`-квотируется пер�
   загружает файл, которым поделился другой пользователь harn; импорт проходит
   валидацию (в бандле должно быть ровно одно определение инструмента, имя и
   параметры перепроверяются) прежде чем инструмент попадёт на диск.
+  **Импортируйте инструменты только от тех, кому доверяете** — валидация
+  проверяет структуру инструмента, но не его намерение, и корректный инструмент
+  всё равно выполнит shell-команду автора на вашей машине, когда агент его вызовет.
 
 ### Несколько агентов, один контекст
 

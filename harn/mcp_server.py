@@ -125,7 +125,7 @@ def _ensure_watch_running(env_dir: Path) -> None:
 
 
 
-def _make_tool_function(tool, project_root: Path):
+def _make_tool_function(tool, project_root: Path, record_used=None):
     """Synthesize a REAL Python function object with one named `str`
     parameter per `tool.params`, so FastMCP's `Tool.from_function` (which
     inspects the function's actual signature via `inspect.signature`) can
@@ -136,6 +136,13 @@ def _make_tool_function(tool, project_root: Path):
     to param names, enforced by the caller before this is ever invoked —
     see the studio save/import handlers in Task 3+), so this exec() only
     ever runs source built from whitelisted identifier characters.
+
+    `record_used`, when supplied, is `build_server`'s `_record_tool_used`
+    helper — the SAME one the `mcp.tool` usage-tracking wrapper calls.
+    Custom tools register via `mcp.add_tool`, which bypasses that wrapper,
+    so we emit the `tool_used` event here instead. Without this a custom
+    tool would never appear in `harn trace`/metrics and would always render
+    as "unused" in a step's Tools line even when the agent called it.
     """
     arg_sig = ", ".join(f"{p}: str = ''" for p in tool.params)
     call_kwargs = ", ".join(f"'{p}': {p}" for p in tool.params)
@@ -143,7 +150,13 @@ def _make_tool_function(tool, project_root: Path):
         f"def _custom_tool({arg_sig}) -> str:\n"
         f"    return _run({{{call_kwargs}}})\n"
     )
-    ns: dict = {"_run": lambda args: tools_mod.execute(tool, args, project_root)}
+
+    def _run(args):
+        if record_used is not None:
+            record_used(tool.name)
+        return tools_mod.execute(tool, args, project_root)
+
+    ns: dict = {"_run": _run}
     exec(src, ns)  # noqa: S102 — src is built entirely from validated [a-z0-9_]+ names
     fn = ns["_custom_tool"]
     fn.__name__ = tool.name
@@ -159,7 +172,7 @@ def _make_tool_function(tool, project_root: Path):
 # own docstring — test_guidance.py's fixed-overhead budget sweeps every
 # triple-quoted string found in build_server's source as a proxy for
 # agent-facing token cost, and this note is maintainer-facing only.)
-def build_server(start_watch: bool = True):
+def build_server(start_watch: bool = True, register_custom: bool = True):
     from mcp.server.fastmcp import FastMCP, Image  # lazy: core CLI has no hard dep
 
     mcp = FastMCP("harn")
@@ -855,21 +868,32 @@ def build_server(start_watch: bool = True):
         _log(f"{t.id} workflow → {t.workflow or 'default'}")
         return f"{t.id} will run under workflow: {t.workflow or 'default (WORKFLOW.md)'}"
 
-    for custom_tool in tools_mod.discover(_env_dir()):
-        # Defense-in-depth: `tools.save()` validates param names before a tool
-        # ever reaches disk, but `discover()` reads harn_env/tools/*.json
-        # directly with no validation of its own — a hand-edited file, a
-        # future Import feature, or a tool bundle shared by another user could
-        # land an unsafe param name here. `_make_tool_function` splices param
-        # names into a Python source string and `exec()`s it, so re-check
-        # every param here and skip (never crash) a tool that fails.
-        unsafe = [p for p in custom_tool.params if not tools_mod.is_safe_param_name(p)]
-        if unsafe:
-            _log(f"custom tool '{custom_tool.name}' skipped: unsafe param name(s) "
-                 f"{unsafe!r} (must match [a-z0-9_]+)")
-            continue
-        fn = _make_tool_function(custom_tool, _env_dir().parent)
-        mcp.add_tool(fn, name=custom_tool.name, description=custom_tool.description)
+    # `register_custom=False` is for INTROSPECTION-ONLY callers (`tool_catalog()`)
+    # that need JUST the static set of built-in tools — never the dynamically
+    # discovered custom tools. Skipping the loop keeps `tool_catalog()`'s
+    # module-level cache genuinely valid (the built-in set really IS static)
+    # and stops a custom tool from being double-listed in the studio Tools tab
+    # or polluting the name-uniqueness gate with a stale cached entry. Real
+    # agent sessions keep the default (register_custom=True).
+    if register_custom:
+        for custom_tool in tools_mod.discover(_env_dir()):
+            # Defense-in-depth: `tools.save()` validates param names before a tool
+            # ever reaches disk, but `discover()` reads harn_env/tools/*.json
+            # directly with no validation of its own — a hand-edited file, a
+            # future Import feature, or a tool bundle shared by another user could
+            # land an unsafe param name here. `_make_tool_function` splices param
+            # names into a Python source string and `exec()`s it, so re-check
+            # every param here and skip (never crash) a tool that fails.
+            unsafe = [p for p in custom_tool.params
+                      if not tools_mod.is_safe_param_name(p)]
+            if unsafe:
+                _log(f"custom tool '{custom_tool.name}' skipped: unsafe param "
+                     f"name(s) {unsafe!r} (must match [a-z0-9_]+)")
+                continue
+            fn = _make_tool_function(custom_tool, _env_dir().parent,
+                                     _record_tool_used)
+            mcp.add_tool(fn, name=custom_tool.name,
+                         description=custom_tool.description)
 
     return mcp
 
@@ -882,13 +906,16 @@ def tool_catalog() -> dict[str, str]:
 
     The single source of truth for "what does this tool do, when do I use it" —
     reused by the studio UI's Tools tab so descriptions never drift out of sync
-    with what the agent itself sees via `tools/list`. Cached (the tool set is
-    static for a given harn install); build once, reuse across studio requests.
+    with what the agent itself sees via `tools/list`. Built with
+    `register_custom=False` so this is JUST the ~35 built-ins (the dynamically
+    discovered custom tools are listed separately by the studio). That set IS
+    static for a given harn install, which is what makes the module-level cache
+    below valid — build once, reuse across studio requests.
     """
     global _catalog_cache
     if _catalog_cache is None:
         import asyncio
-        mcp = build_server(start_watch=False)
+        mcp = build_server(start_watch=False, register_custom=False)
         tools = asyncio.run(mcp.list_tools())
         _catalog_cache = {t.name: (t.description or "").strip() for t in tools}
     return _catalog_cache

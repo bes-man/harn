@@ -208,6 +208,16 @@ def save_custom_tool_payload(env_dir: Path, payload: dict) -> dict:
         script_name = Path(script_name).name  # strip any path components (traversal guard)
         if not script_name or script_name in (".", ".."):
             return {"ok": False, "error": "invalid script_name"}
+        # A tool's script must NEVER be a .json — discover() treats every
+        # harn_env/tools/*.json as a live tool definition, so writing a .json
+        # sibling here would plant a second tool with an arbitrary command,
+        # bypassing tools.save()'s name/param validation, the collision check,
+        # and the built-in-name gate. The ONLY .json in tools/ is the one
+        # tools.save() wrote above. Mirrors import_bundle()'s second-.json
+        # defense on the import path.
+        if script_name.lower().endswith(".json"):
+            return {"ok": False,
+                    "error": "script_name must not be a .json file"}
         try:
             data = base64.b64decode(content_b64, validate=True)
         except Exception:

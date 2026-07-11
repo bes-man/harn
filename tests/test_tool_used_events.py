@@ -1,9 +1,10 @@
 """Every MCP tool call emits a tool_used event scoped to the currently
 claimed task and (for a sequential step) the currently running step."""
+import asyncio
 import os
 from pathlib import Path
 
-from harn import events, mcp_server, state, tasks
+from harn import events, mcp_server, state, tasks, tools
 
 
 def _env(tmp_path, monkeypatch):
@@ -58,3 +59,25 @@ def test_tool_call_uses_harn_step_id_env_over_state_current_step(
     evs = [e for e in events.read(env, task_id=task.id) if e["event"] == "tool_used"]
     assert len(evs) == 1
     assert evs[0]["step_id"] == "wave-member-2"
+
+
+def test_custom_tool_call_emits_tool_used_scoped_like_builtins(
+        tmp_path, monkeypatch):
+    """Custom tools register via mcp.add_tool (bypassing the mcp.tool usage
+    wrapper), so the synthesized function must emit the tool_used event itself
+    — otherwise Phase 4 usage badges always show custom tools as unused."""
+    env = _env(tmp_path, monkeypatch)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id, current_step="s1")
+    st.save(state_dir)
+    tools.save(env, "echo_it", "echo a message", ["msg"], "echo {msg}")
+
+    server = mcp_server.build_server(start_watch=False)
+    tool = server._tool_manager.get_tool("echo_it")
+    asyncio.run(tool.run({"msg": "hello"}))
+
+    evs = [e for e in events.read(env, task_id=task.id) if e["event"] == "tool_used"]
+    assert len(evs) == 1
+    assert evs[0]["tool"] == "echo_it"
+    assert evs[0]["step_id"] == "s1"
