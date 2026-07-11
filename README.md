@@ -220,6 +220,33 @@ todo → in_progress → review ⇄ changes_requested → done
 See [`harn_example/tasks/AUTH-42.json`](./harn_example/tasks/AUTH-42.json)
 for a `done` task with its full review log and carried-forward notes.
 
+## Creating and starting tasks from the Board
+
+You don't need an agent session to get a task onto the board:
+
+- **"＋ New task"** on the Board tab creates a task directly from Studio —
+  only a title is required; description, flow, and priority are optional and
+  default to none/project-default/`10`.
+- A task's **status** can be changed right from its detail panel, via the
+  dropdown next to the task id (a raw status move — it never touches
+  `review_log` or counts as an accept/request-changes).
+- **Picking a flow is required before a task can move to `in_progress`.** The
+  workflow picker always shows a real, explicit selection — "default
+  workflow" counts as one — so re-confirming the default is a valid pick too.
+  Moving the status to `in_progress` before any flow has been picked is
+  refused with a clear message, and the status stays put.
+- Moving a task to `in_progress` **immediately launches its run** in the
+  background — the same single-runner-at-a-time rule as the existing
+  **▶ Launch** button applies: if another run is already active, the launch
+  is refused and the status change is rolled back, so the task never ends up
+  stuck at `in_progress` with nothing running.
+- **"Open flow ▶"** on the task's detail panel jumps to the Flow tab with
+  this task selected, so you can watch it execute live.
+- Viewing an unstarted task's plan (or previewing a step's prompt) no longer
+  freezes it — a task's real plan is only frozen once something actually
+  executes it (a full run, or a single-step **Run**), so switching flows
+  before that point genuinely takes effect.
+
 ## Workflow steps: agent vs command, on-fail, parallel
 
 `harn_env/WORKFLOW.md` is the plan every task walks (edit by hand or via
@@ -739,6 +766,33 @@ todo → in_progress → review ⇄ changes_requested → done
 Комментарий → `changes_requested` (агент переделывает). Принятие → `done` с
 секцией **«Notes for future agents»**. История ревью дописывается в сам файл
 задачи, поэтому контекст путешествует вместе с ней.
+
+### Создание и запуск задач прямо с доски
+
+Чтобы завести задачу, не нужна сессия агента:
+
+- **«＋ New task»** на вкладке Board создаёт задачу прямо из Studio —
+  обязателен только заголовок; описание, флоу и приоритет необязательны и по
+  умолчанию пустые/дефолтный флоу проекта/`10`.
+- **Статус** задачи можно поменять прямо в панели деталей — выпадающим
+  списком рядом с id задачи (это обычная смена статуса — она не трогает
+  `review_log` и не считается accept/request-changes).
+- **Перед переводом в `in_progress` обязательно нужно выбрать флоу.**
+  Селектор флоу всегда показывает реальный, явный выбор — «default workflow»
+  тоже считается таким выбором, так что повторное подтверждение дефолта
+  засчитывается. Если флоу ещё не выбирали, перевод статуса в `in_progress`
+  отклоняется с понятной ошибкой, а статус остаётся прежним.
+- Перевод задачи в `in_progress` **сразу запускает её прогон** в фоне — по
+  тому же правилу «один прогон одновременно», что и у кнопки **▶ Launch**:
+  если уже активен другой прогон, запуск отклоняется, а смена статуса
+  откатывается — задача никогда не остаётся «застрявшей» в `in_progress` без
+  реально работающего прогона.
+- **«Open flow ▶»** в панели деталей задачи переключает на вкладку Flow с уже
+  выбранной этой задачей — можно смотреть выполнение вживую.
+- Просмотр плана ещё не начатой задачи (или превью промпта шага) больше не
+  замораживает её — реальный план задачи фиксируется только когда что-то его
+  реально выполняет (полный прогон или одиночный **Run** шага), поэтому смена
+  флоу до этого момента по-настоящему на что-то влияет.
 
 ### Шаги воркфлоу: agent/command, on-fail, parallel
 
