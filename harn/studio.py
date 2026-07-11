@@ -2760,19 +2760,29 @@ async function deleteSkill(i){
 
 /* ---------- tools tab (tools live in steps; edited via the workflow) ---------- */
 let toolSel=null, customToolSel=null;
+function selectTool(t){ toolSel=t; customToolSel=null; renderTools(); }
 function renderTools(){
   const v=$('#listView'); const tools=allTools();
-  v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— used across steps; Save flow to persist</span></h2>';
-  tools.forEach(t=>{ const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(t));
+  // Build the WHOLE #listView as one string assignment. Mixing
+  // `document.createElement`+`.onclick`-property rows with a later
+  // `v.innerHTML+=...` serializes the DOM back to a string and reparses it —
+  // that reparse throws away any handler attached as a JS property (only
+  // `onclick="..."` HTML-attribute handlers survive), silently making every
+  // row unclickable the moment a second section (custom tools / chat panel)
+  // gets appended below it. Using `onclick="selectTool(...)"` string
+  // attributes throughout — the same convention every other list in this
+  // file already uses — avoids the trap entirely.
+  const rows=tools.map(t=>{
+    const users=S.workflow.nodes.filter(n=>(n.tools||[]).includes(t));
     const doc=toolDoc(t); const first=doc.split('\n')[0];
-    const r=document.createElement('div');r.className='skillrow'+(toolSel===t?' sel':'');r.title=doc;
-    r.onclick=()=>{toolSel=t;customToolSel=null;renderToolEditor();renderTools();};
-    r.innerHTML=`<div style="width:100%"><div class="nm">${esc(t)} <span class="mut" style="font-weight:400">· ${users.length} step(s)</span></div>`+
-      `<div class="ds">${esc(first)}</div></div>`;
-    v.appendChild(r); });
-  if(!tools.length) v.innerHTML+='<div class="empty">No tools yet — add tools on a step (Flow tab).</div>';
-  v.innerHTML+=renderCustomToolsSection();
-  v.innerHTML+=renderToolChatPanel();
+    return `<div class="skillrow${toolSel===t?' sel':''}" title="${esc(doc)}" onclick="selectTool('${esc(t)}')">`+
+      `<div style="width:100%"><div class="nm">${esc(t)} <span class="mut" style="font-weight:400">· ${users.length} step(s)</span></div>`+
+      `<div class="ds">${esc(first)}</div></div></div>`;
+  }).join('');
+  v.innerHTML='<h2>TOOLS <span class="mut" style="text-transform:none;letter-spacing:0">— used across steps; Save flow to persist</span></h2>'+
+    (rows || '<div class="empty">No tools yet — add tools on a step (Flow tab).</div>')+
+    renderCustomToolsSection()+
+    renderToolChatPanel();
   if(customToolSel && CUSTOM_TOOLS.some(t=>t.name===customToolSel)) renderCustomToolEditor();
   else if(toolSel&&tools.includes(toolSel)) renderToolEditor();
   else $('#insp').innerHTML='<div class="empty">Select a tool.</div>';
