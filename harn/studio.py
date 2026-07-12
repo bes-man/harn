@@ -497,6 +497,86 @@ def save_defaults(env_dir: Path, payload: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Phase-8 loop budget + MCP knobs ([loop]/[mcp] in harn.toml) — Settings tab
+# --------------------------------------------------------------------------- #
+def settings_payload(env_dir: Path) -> dict:
+    cfg = Config.load(env_dir)
+    return {"max_cost_usd": cfg.max_cost_usd, "max_tokens": cfg.max_tokens,
+            "turn_timeout_seconds": cfg.turn_timeout_seconds,
+            "max_iterations": cfg.max_iterations,
+            "mcp_ui_supervise": cfg.mcp_ui_supervise,
+            "mcp_ui_port": cfg.mcp_ui_port,
+            "mcp_tool_reload_seconds": cfg.mcp_tool_reload_seconds}
+
+
+# key -> (section, kind); kind: "float" | "int" | "bool"
+_SETTINGS_KEYS = {
+    "max_cost_usd": ("loop", "float"), "max_tokens": ("loop", "int"),
+    "turn_timeout_seconds": ("loop", "int"), "max_iterations": ("loop", "int"),
+    "mcp_ui_supervise": ("mcp", "bool"), "mcp_ui_port": ("mcp", "int"),
+    "mcp_tool_reload_seconds": ("mcp", "int"),
+}
+# UI/config key name -> the harn.toml key name (they differ for the mcp_* ones).
+_SETTINGS_TOML_KEY = {
+    "mcp_ui_supervise": "ui_supervise", "mcp_ui_port": "ui_port",
+    "mcp_tool_reload_seconds": "tool_reload_seconds",
+}
+
+
+def _coerce_setting(kind: str, raw):
+    """Blank -> 0/False; validate type; reject negatives for numerics.
+    Returns (value, error)."""
+    if kind == "bool":
+        return bool(raw), ""
+    if raw in ("", None):
+        return (0.0 if kind == "float" else 0), ""
+    try:
+        val = float(raw) if kind == "float" else int(raw)
+    except (TypeError, ValueError):
+        return None, f"{raw!r} is not a number"
+    if val < 0:
+        return None, "value cannot be negative"
+    return val, ""
+
+
+def save_loop_mcp_settings(env_dir: Path, payload: dict) -> dict:
+    """Write `[loop]`/`[mcp]` knobs in harn.toml via a targeted regex edit
+    (stdlib can't write TOML — same idiom as save_defaults/set_config_flag).
+    Rejects negatives, coerces blank to 0/False, ignores unknown keys."""
+    toml_path = env_dir / "harn.toml"
+    text = toml_path.read_text(encoding="utf-8") if toml_path.exists() else ""
+    saved = {}
+    for key, raw in payload.items():
+        spec = _SETTINGS_KEYS.get(key)
+        if not spec:
+            continue
+        section, kind = spec
+        val, err = _coerce_setting(kind, raw)
+        if err:
+            return {"ok": False, "error": err}
+        toml_key = _SETTINGS_TOML_KEY.get(key, key)
+        literal = ("true" if val else "false") if kind == "bool" else repr(val)
+        text = _set_toml_kv(text, section, toml_key, literal)
+        saved[key] = val
+    toml_path.parent.mkdir(parents=True, exist_ok=True)
+    toml_path.write_text(text, encoding="utf-8")
+    return {"ok": True, "error": "", **saved}
+
+
+def _set_toml_kv(text: str, section: str, key: str, literal: str) -> str:
+    """Targeted in-place edit of `[section] key = literal` (stdlib can't write
+    TOML). Same regex idiom as save_defaults/set_config_flag."""
+    line = f"{key} = {literal}"
+    if re.search(rf"(?m)^\s*{key}\s*=.*$", text) and \
+       re.search(rf"(?ms)^\[{section}\].*?^\s*{key}\s*=", text):
+        return re.sub(rf"(?m)^\s*{key}\s*=.*$", line, text, count=1)
+    if re.search(rf"(?m)^\[{section}\]\s*$", text):
+        return re.sub(rf"(?m)^\[{section}\]\s*$", f"[{section}]\n{line}", text, count=1)
+    return (text.rstrip() + f"\n\n[{section}]\n{line}\n") if text else \
+        f"[{section}]\n{line}\n"
+
+
+# --------------------------------------------------------------------------- #
 # Live progress + per-stage stats (from events.jsonl) for the flow animation
 # --------------------------------------------------------------------------- #
 # Map a workflow node (by keywords in its title) to the pipeline stage that
@@ -1002,6 +1082,8 @@ def _make_handler(default_env: Path):
                 ctype = "application/zip" if is_zip else "application/json"
                 self._send(200, data, ctype, extra_headers={
                     "Content-Disposition": f'attachment; filename="{fname}"'})
+            elif route == "/api/settings":
+                self._json(settings_payload(env))
             elif route == "/api/skill/export":
                 name = self._query("name") or ""
                 skill = next((s for s in skills_mod.discover(env) if s.name == name), None)
@@ -1072,6 +1154,8 @@ def _make_handler(default_env: Path):
                 self._json(save_task_plan_route(env, body))
             elif route == "/api/defaults":
                 self._json(save_defaults(env, body))
+            elif route == "/api/settings":
+                self._json(save_loop_mcp_settings(env, body))
             elif route == "/api/mcp/restart":
                 self._json(restart_mcp_payload(env))
             elif route == "/api/task_plan/step_prompt/export":
