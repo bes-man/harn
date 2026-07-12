@@ -18,7 +18,7 @@ class ScriptedAdapter:
     def available(self):
         return True
 
-    def run_turn(self, prompt, cwd):
+    def run_turn(self, prompt, cwd, **kwargs):
         self.calls += 1
         item = self.script[min(self.calls - 1, len(self.script) - 1)]
         return item(prompt, cwd) if callable(item) else AgentResult(ok=True, text=item)

@@ -80,7 +80,7 @@ class NudgeCountingAdapter:
     def available(self):
         return True
 
-    def run_turn(self, prompt, cwd):
+    def run_turn(self, prompt, cwd, **kwargs):
         self.calls += 1
         self.feedbacks.append("NO tests" in prompt)
         (self.repo / "app.py").write_text(f"x = {self.calls + 10}\n")

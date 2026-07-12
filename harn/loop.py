@@ -769,10 +769,28 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
     return "handled"
 
 
+def _over_budget(run_cost: float, run_tok: int, cfg) -> str:
+    """A run-level spend guard checked between turns. Returns a human reason
+    when a configured ceiling is crossed, else "". 0 = that ceiling is off.
+    Tolerant of odd inputs — never raises into the loop."""
+    cost_cap = getattr(cfg, "max_cost_usd", 0.0) or 0.0
+    tok_cap = getattr(cfg, "max_tokens", 0) or 0
+    if cost_cap and run_cost >= cost_cap:
+        return (f"Run stopped: budget exceeded — spent ${run_cost:.2f}, "
+                f"cap ${cost_cap:.2f}. Raise the budget in Settings or split "
+                f"the task, then Resume.")
+    if tok_cap and run_tok >= tok_cap:
+        return (f"Run stopped: budget exceeded — used {run_tok} tokens, "
+                f"cap {tok_cap}. Raise the budget in Settings or split the "
+                f"task, then Resume.")
+    return ""
+
+
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
               task_id: str, stage: str, tok_totals: dict, tok_costs: dict,
               cfg: Config, verdict: str | None = None,
-              overrides: dict | None = None, step_title: str | None = None):
+              overrides: dict | None = None, step_title: str | None = None,
+              timeout: int | None = None):
     """Run one agent turn and emit a structured stage_start/stage_end pair.
 
     Centralising the run_turn call guarantees that EVERY completed agent cycle
@@ -790,7 +808,10 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
                 agent=adapter.name, step_title=step_title)
     t0 = time.time()
     try:
-        res = adapter.run_turn(prompt, project_root, **(overrides or {}))
+        call_kw = dict(overrides or {})
+        if timeout:               # 0 / None → adapter's own 1800s default
+            call_kw["timeout"] = timeout
+        res = adapter.run_turn(prompt, project_root, **call_kw)
     except Exception as e:
         events.emit(env_dir, "error", task_id=task_id, stage=stage,
                     detail=str(e)[:300])
@@ -1701,6 +1722,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     feedback_tail = ""
     tok_totals: dict[str, int] = {}
     tok_costs: dict[str, float] = {}
+    run_cost_total = 0.0     # cumulative across the WHOLE run (never popped)
+    run_tok_total = 0        # — the budget guard's source of truth
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
     # Debounces the post-step required-usage enforcement retry (Phase 4) to
@@ -1880,9 +1903,28 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 _build_step_prompt(env_dir, cfg, task, step, feedback_tail, auto=auto),
                 project_root, task_id=task.id, stage=sid, step_title=title,
                 overrides=_step_overrides(cfg, step),
-                tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+                tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg,
+                timeout=cfg.turn_timeout_seconds)
             st.current_step = None
             st.save(state_dir)
+
+            run_cost_total += (result.cost_usd or 0.0)
+            run_tok_total += (result.total_tokens or 0)
+            over = _over_budget(run_cost_total, run_tok_total, cfg)
+            if over:
+                state.blocked_marker(state_dir).write_text(over, encoding="utf-8")
+                st.block(over)
+                st.save(state_dir)
+                events.emit(env_dir, "block", task_id=task.id, stage=sid,
+                            detail=over[:300])
+                if not auto:
+                    task.step_results[sid] = {**task.step_results.get(sid, {}),
+                                              "status": "blocked"}
+                    tasks._save(task)
+                    progress.log(env_dir, f"{task.id}: {over}", agent=step_adapter.name)
+                print(f"[harn] {task.id}: {over}")
+                return _run_end(env_dir, st)
+
             last_step_text = result.text or ""
             print(result.text[-2000:] if result.text else "(no output)")
             if not auto and result.usage_str():

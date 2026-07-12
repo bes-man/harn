@@ -99,7 +99,7 @@ class FakeAdapter:
     def available(self):
         return True
 
-    def run_turn(self, prompt, cwd):
+    def run_turn(self, prompt, cwd, **kwargs):
         self.calls += 1
         return AgentResult(ok=True, text=self.text,
                            input_tokens=10, output_tokens=5)
