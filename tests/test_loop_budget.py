@@ -228,6 +228,75 @@ def test_wave_and_merge_helpers_accept_and_forward_spend():
     assert "spend=spend" in src
 
 
+# --------------------------------------------------------------------------- #
+# Ordering bug (Phase 8, Task 2b follow-up): an on_fail-handler turn that BOTH
+# raises a real question (ask_user -> BLOCKED) AND tips the run over budget
+# must have the blocked outcome win. The command-step checkpoint in run()
+# used to check the budget BEFORE handling `outcome == "blocked"`, so
+# _block_on_budget would overwrite the just-persisted real question (using a
+# stale outer `st`) with the budget message. Mirrors the wave checkpoint,
+# which already gets this ordering right.
+# --------------------------------------------------------------------------- #
+class _BlockingCostlyAdapter(_CostlyAdapter):
+    """Like _CostlyAdapter, but also raises a real ask_user-style question
+    (by writing BLOCKED.md, the same cross-agent signal `ask_user` uses) on
+    its first call — simulating an on_fail handler turn that both blocks AND
+    burns enough spend to trip the budget guard in the same turn."""
+    REAL_QUESTION = "Which retry strategy should the fix use — exponential or fixed backoff?"
+
+    def __init__(self, state_dir: Path, cost_usd=10.0, total_tokens=1000):
+        super().__init__(cost_usd=cost_usd, total_tokens=total_tokens)
+        self._state_dir = state_dir
+
+    def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                temperature=None):
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        (self._state_dir / "BLOCKED.md").write_text(self.REAL_QUESTION)
+        return super().run_turn(prompt, cwd, timeout=timeout, model=model,
+                                effort=effort, temperature=temperature)
+
+
+def test_onfail_block_and_overspend_in_same_turn_keeps_the_real_question(
+    tmp_path, monkeypatch
+):
+    """Regression for the state-ordering bug: budget must not clobber a real
+    BLOCKED question. A single on_fail-handler turn both calls ask_user
+    (BLOCKED.md written) and reports enough cost to blow past a $1.00 cap
+    (cost_usd=10.0). If the budget check ran first (the bug), STATE.json's
+    `question` and BLOCKED.md would hold the generic budget-ceiling message
+    instead of REAL_QUESTION, and the persisted reason for the stop would be
+    wrong even though the run correctly still stops."""
+    env, t = _project(
+        tmp_path,
+        [
+            _step("Tests", id="step-t1", type="command", command="false",
+                  on_fail="step-fix"),
+            _step("Fix tests", id="step-fix"),
+        ],
+        max_cost_usd=1.0, max_tokens=0,
+    )
+    state_dir = env / "state"
+    fake = _BlockingCostlyAdapter(state_dir, cost_usd=10.0, total_tokens=1000)
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    from harn import state
+    phase = loop.run(tmp_path, env)
+
+    assert phase == state.BLOCKED
+    # Exactly one on_fail dispatch — the block must stop the run before a
+    # second (budget-driven) iteration could even start.
+    assert len(fake.calls) == 1
+
+    st = state.State.load(state_dir)
+    assert st.question == _BlockingCostlyAdapter.REAL_QUESTION
+    assert "budget" not in (st.question or "").lower()
+
+    blocked_text = (env / "state" / "BLOCKED.md").read_text()
+    assert blocked_text.strip() == _BlockingCostlyAdapter.REAL_QUESTION
+    assert "budget" not in blocked_text.lower()
+
+
 def test_run_wires_a_single_shared_spend_into_all_three_checkpoints():
     """run()'s source must create exactly one _RunSpend and pass it to the
     sequential turn, the command-step path, and the parallel-wave path —

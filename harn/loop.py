@@ -1918,6 +1918,15 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             if step.get("type") == "command":
                 outcome = _run_command_step(env_dir, project_root, task, step, steps,
                                             cfg, adapter, spend=spend)
+                if outcome == "blocked":
+                    # _run_onfail_handler (inside _run_command_step) loads and
+                    # saves its OWN `state.State` instance when it calls
+                    # `_handle_block` — reload here so `st.phase` reflects that
+                    # before `_run_end` reports it, and so the budget check
+                    # below (skipped via this early return) can never
+                    # overwrite the real blocked question with a stale `st`.
+                    st = state.State.load(state_dir)
+                    return _run_end(env_dir, st)
                 # Checked here (not just after the sequential-step turn below)
                 # so an on_fail-handler-driven overspend — invisible to the
                 # old sequential-only guard — stops the run before the same
@@ -1926,8 +1935,6 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 if over:
                     _block_on_budget(env_dir, cfg, st, state_dir, task, over,
                                     sid=sid, agent_name=adapter.name, auto=auto)
-                    return _run_end(env_dir, st)
-                if outcome == "blocked":
                     return _run_end(env_dir, st)
                 if outcome == "advance":
                     # Success, or a terminal failure with no live on_fail
