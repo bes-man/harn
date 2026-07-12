@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -527,6 +528,8 @@ def _coerce_setting(kind: str, raw):
     """Blank -> 0/False; validate type; reject negatives for numerics.
     Returns (value, error)."""
     if kind == "bool":
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("false", "0", "off", "no", ""), ""
         return bool(raw), ""
     if raw in ("", None):
         return (0.0 if kind == "float" else 0), ""
@@ -534,6 +537,8 @@ def _coerce_setting(kind: str, raw):
         val = float(raw) if kind == "float" else int(raw)
     except (TypeError, ValueError):
         return None, f"{raw!r} is not a number"
+    if not math.isfinite(val):
+        return None, "value must be a finite number"
     if val < 0:
         return None, "value cannot be negative"
     return val, ""
@@ -568,7 +573,7 @@ def _set_toml_kv(text: str, section: str, key: str, literal: str) -> str:
     TOML). Same regex idiom as save_defaults/set_config_flag."""
     line = f"{key} = {literal}"
     if re.search(rf"(?m)^\s*{key}\s*=.*$", text) and \
-       re.search(rf"(?ms)^\[{section}\].*?^\s*{key}\s*=", text):
+       re.search(rf"(?ms)^\[{section}\][^\n]*\n(?:(?!^\[).)*?^\s*{key}\s*=", text):
         return re.sub(rf"(?m)^\s*{key}\s*=.*$", line, text, count=1)
     if re.search(rf"(?m)^\[{section}\]\s*$", text):
         return re.sub(rf"(?m)^\[{section}\]\s*$", f"[{section}]\n{line}", text, count=1)
