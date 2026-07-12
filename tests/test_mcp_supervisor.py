@@ -28,10 +28,32 @@ def test_down_when_healthcheck_fails(monkeypatch, tmp_path):
     env = tmp_path / "harn_env"; (env / "tools").mkdir(parents=True)
     monkeypatch.setattr(studio.mcp_server, "healthcheck",
                         lambda e, timeout=40: (False, [], "boom"))
-    p = studio.mcp_health_payload(env)
+    p = studio.mcp_health_payload(env, force=True)  # bypass any stale cache
     assert p["running"] is False
     assert p["error"] == "boom"
     assert p["stale"] is False  # can't be stale if it isn't running
+
+
+def test_health_probe_is_cached_so_rapid_polls_dont_spawn_subprocesses(monkeypatch, tmp_path):
+    # Regression: healthcheck() spawns a full `harn mcp` subprocess; the badge
+    # polled it every ~1.5s, and without caching that continuous subprocess
+    # churn pinned a core and made the whole studio UI laggy (dropped
+    # keystrokes in every input). The probe must run at most once per TTL.
+    env = tmp_path / "harn_env"; (env / "tools").mkdir(parents=True)
+    studio._mcp_health_cache.clear()
+    calls = {"n": 0}
+    def fake_hc(e, timeout=40):
+        calls["n"] += 1
+        return (True, ["board"], "")
+    monkeypatch.setattr(studio.mcp_server, "healthcheck", fake_hc)
+
+    studio.mcp_health_payload(env)          # 1 real probe
+    studio.mcp_health_payload(env)          # cached
+    studio.mcp_health_payload(env)          # cached
+    assert calls["n"] == 1                  # only ONE subprocess, not three
+
+    studio.mcp_health_payload(env, force=True)   # explicit bypass (e.g. restart)
+    assert calls["n"] == 2
 
 
 def _make_supervisor(tmp_path):

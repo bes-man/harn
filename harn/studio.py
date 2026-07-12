@@ -1173,22 +1173,43 @@ def _make_handler(default_env: Path):
     return Handler
 
 
-def mcp_health_payload(env_dir: Path) -> dict:
+# Cache the health probe: healthcheck() spawns a full `python -m harn mcp`
+# subprocess (boots the whole server, registers every tool, does an
+# init+tools/list handshake) — ~1-2s of real CPU. The studio badge polls this,
+# and WITHOUT this cache a poll every ~1.5s meant near-continuous subprocess
+# spawning that pinned a core and bogged the single studio HTTP server down so
+# badly the UI went laggy and dropped keystrokes in every input field. The
+# cache caps the real probe to once per _MCP_HEALTH_TTL seconds per env; rapid
+# polls in between return the last result instantly.
+_mcp_health_cache: dict = {}          # env-path -> (monotonic_ts, payload)
+_MCP_HEALTH_TTL = 8.0
+
+
+def mcp_health_payload(env_dir: Path, *, force: bool = False) -> dict:
     """What the studio's MCP badge needs. `running`/`tools_count` come from a
-    fresh healthcheck subprocess; `stale` is true when a custom tool exists on
-    disk but the live server isn't serving it — the exact PRJ-044 condition."""
+    (cached) healthcheck subprocess; `stale` is true when a custom tool exists
+    on disk but the live server isn't serving it — the exact PRJ-044 condition.
+    `force=True` bypasses the cache (used right after a manual restart)."""
+    key = str(env_dir)
+    now = time.monotonic()
+    if not force:
+        hit = _mcp_health_cache.get(key)
+        if hit and (now - hit[0]) < _MCP_HEALTH_TTL:
+            return hit[1]
     cfg = Config.load(env_dir)
     disk = sorted(t.name for t in tools_mod.discover(env_dir))
     try:
-        ok, tools, err = mcp_server.healthcheck(env_dir)
+        ok, tools, err = mcp_server.healthcheck(env_dir, timeout=10)
     except Exception as exc:
         ok, tools, err = False, [], str(exc)
     live_custom = sorted(n for n in tools if n in set(disk))
     stale = ok and bool(set(disk) - set(live_custom))
-    return {"running": bool(ok), "port": cfg.mcp_ui_port,
-            "tools_count": len(tools), "custom_names": live_custom,
-            "disk_custom_names": disk, "stale": stale, "error": err or "",
-            "supervised": bool(cfg.mcp_ui_supervise)}
+    payload = {"running": bool(ok), "port": cfg.mcp_ui_port,
+               "tools_count": len(tools), "custom_names": live_custom,
+               "disk_custom_names": disk, "stale": stale, "error": err or "",
+               "supervised": bool(cfg.mcp_ui_supervise)}
+    _mcp_health_cache[key] = (now, payload)
+    return payload
 
 
 class _MCPSupervisor:
@@ -1307,6 +1328,7 @@ def restart_mcp_payload(env_dir: Path) -> dict:
                 "([mcp] ui_supervise = false)"}
     try:
         if _SUPERVISOR.restart():
+            _mcp_health_cache.clear()   # force a fresh probe on the next badge poll
             return {"ok": True, "error": ""}
         return {"ok": False, "error": "MCP supervisor is shutting down"}
     except Exception as exc:
@@ -1713,7 +1735,11 @@ async function load(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){}
   await ensureModelsLoaded();
   renderWorkflows(); render(); loadConfig(); pollProgress();
-  setInterval(()=>{ pollProgress(); pollBoard(); pollMcpHealth(); }, 1500);
+  setInterval(()=>{ pollProgress(); pollBoard(); }, 1500);
+  // The MCP health badge polls on its OWN slow cadence — a full server probe
+  // (see mcp_health_payload) is expensive, so it must NOT ride the 1.5s
+  // progress/board tick that keeps the UI feeling live.
+  setInterval(pollMcpHealth, 9000);
   pollMcpHealth(); loadRunCaps();
 }
 // Loop/safety caps (max_cost_usd / max_tokens) — fetched for the run-banner
@@ -2270,11 +2296,28 @@ function toggleRunLog(){
   if(VIEWING_RUN_LOG) renderRunLogPanel(); else renderInsp();
 }
 function renderRunLogPanel(){
+  const text=BOARD.run_log||'(no output yet)';
+  const body=document.getElementById('runLogBody');
+  if(body){
+    // Update the text IN PLACE (not a full innerHTML rebuild) so the 1.5s
+    // poll re-render doesn't reset the user's scroll position — the bug where
+    // scrolling to the bottom snapped straight back to the top every tick.
+    // Follow new output only when already at the bottom (tail -f behaviour);
+    // leave the scroll alone if the user scrolled up to read earlier lines.
+    if(body.textContent!==text){
+      const atBottom=body.scrollHeight-body.scrollTop-body.clientHeight<30;
+      body.textContent=text;   // textContent auto-escapes — safe, no esc() needed
+      if(atBottom) body.scrollTop=body.scrollHeight;
+    }
+    return;
+  }
   $('#insp').innerHTML=`<div class="row" style="justify-content:space-between">`+
     `<h2 style="margin:0">Run log</h2>`+
     `<button class="icon-btn" onclick="toggleRunLog()" title="Close">✕</button></div>`+
     `<div class="mut" style="font-size:11px;margin-bottom:6px">live stdout/stderr tail — refreshes every 1.5s</div>`+
-    `<div class="toolDoc runlog" style="white-space:pre-wrap">${esc(BOARD.run_log||'(no output yet)')}</div>`;
+    `<div class="toolDoc runlog" id="runLogBody" style="white-space:pre-wrap;overflow:auto">${esc(text)}</div>`;
+  const b=document.getElementById('runLogBody');
+  if(b) b.scrollTop=b.scrollHeight;   // open scrolled to the newest line
 }
 function renderFlowTerminal(el){
   const runningWhole=BOARD.run&&!BOARD.run.stage;
