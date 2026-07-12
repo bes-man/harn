@@ -63,6 +63,22 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _nonneg_float(v) -> float:
+    """Parse a non-negative float; negative or malformed values clamp to 0."""
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _nonneg_int(v) -> int:
+    """Parse a non-negative int; negative or malformed values clamp to 0."""
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
 _HIL_CHANNELS = {"chat", "telegram", "both"}
 
 
@@ -85,11 +101,14 @@ DEFAULTS: dict = {
     "loop": {"max_iterations": 10, "loop_aware": True,
              "auto": False, "auto_max_iterations": 30,
              "oracle": True, "oracle_agent": "",
-             "design": True, "auto_reconcile": True},
+             "design": True, "auto_reconcile": True,
+             "max_cost_usd": 3.0, "max_tokens": 400000,
+             "turn_timeout_seconds": 1800},
     "browser": {"enabled": False, "app_cmd": "", "app_url": "",
                 "ready_timeout_s": 60},
     "code_search": {"semble": True, "socraticcode": True},
-    "mcp": {"context7": True},
+    "mcp": {"context7": True, "ui_supervise": True, "ui_port": 8765,
+            "tool_reload_seconds": 2},
     "notify": {"idle_minutes": 30, "wait_for_reply": True, "wait_timeout_minutes": 0,
                "channel": "both", "chat_grace_minutes": 5},
     # Change logging: keep a release-notes-style changelog on each task (what
@@ -122,6 +141,19 @@ class Config:
     loop_aware: bool = True
     auto: bool = False
     auto_max_iterations: int = 30
+    # Run-level spend ceilings (0 = unlimited). Checked between turns in
+    # loop.run(): crossing either stops the run and BLOCKS, so a single
+    # runaway turn can't quietly burn the budget.
+    max_cost_usd: float = 3.0
+    max_tokens: int = 400000
+    # Per-turn subprocess timeout handed to adapter.run_turn (0 = the
+    # adapter's own 1800s default). Caps a single turn's blast radius.
+    turn_timeout_seconds: int = 1800
+    # harn ui supervises an owned `harn mcp --http` child on this port.
+    mcp_ui_supervise: bool = True
+    mcp_ui_port: int = 8765
+    # Hot-reload: the MCP watcher polls harn_env/tools/ this often (0 = off).
+    mcp_tool_reload_seconds: int = 2
     # Code search backends (both default on; gracefully degrade if not installed)
     code_search_semble: bool = True       # use semble for semantic chunk retrieval
     code_search_socraticcode: bool = True  # use SocratiCode for dependency graphs
@@ -216,5 +248,11 @@ class Config:
                 or data["notify"].get("chat_grace_minutes", 5)
             ),
             log_changes=bool(data.get("log", {}).get("changes", True)),
+            max_cost_usd=_nonneg_float(data["loop"].get("max_cost_usd", 3.0)),
+            max_tokens=_nonneg_int(data["loop"].get("max_tokens", 400000)),
+            turn_timeout_seconds=_nonneg_int(data["loop"].get("turn_timeout_seconds", 1800)),
+            mcp_ui_supervise=bool(data["mcp"].get("ui_supervise", True)),
+            mcp_ui_port=_nonneg_int(data["mcp"].get("ui_port", 8765)),
+            mcp_tool_reload_seconds=_nonneg_int(data["mcp"].get("tool_reload_seconds", 2)),
             raw=data,
         )
