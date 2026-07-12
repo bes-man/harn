@@ -224,7 +224,7 @@ class Config:
             guidance=str(data["harn"].get("guidance", "lean") or "lean").strip().lower(),
             test_cmd=data["feedback"].get("test_cmd", ""),
             require_tests=bool(data["feedback"].get("require_tests", True)),
-            max_iterations=int(data["loop"].get("max_iterations", 10)),
+            max_iterations=_nonneg_int(data["loop"].get("max_iterations", 10)),
             loop_aware=bool(data["loop"].get("loop_aware", True)),
             code_search_semble=bool(data["code_search"].get("semble", True)),
             code_search_socraticcode=bool(data["code_search"].get("socraticcode", True)),

@@ -13,6 +13,7 @@ agent that runs next picks up with full knowledge of what's done and planned.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shutil
@@ -1809,7 +1810,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     # submit_for_review() call instead of a status transition means every
     # resubmission gets a fresh debounce, however many rework rounds happen.
     reworked: set[str] = set()
-    for _ in range(limit):
+    for _ in (itertools.count() if not limit else range(limit)):
         task = tasks.next_task(env_dir, exclude=handled, only=only_task)
         if task is None:
             if auto:
