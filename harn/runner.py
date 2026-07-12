@@ -77,9 +77,19 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
     elif auto:
         cmd.append("--auto")
     cmd.append(str(project_root))
+    # PYTHONUNBUFFERED matters: stdout redirected to a real file (not a tty)
+    # makes CPython fully block-buffer it, so every print() in the child sits
+    # in an internal buffer and never reaches ui_run.log until the process
+    # EXITS (confirmed directly: a child process's file-redirected output was
+    # completely invisible while running, appearing only at exit). Without
+    # this, the studio's "View log" panel reads an empty file for a run's
+    # entire lifetime and shows "(no output yet)" even while it's actively
+    # executing turns.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     with open(_log_path(env_dir), "wb") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                cwd=str(project_root), start_new_session=True)
+                                cwd=str(project_root), start_new_session=True,
+                                env=env)
     # Nothing else ever calls .wait() on this Popen (the HTTP handler returns
     # immediately) — without reaping it, a finished child sits as a zombie
     # forever, and os.kill(pid, 0) in `active()` keeps reporting it as alive.

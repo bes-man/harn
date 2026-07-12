@@ -68,6 +68,29 @@ def test_successful_command_step_advances_without_agent_call(tmp_path, monkeypat
     assert fresh.step_results["step-t1"]["status"] == "ok"
 
 
+def test_command_step_prints_to_stdout_so_studio_view_log_sees_it(tmp_path, monkeypatch, capsys):
+    # Regression: _run_command_step wrote status/output to task.step_results
+    # and events.jsonl/PROGRESS.md but never called print(), unlike the
+    # agent-turn path's own "with {agent}..." / result-text prints -- so a
+    # multi-step command-heavy run showed NOTHING in the studio's ui_run.log
+    # (and therefore the "View log" panel) between the run starting and the
+    # entire pipeline finishing. Found live-testing the View log button via
+    # Playwright: a 4-command-step run's log stayed frozen at the startup
+    # line the whole time, unlike an agent-turn step's log which updated
+    # immediately (proving runner.launch()'s PYTHONUNBUFFERED fix works --
+    # this is the SEPARATE gap that fix didn't (and couldn't) cover).
+    env, t = _project(tmp_path, [
+        _step("Echo", id="step-e1", type="command", command="echo tick-marker"),
+    ])
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+    out = capsys.readouterr().out
+    assert "Echo (command)" in out          # pre-run boundary line
+    assert "tick-marker" in out             # the command's own captured output
+
+
 def test_failing_command_step_with_no_onfail_advances_and_records_failure(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Tests", id="step-t1", type="command", command="false"),

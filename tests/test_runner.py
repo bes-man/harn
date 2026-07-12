@@ -72,6 +72,20 @@ def test_launch_step_rerun_includes_rerun_flag(tmp_path):
     assert r["step"] == "step-000002" and r["rerun"] is True
 
 
+def test_launch_sets_pythonunbuffered_so_the_log_updates_live(tmp_path):
+    # Regression: stdout redirected to a real file (not a tty) makes CPython
+    # fully block-buffer it, so a child's print() output never reached
+    # ui_run.log until the process EXITED -- the studio's "View log" panel
+    # read an empty file for a run's entire lifetime, always showing "(no
+    # output yet)" even while it was actively executing. Confirmed directly
+    # by spawning a real subprocess with/without this env var.
+    env = _env(tmp_path)
+    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
+         patch("harn.runner.os.kill"):
+        runner.launch(tmp_path, env, "PRJ-010")
+    assert m.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+
+
 def test_active_reports_step_info(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(555)), \

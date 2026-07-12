@@ -704,11 +704,19 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     # on the reading side.
     events.emit(env_dir, "stage_start", task_id=task.id, stage=sid,
                 agent="command", step_title=title)
+    # Mirror the agent-turn path's own print()s (see run()'s "STEP TURN"
+    # block): a command step previously logged nothing to stdout at all
+    # (only events.jsonl/PROGRESS.md, neither of which reach ui_run.log), so
+    # a multi-step command-heavy run showed nothing in the studio's "View
+    # log" panel between its start and its very end, regardless of stdout
+    # buffering — a different gap from the buffering fix in runner.launch().
+    print(f"[harn] {task.id} · {title} (command): {command[:200]}")
     t0 = time.time()
     result = run_feedback(command, project_root)
     dur_ms = int((time.time() - t0) * 1000)
     ended = tasks._now_iso()
     lines = [ln for ln in (result.output or "").strip().splitlines() if ln.strip()]
+    print(result.output[-2000:] if result.output else "(no output)")
     events.emit(env_dir, "stage_end", task_id=task.id, stage=sid,
                 agent="command", step_title=title, ok=result.ok, dur_ms=dur_ms,
                 summary=(lines[-1][:200] if lines else None))
