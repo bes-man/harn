@@ -13,6 +13,8 @@ import base64
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from . import attachments as attachments_mod
@@ -216,6 +218,10 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         return wrap
 
     mcp.tool = _tracked_tool
+    # Stash so a hot-reload tick (called from outside build_server, even from
+    # the watcher thread) can pass the same tool-usage tracker into freshly
+    # registered custom tools that the boot loop below uses.
+    mcp._harn_record_tool_used = _record_tool_used
 
     if start_watch:
         # Auto-start the watch dispatcher so Telegram escalation, oracle, and
@@ -903,7 +909,120 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             mcp.add_tool(fn, name=custom_tool.name,
                          description=custom_tool.description)
 
+        try:
+            interval = Config.load(_env_dir()).mcp_tool_reload_seconds
+        except Exception:
+            interval = 2
+        start_tool_reload(mcp, interval)
+
     return mcp
+
+
+def _tools_dir_signature(env_dir: Path) -> tuple:
+    """Cheap change-detector for harn_env/tools/: (name, mtime, size) per json,
+    sorted. Never raises — a stat error yields an empty signature (treated as
+    'no tools'), which the reconciler handles safely."""
+    d = env_dir / "tools"
+    try:
+        out = []
+        for p in sorted(d.glob("*.json")):
+            st = p.stat()
+            out.append((p.name, st.st_mtime, st.st_size))
+        return tuple(out)
+    except Exception:
+        return ()
+
+
+def _reconcile_custom_tools(mcp, env_dir: Path, registered: set) -> set:
+    """Make the live ToolManager match the SAFE custom tools on disk. Adds
+    new/changed, removes deleted, skips unsafe-param tools (same gate as the
+    boot loop above). Returns the new registered-name set. Best-effort, never
+    raises."""
+    tm = mcp._tool_manager
+    try:
+        discovered = {t.name: t for t in tools_mod.discover(env_dir)}
+    except Exception as exc:
+        _log(f"tool reload: discover failed ({exc}); keeping current set")
+        return registered
+    safe = {}
+    for name, ct in discovered.items():
+        # Same defense-in-depth as the boot loop: `discover()` reads
+        # harn_env/tools/*.json directly with no validation of its own, so
+        # re-check every param name before it can reach `_make_tool_function`'s
+        # exec()'d source string.
+        unsafe = [p for p in ct.params if not tools_mod.is_safe_param_name(p)]
+        if unsafe:
+            _log(f"tool reload: '{name}' skipped: unsafe param(s) {unsafe!r}")
+            continue
+        safe[name] = ct
+    changed = False
+    # Remove tools that vanished or became unsafe.
+    for name in list(registered):
+        if name not in safe:
+            try:
+                tm.remove_tool(name)
+            except Exception:
+                pass
+            changed = True
+    # Add/replace current safe tools (always re-add so an edited command/params
+    # takes effect — remove-then-add makes it idempotent).
+    record_used = getattr(mcp, "_harn_record_tool_used", None)
+    new_reg = set()
+    for name, ct in safe.items():
+        try:
+            if name in {t.name for t in tm.list_tools()}:
+                tm.remove_tool(name)
+            fn = _make_tool_function(ct, env_dir.parent, record_used)
+            mcp.add_tool(fn, name=ct.name, description=ct.description)
+            new_reg.add(name)
+            changed = True
+        except Exception as exc:
+            _log(f"tool reload: '{name}' failed to register ({exc})")
+    if changed:
+        _notify_tools_changed(mcp)
+    return new_reg
+
+
+def _notify_tools_changed(mcp) -> None:
+    """Best-effort: tell connected clients the tool list changed. If no active
+    session is reachable from this thread, the ToolManager is still correct so
+    the next tools/list is fresh anyway. Never raises."""
+    try:
+        session = mcp._mcp_server.request_context.session
+        import anyio
+        anyio.from_thread.run(session.send_tool_list_changed)
+    except Exception:
+        pass
+
+
+def start_tool_reload(mcp, interval_s: int) -> None:
+    """Daemon watcher: poll harn_env/tools/ every interval_s and reconcile the
+    live server. interval_s <= 0 disables it. Never blocks server startup and
+    never lets an unexpected exception escape the loop (a request thread must
+    never see this thread crash)."""
+    if interval_s <= 0:
+        return
+    env_dir = _env_dir()
+
+    def _loop():
+        try:
+            registered = {t.name for t in mcp._tool_manager.list_tools()
+                          if t.name in {c.name for c in tools_mod.discover(env_dir)}}
+        except Exception:
+            registered = set()
+        last = _tools_dir_signature(env_dir)
+        while True:
+            try:
+                time.sleep(interval_s)
+                sig = _tools_dir_signature(env_dir)
+                if sig != last:
+                    last = sig
+                    registered = _reconcile_custom_tools(mcp, env_dir, registered)
+            except Exception:
+                # Never let the daemon die or take the process down with it.
+                continue
+
+    threading.Thread(target=_loop, name="harn-tool-reload", daemon=True).start()
 
 
 _catalog_cache: dict[str, str] | None = None
