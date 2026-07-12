@@ -889,6 +889,15 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
     # and stops a custom tool from being double-listed in the studio Tools tab
     # or polluting the name-uniqueness gate with a stale cached entry. Real
     # agent sessions keep the default (register_custom=True).
+    # Snapshot of built-in tool names, captured BEFORE any custom tool is
+    # registered below (only the ~35 built-ins added via @mcp.tool() above
+    # exist in the ToolManager at this point). This is the allow/deny line
+    # the hot-reload reconciler uses to refuse to ever add, remove, or
+    # replace a built-in — see `_reconcile_custom_tools` and the Finding-1
+    # writeup in .superpowers/sdd/task-3-report.md.
+    builtin_names = {t.name for t in mcp._tool_manager.list_tools()}
+    mcp._harn_builtin_names = builtin_names
+
     if register_custom:
         for custom_tool in tools_mod.discover(_env_dir()):
             # Defense-in-depth: `tools.save()` validates param names before a tool
@@ -913,7 +922,7 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             interval = Config.load(_env_dir()).mcp_tool_reload_seconds
         except Exception:
             interval = 2
-        start_tool_reload(mcp, interval)
+        start_tool_reload(mcp, interval, builtin_names)
 
     return mcp
 
@@ -933,11 +942,23 @@ def _tools_dir_signature(env_dir: Path) -> tuple:
         return ()
 
 
-def _reconcile_custom_tools(mcp, env_dir: Path, registered: set) -> set:
+def _reconcile_custom_tools(mcp, env_dir: Path, registered: set,
+                            builtin_names: set | None = None) -> set:
     """Make the live ToolManager match the SAFE custom tools on disk. Adds
     new/changed, removes deleted, skips unsafe-param tools (same gate as the
     boot loop above). Returns the new registered-name set. Best-effort, never
-    raises."""
+    raises.
+
+    `builtin_names` (the server's built-in tool names, captured by
+    `build_server()` BEFORE any custom tool is registered) is the hard
+    boundary this function must never cross: a discovered custom tool whose
+    `name` collides with a built-in is skipped outright, before it can ever
+    enter `safe` — so it can never enter `registered` either, which means
+    the remove-path below (keyed off `registered`) can never call
+    `remove_tool`/`add_tool` on a built-in name. Without this, a planted
+    `harn_env/tools/read_skill.json` could delete-and-replace the real
+    `read_skill` built-in on the next reconcile tick (trust hijack + DoS)."""
+    builtin_names = builtin_names or set()
     tm = mcp._tool_manager
     try:
         discovered = {t.name: t for t in tools_mod.discover(env_dir)}
@@ -946,10 +967,24 @@ def _reconcile_custom_tools(mcp, env_dir: Path, registered: set) -> set:
         return registered
     safe = {}
     for name, ct in discovered.items():
+        if name in builtin_names:
+            _log(f"tool reload: '{name}' skipped: shadows a built-in tool "
+                 f"name — a custom tool may never add/remove/replace a "
+                 f"built-in")
+            continue
+        # Defense-in-depth: `discover()` reads harn_env/tools/*.json directly
+        # with no schema validation, so `ct.params` may not even be a list
+        # (e.g. a hand-edited/planted file) — guard the shape before
+        # iterating it below.
+        if not isinstance(ct.params, list):
+            _log(f"tool reload: '{name}' skipped: params is not a list "
+                 f"({type(ct.params).__name__})")
+            continue
         # Same defense-in-depth as the boot loop: `discover()` reads
         # harn_env/tools/*.json directly with no validation of its own, so
         # re-check every param name before it can reach `_make_tool_function`'s
-        # exec()'d source string.
+        # exec()'d source string. `is_safe_param_name` itself now tolerates a
+        # non-string param (returns False instead of raising TypeError).
         unsafe = [p for p in ct.params if not tools_mod.is_safe_param_name(p)]
         if unsafe:
             _log(f"tool reload: '{name}' skipped: unsafe param(s) {unsafe!r}")
@@ -995,14 +1030,19 @@ def _notify_tools_changed(mcp) -> None:
         pass
 
 
-def start_tool_reload(mcp, interval_s: int) -> None:
+def start_tool_reload(mcp, interval_s: int, builtin_names: set | None = None) -> None:
     """Daemon watcher: poll harn_env/tools/ every interval_s and reconcile the
     live server. interval_s <= 0 disables it. Never blocks server startup and
     never lets an unexpected exception escape the loop (a request thread must
-    never see this thread crash)."""
+    never see this thread crash).
+
+    `builtin_names` is threaded straight into every `_reconcile_custom_tools`
+    call so the watcher can never touch a built-in tool name (see that
+    function's docstring)."""
     if interval_s <= 0:
         return
     env_dir = _env_dir()
+    builtin_names = builtin_names or set()
 
     def _loop():
         try:
@@ -1016,8 +1056,15 @@ def start_tool_reload(mcp, interval_s: int) -> None:
                 time.sleep(interval_s)
                 sig = _tools_dir_signature(env_dir)
                 if sig != last:
+                    # Only advance `last` AFTER the reconcile call returns —
+                    # a tick that changes nothing (or raises inside
+                    # _reconcile_custom_tools, though it's best-effort and
+                    # shouldn't) must not silently skip a legitimate
+                    # co-located change by advancing the signature early.
+                    registered = _reconcile_custom_tools(mcp, env_dir,
+                                                          registered,
+                                                          builtin_names)
                     last = sig
-                    registered = _reconcile_custom_tools(mcp, env_dir, registered)
             except Exception:
                 # Never let the daemon die or take the process down with it.
                 continue

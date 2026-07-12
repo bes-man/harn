@@ -25,15 +25,22 @@ _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _MAX_BUNDLE_BYTES = 25 * 1024 * 1024
 
 
-def is_safe_param_name(name: str) -> bool:
+def is_safe_param_name(name) -> bool:
     """True iff `name` is safe to splice into generated Python source as a
     function parameter (e.g. Task 2's `def _custom_tool({param}: str = ''):`
     exec-based registration). Same character class as tool names themselves
     — restrictive on purpose, since this is the last line of defense against
     code injection via an attacker-controlled param name (uploaded tool
     definition, agent-drafted tool, or an imported tool bundle from another
-    harn user)."""
-    return bool(_NAME_RE.fullmatch(name))
+    harn user).
+
+    `name` is untyped on purpose: `discover()` parses harn_env/tools/*.json
+    with no schema validation, so a planted/hand-edited file can hand this a
+    non-string (e.g. `"params": ["a", 123]`). `_NAME_RE.fullmatch` raises
+    TypeError on a non-string, which would otherwise crash every caller
+    (the boot loop in build_server() AND the hot-reload reconcile) — so a
+    non-string safely resolves to False (skipped) instead."""
+    return isinstance(name, str) and bool(_NAME_RE.fullmatch(name))
 
 
 @dataclass
