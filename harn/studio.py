@@ -2361,21 +2361,31 @@ function renderFlowTerminal(el){
     return;
   }
   const all=flowAllTasks();
-  if(!all.length){
-    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
-      <div class="mut" style="font-size:11.5px">No tasks yet — create one, then come back here to launch it.</div>`;
+  // Only LAUNCHABLE tasks belong in the picker — you can't start a task that's
+  // already in review or done, so listing them (and then disabling Run with no
+  // feedback) just looked like "Run does nothing". Show only runnable ones.
+  const runnable=all.filter(t=>RUNNABLE_STATUSES.includes(t.status));
+  if(!runnable.length){
+    const msg=all.length
+      ? 'No runnable task — every task is in review or done. Move one back to <b>To do</b> on the Board, or use <b>↻ Rerun from scratch</b> on a finished task, to launch it here.'
+      : 'No tasks yet — create one, then come back here to launch it.';
+    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>`+
+      `<div class="mut" style="font-size:11.5px">${msg}</div>`;
     return;
   }
-  const selId=flowSelectedTaskId();
-  const opts=all.map(x=>`<option value="${esc(x.id)}" ${x.id===selId?'selected':''}>${esc(x.id)}: ${esc(x.title)} (${esc(x.status)})</option>`).join('');
-  const task=flowSelectedTask();
+  // Honour the user's picked task only if it's still runnable, else default to
+  // the first runnable one — so the Run button below is ALWAYS enabled for
+  // whatever the dropdown can show.
+  let selId=(FLOW_SEL_TASK_ID&&runnable.some(t=>t.id===FLOW_SEL_TASK_ID))
+    ? FLOW_SEL_TASK_ID : runnable[0].id;
+  FLOW_SEL_TASK_ID=selId;
+  const opts=runnable.map(x=>`<option value="${esc(x.id)}" ${x.id===selId?'selected':''}>${esc(x.id)}: ${esc(x.title)} (${esc(x.status)})</option>`).join('');
+  const task=runnable.find(t=>t.id===selId);
   const hasBaseline=task&&task.baseline_ref;
-  const isRunnable=task&&RUNNABLE_STATUSES.includes(task.status);
   el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
     <div class="mut" style="font-size:11px">Runs the active workflow (<b>${esc(S.active||'default')}</b>) end-to-end against the task you pick.</div>
     <select id="flowTaskSel" onchange="FLOW_SEL_TASK_ID=this.value;renderFlow()">${opts}</select>
-    <button class="primary" onclick="runWholeWorkflow()" ${isRunnable?'':'disabled'}
-      title="${isRunnable?'':'This task is '+esc(task?task.status:'')+' — not runnable. Rerun from scratch to reopen it.'}">▶ Run</button>
+    <button class="primary" onclick="runWholeWorkflow()">▶ Run</button>
     ${hasBaseline?`<button class="ghost" onclick="rerunWholeWorkflow()" title="Restore to before this task's very first attempt and reopen it, then run it again">↻ Rerun from scratch</button>`:''}`;
 }
 async function runWholeWorkflow(){
