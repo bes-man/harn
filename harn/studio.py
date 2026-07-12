@@ -1843,6 +1843,12 @@ const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your 
 
 async function pollBoard(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
+  // The blocked-question banner reflects per-ENV state (harn has one active
+  // task at a time — see blocked_question_payload), not per-selected-task, so
+  // it must poll on EVERY tab, not just Board — someone watching a run finish
+  // on the Flow tab needs to see "needs your answer" right there, not only
+  // after switching to Board and clicking the task.
+  await pollBlockedQuestion();
   if(tab!=='board') return;
   // Don't rebuild the list out from under an open "＋ New task" form (even
   // before the user has focused a field in it) or a half-typed value inside
@@ -1853,20 +1859,16 @@ async function pollBoard(){
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
     // steal focus mid-typing. The next tick refreshes once the user is done.
     if(!isEditing($('#insp'))) renderTaskDetail();
-    await pollBlockedQuestion();
   } else{
     boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
-    BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
-    const el=$('#blockedBanner'); if(el){ el.style.display='none'; el.innerHTML=''; }
   }
 }
 let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null;
 async function pollBlockedQuestion(){
-  if(!boardSel) return;
   const el=$('#blockedBanner');
   if(!el) return;
   let r;
-  try{ r=await (await fetch(api(`/api/tasks/blocked_question?task=${encodeURIComponent(boardSel)}`))).json(); }
+  try{ r=await (await fetch(api(`/api/tasks/blocked_question?task=${encodeURIComponent(boardSel||'')}`))).json(); }
   catch(e){ return; }
   // Re-render ONLY when the question (or selected task) actually changed —
   // this poll fires every 1.5s, and blindly overwriting the banner's innerHTML
