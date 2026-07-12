@@ -77,6 +77,14 @@ design = true
 # Not recommended for complex tasks.
 auto = false
 auto_max_iterations = 30
+# Run-level spend ceilings (0 = unlimited). harn sums per-turn cost/tokens as
+# the loop runs; crossing either STOPS the run and BLOCKS it immediately — a
+# single runaway turn can't quietly burn the whole budget. Change these here
+# or from the studio Settings tab.
+max_cost_usd = 3.0
+max_tokens = 400000
+# Per-turn subprocess timeout in seconds (0 = the adapter's own 1800s default).
+turn_timeout_seconds = 1800
 
 [browser]
 # Browser verification (default off): after tests + verify pass on a UI task
@@ -142,3 +150,14 @@ socraticcode = true
 # docs and best practices instead of stale training data. Needs Node.js (npx).
 # Set false and re-run `harn setup` to remove it from the generated MCP config.
 context7 = true
+# ui_supervise (default true) — `harn ui` supervises an owned `harn mcp --http`
+# child on ui_port, restarts it if it dies, and shows its health in the header.
+# This is for visibility/health only — your agent still talks to its OWN stdio
+# `harn mcp` process (see "How the MCP server works" below); it doesn't migrate
+# to this HTTP one. Set false to opt out.
+ui_supervise = true
+ui_port = 8765
+# The running MCP server hot-reloads custom tools from harn_env/tools/ this
+# often, so a tool you add mid-session becomes callable without restarting the
+# server (0 = disable live reload).
+tool_reload_seconds = 2

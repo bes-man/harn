@@ -119,6 +119,10 @@ auto = false                        # autonomous (also `harn run --auto`); see b
 # Per-step agent/model/effort/temperature now live on the step itself, in the
 # workflow plan (set via the studio UI) — not here. `[harn] model` above is
 # just the default a step falls back to when it sets none of its own.
+max_cost_usd = 3.0                  # run-level cost ceiling, 0 = unlimited
+max_tokens = 400000                 # run-level token ceiling, 0 = unlimited
+# crossing either STOPS the run and BLOCKS it — change here or in Settings tab
+turn_timeout_seconds = 1800         # per-turn subprocess timeout, 0 = adapter default
 
 [browser]                           # Playwright phase: verify criteria in the LIVE app
 enabled = false                     # turn on, then re-run `harn setup` (adds the MCP)
@@ -128,6 +132,12 @@ app_url = "http://localhost:3000"   # where it answers
 [code_search]                       # search-before-reading; installed by `harn setup`
 semble = true                       # semantic chunk retrieval (no infra)
 socraticcode = true                 # dependency graph / blast-radius (Docker)
+
+[mcp]
+context7 = true                     # live library docs as MCP tools (needs Node.js)
+ui_supervise = true                 # `harn ui` supervises an owned `harn mcp --http` child
+ui_port = 8765                      # that child's port
+tool_reload_seconds = 2             # hot-reload harn_env/tools/ this often, 0 = disable
 
 [notify]
 idle_minutes = 30                   # reminder cadence while waiting on you
@@ -414,6 +424,19 @@ Tools: `list_skills`, `read_skill`, `get_next_task`, `create_task`,
 `codebase_*` from the code-search servers). Run `harn mcp --http --port 8765` to
 serve over `127.0.0.1` instead (same tools; can later sit behind auth/TLS).
 
+**`harn ui` supervision** (`[mcp] ui_supervise`, default `true`): the studio
+starts its own `harn mcp --http` child on `[mcp] ui_port` (default `8765`),
+restarts it if it dies, and shows its health in the header. This is for
+visibility only — it does **not** replace the stdio server your agent already
+owns, and agents don't migrate to it. Set `ui_supervise = false` to opt out.
+
+**Hot-reloading custom tools** (`[mcp] tool_reload_seconds`, default `2`, `0`
+= disable): every running `harn mcp` process — the agent's stdio one and the
+studio's supervised HTTP one — polls `harn_env/tools/` on this interval and
+reconciles its tool list against what's on disk. A custom tool you add (or
+edit) mid-session becomes callable within a couple of seconds, with no server
+restart needed.
+
 ## Phases vs. task statuses
 
 - **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING →
@@ -433,6 +456,16 @@ When an agent CLI reports token usage (e.g. Claude via `--output-format json`),
 harn records the per-task total and cost in the task's Review log and in
 `PROGRESS.md`, so you can see what each task cost. Agents that don't expose usage
 simply show nothing.
+
+**Run-level budget guard** (`[loop] max_cost_usd`, `[loop] max_tokens`, both
+`0` = unlimited, defaults `3.0` / `400000`): harn sums per-turn cost and tokens
+as the run progresses, and if either ceiling is crossed the run **stops
+immediately and goes to `BLOCKED`** rather than quietly continuing to spend —
+a single runaway turn can't burn through the whole budget unnoticed. Change
+either value in `harn_env/harn.toml` or from the studio **Settings** tab.
+`[loop] turn_timeout_seconds` (default `1800`, `0` = the adapter's own
+default) caps how long a single turn's subprocess may run before harn kills
+it.
 
 ## UI tasks: design-first + browser verification (Playwright MCP)
 
