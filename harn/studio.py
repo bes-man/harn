@@ -1438,6 +1438,11 @@ _HTML = r"""<!DOCTYPE html>
   .settings .field{margin:14px 0}
   .settings label{display:block;margin-bottom:5px}
   .status{color:var(--muted);font-size:12px;min-width:120px;text-align:right}
+  .mcpbadge{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);
+    cursor:pointer;white-space:nowrap}
+  .mcpbadge.live{color:var(--accent2);border-color:#3ad6a055}
+  .mcpbadge.stale{color:var(--warn);border-color:#e8b93a66}
+  .mcpbadge.down{color:var(--danger);border-color:#ff6b6b66}
   main{display:grid;grid-template-columns:1fr 6px var(--insp-w);height:calc(100vh - 53px)}
   .canvas{position:relative;overflow:auto;background:
     radial-gradient(circle at 1px 1px,#222732 1px,transparent 0) 0 0/24px 24px var(--bg)}
@@ -1616,6 +1621,7 @@ _HTML = r"""<!DOCTYPE html>
     <label class="sw"><input type="checkbox" id="tgSocratic" onchange="setToggle('socraticcode',this.checked)"><span></span>socraticode</label>
   </div>
   <span class="sp"></span>
+  <span id="mcpBadge" class="mcpbadge" title="harn MCP status" style="display:none"></span>
   <span class="status" id="status">loading…</span>
   <button onclick="addStep()" id="addBtn">＋ Add step</button>
   <button onclick="addSkill()" id="addSkillBtn" style="display:none">＋ Add skill</button>
@@ -1707,7 +1713,34 @@ async function load(){
   try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){}
   await ensureModelsLoaded();
   renderWorkflows(); render(); loadConfig(); pollProgress();
-  setInterval(()=>{ pollProgress(); pollBoard(); }, 1500);
+  setInterval(()=>{ pollProgress(); pollBoard(); pollMcpHealth(); }, 1500);
+  pollMcpHealth(); loadRunCaps();
+}
+// Loop/safety caps (max_cost_usd / max_tokens) — fetched for the run-banner
+// budget row. Refreshed on load and whenever Settings are saved; not polled
+// on the 1.5s interval since caps rarely change mid-run.
+let RUN_CAPS={};
+async function loadRunCaps(){
+  try{ RUN_CAPS=await (await fetch(api('/api/settings'))).json(); }catch(e){}
+}
+let MCP_HEALTH=null;
+async function pollMcpHealth(){
+  let h; try{ h=await (await fetch(api('/api/mcp/health'))).json(); }catch(e){ return; }
+  MCP_HEALTH=h;
+  const b=$('#mcpBadge'); if(!b) return;
+  b.style.display='';
+  if(!h.running){ b.className='mcpbadge down'; b.textContent='MCP ○ down — Restart'; }
+  else if(h.stale){ b.className='mcpbadge stale'; b.textContent='MCP ▲ stale — Reload'; }
+  else { b.className='mcpbadge live'; b.textContent=`MCP ● live · ${h.tools_count} tools`; }
+  b.onclick=restartMcp;
+}
+async function restartMcp(){
+  const b=$('#mcpBadge'); if(b) b.textContent='MCP … restarting';
+  try{
+    const r=await post_('/api/mcp/restart',{});
+    if(!r.ok) alert(r.error||'restart failed');
+  }catch(e){}
+  setTimeout(pollMcpHealth, 1500);
 }
 function toolDoc(name){ return TOOL_DOCS[name] || '(custom / external tool — not a registered harn MCP tool)'; }
 /* ---------- workflow switcher (named presets) ---------- */
@@ -2231,6 +2264,14 @@ function renderFlowTerminal(el){
     const tok=(t.tok_in||0)+(t.tok_out||0);
     const cost=t.cost_usd? '$'+t.cost_usd.toFixed(4) : '—';
     const stage=PROG.active? `<span class="live">▶ ${esc(PROG.active)}</span>` : 'starting…';
+    let budget='—';
+    try{
+      const capC=RUN_CAPS.max_cost_usd||0, capT=RUN_CAPS.max_tokens||0;
+      budget=(capC||capT)
+        ? [capC?('$'+(t.cost_usd||0).toFixed(2)+' / $'+capC.toFixed(2)):'', capT?(tok+' / '+capT+' tok'):'']
+            .filter(Boolean).join('  ·  ')
+        : 'unlimited';
+    }catch(e){}
     el.innerHTML=`<div class="ttl"><span>▶ RUNNING WORKFLOW</span></div>
       <div class="kv"><span>task</span><b>${esc(BOARD.run.task_id)}</b></div>
       ${runningTask?`<div class="kv"><span>title</span><b style="font-weight:400;font-family:inherit">${esc(runningTask.title)}</b></div>`:''}
@@ -2238,6 +2279,7 @@ function renderFlowTerminal(el){
       <div class="kv"><span>time</span><b>${fmtDur(t.dur_ms)}</b></div>
       <div class="kv"><span>tokens</span><b>${tok}</b></div>
       <div class="kv"><span>cost</span><b>${cost}</b></div>
+      <div class="kv"><span>budget</span><b id="runBudget" class="mut">${esc(budget)}</b></div>
       <button class="ghost" onclick="stopRun()">■ Stop</button>`;
     return;
   }
@@ -2888,6 +2930,7 @@ function showTab(t){
 /* ---------- settings tab: default agent + model for harn run ---------- */
 async function renderSettings(){
   await ensureModelsLoaded();
+  let LM_SETTINGS={}; try{ LM_SETTINGS=await (await fetch(api('/api/settings'))).json(); }catch(e){}
   const v=$('#listView');
   const da=MODELS.default_agent||'', dm=MODELS.default_model||'';
   const agentOpts=allAgentNames().map(a=>{
@@ -2919,8 +2962,37 @@ async function renderSettings(){
       agent and model are whatever your IDE session uses — harn can't switch
       them. These defaults govern <b>harn run</b> only.
     </p>
+    <h2 style="margin-top:26px">SETTINGS — loop &amp; safety</h2>
+    <div id="loopSafetyFields"></div>
+    <h2 style="margin-top:26px">SETTINGS — MCP</h2>
+    <div id="mcpFields"></div>
   </div>`;
   $('#insp').innerHTML='<div class="empty">harn run defaults. Per-stage overrides live on each Flow step.</div>';
+  const numField=(id,label,val,hint)=>`<div class="field"><label>${label} <span class="mut">${hint}</span></label>`+
+    `<input type="number" id="${id}" value="${(val===undefined||val===null)?'':val}" min="0" step="any"/></div>`;
+  $('#loopSafetyFields').innerHTML=
+    numField('setMaxCost','Max cost per run (USD)',LM_SETTINGS.max_cost_usd,'(0 = unlimited)')+
+    numField('setMaxTokens','Max tokens per run',LM_SETTINGS.max_tokens,'(0 = unlimited)')+
+    numField('setTurnTimeout','Per-turn timeout (seconds)',LM_SETTINGS.turn_timeout_seconds,'(0 = adapter default 1800)')+
+    numField('setMaxIters','Max iterations per run',LM_SETTINGS.max_iterations,'(0 = unlimited/off)')+
+    `<button class="primary" onclick="saveLoopMcp()">Save loop &amp; MCP settings</button> <span id="lmStatus" class="status"></span>`;
+  $('#mcpFields').innerHTML=
+    `<div class="field"><label><input type="checkbox" id="setSupervise" ${LM_SETTINGS.mcp_ui_supervise?'checked':''}/> harn ui supervises an MCP server</label></div>`+
+    numField('setMcpPort','MCP port',LM_SETTINGS.mcp_ui_port,'(harn mcp --http)')+
+    numField('setReload','Tool hot-reload (seconds)',LM_SETTINGS.mcp_tool_reload_seconds,'(0 = disable live reload)');
+}
+async function saveLoopMcp(){
+  const num=id=>{const el=$('#'+id); const v=el?el.value.trim():''; return v===''?'':v;};
+  const st=$('#lmStatus'); if(st) st.textContent='saving…';
+  try{
+    const r=await post_('/api/settings',{
+      max_cost_usd:num('setMaxCost'), max_tokens:num('setMaxTokens'),
+      turn_timeout_seconds:num('setTurnTimeout'), max_iterations:num('setMaxIters'),
+      mcp_ui_supervise:$('#setSupervise')?$('#setSupervise').checked:false, mcp_ui_port:num('setMcpPort'),
+      mcp_tool_reload_seconds:num('setReload')});
+    if(st) st.textContent = r.ok ? 'saved ✓ (restart harn ui for MCP changes)' : (r.error||'save failed');
+    if(r.ok) loadRunCaps();
+  }catch(e){ if(st) st.textContent='save failed'; }
 }
 function settingsModelSelect(current,options){
   const isCustom=!!current && !options.includes(current);
