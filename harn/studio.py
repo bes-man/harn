@@ -2257,6 +2257,25 @@ function flowSelectedTaskId(){
 function flowSelectedTask(){ const id=flowSelectedTaskId(); return id&&(BOARD.tasks||[]).find(t=>t.id===id); }
 
 /* ---------- terminal "Run workflow" block — last node in the flow ---------- */
+// "View log" on the RUNNING WORKFLOW panel — surfaces BOARD.run_log (the
+// live stdout/stderr tail, already fetched every 1.5s poll regardless of
+// active tab) directly in the sidebar, so watching a run on the Flow tab
+// doesn't require switching to Board to see what the agent is actually
+// doing. Stays live: renderFlowTerminal() re-renders this panel on every
+// poll tick while VIEWING_RUN_LOG is set, same cadence as the rest of the
+// running-workflow stats.
+let VIEWING_RUN_LOG=false;
+function toggleRunLog(){
+  VIEWING_RUN_LOG=!VIEWING_RUN_LOG;
+  if(VIEWING_RUN_LOG) renderRunLogPanel(); else renderInsp();
+}
+function renderRunLogPanel(){
+  $('#insp').innerHTML=`<div class="row" style="justify-content:space-between">`+
+    `<h2 style="margin:0">Run log</h2>`+
+    `<button class="icon-btn" onclick="toggleRunLog()" title="Close">✕</button></div>`+
+    `<div class="mut" style="font-size:11px;margin-bottom:6px">live stdout/stderr tail — refreshes every 1.5s</div>`+
+    `<div class="toolDoc runlog" style="white-space:pre-wrap">${esc(BOARD.run_log||'(no output yet)')}</div>`;
+}
 function renderFlowTerminal(el){
   const runningWhole=BOARD.run&&!BOARD.run.stage;
   const runningStage=BOARD.run&&BOARD.run.stage;
@@ -2282,7 +2301,9 @@ function renderFlowTerminal(el){
       <div class="kv"><span>tokens</span><b>${tok}</b></div>
       <div class="kv"><span>cost</span><b>${cost}</b></div>
       <div class="kv"><span>budget</span><b id="runBudget" class="mut">${esc(budget)}</b></div>
+      <button class="ghost" onclick="toggleRunLog()">▤ View log</button>
       <button class="ghost" onclick="stopRun()">■ Stop</button>`;
+    if(VIEWING_RUN_LOG) renderRunLogPanel();
     return;
   }
   if(runningStage){
@@ -2291,7 +2312,9 @@ function renderFlowTerminal(el){
       <div class="mut" style="font-size:11.5px">A single step is running${BOARD.run.rerun?' (rerun)':''}: `+
       `<b>${esc(BOARD.run.stage)}</b> for <b>${esc(BOARD.run.task_id)}</b>`+
       `${runningTask?' — '+esc(runningTask.title):''}.</div>
+      <button class="ghost" onclick="toggleRunLog()">▤ View log</button>
       <button class="ghost" onclick="stopRun()">■ Stop</button>`;
+    if(VIEWING_RUN_LOG) renderRunLogPanel();
     return;
   }
   const all=flowAllTasks();

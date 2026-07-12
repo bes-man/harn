@@ -1132,7 +1132,17 @@ def tool_catalog() -> dict[str, str]:
 
 
 def serve(http: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None:
-    mcp = build_server()
+    # A PROBE invocation (healthcheck()'s spawned subprocess, e.g. the studio's
+    # MCP health badge polling every 1.5s) sets HARN_MCP_PROBE so it never
+    # mints a "chat" run_id or starts the watch daemon — it only wants a
+    # quick, side-effect-free tools/list answer. Without this, a frequent
+    # poller floods events.jsonl with bogus run_start events that clobber the
+    # shared "current run" pointer (events.new_run's .run_id file), starving
+    # progress_payload()'s active-stage detection for the REAL running loop —
+    # the exact cause of the Flow tab getting stuck showing "starting…"
+    # forever while a real run is actively executing under a different id.
+    probe = os.environ.get("HARN_MCP_PROBE") == "1"
+    mcp = build_server(start_watch=not probe)
     if http:
         mcp.settings.host = host
         mcp.settings.port = port
@@ -1162,7 +1172,9 @@ def healthcheck(env_dir, timeout: int = 40) -> tuple[bool, list[str], str]:
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     ]
     stdin = "\n".join(json.dumps(m) for m in msgs) + "\n"
-    env = {**os.environ, "HARN_ENV_DIR": str(env_dir)}
+    # HARN_MCP_PROBE tells serve() this is a health probe, not a real agent
+    # session — see the comment on serve() for why that distinction matters.
+    env = {**os.environ, "HARN_ENV_DIR": str(env_dir), "HARN_MCP_PROBE": "1"}
     try:
         p = subprocess.run([sys.executable, "-m", "harn", "mcp"],
                            input=stdin, capture_output=True, text=True,
