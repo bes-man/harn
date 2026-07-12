@@ -1113,8 +1113,10 @@ class _MCPSupervisor:
         self.proc: subprocess.Popen | None = None
         self._stop = threading.Event()
         self._restarts: list[float] = []   # timestamps, rolling 60s window
+        self._lock = threading.Lock()
 
-    def _spawn(self) -> None:
+    def _spawn_locked(self) -> None:
+        """Spawn a new child. Caller MUST hold self._lock."""
         env = {**os.environ, "HARN_ENV_DIR": str(self.env_dir)}
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "harn", "mcp", "--http",
@@ -1126,6 +1128,10 @@ class _MCPSupervisor:
         (self.env_dir / "state" / "ui_mcp.pid").write_text(
             str(self.proc.pid), encoding="utf-8")
 
+    def _spawn(self) -> None:
+        with self._lock:
+            self._spawn_locked()
+
     def start(self) -> None:
         try:
             self._spawn()
@@ -1134,35 +1140,60 @@ class _MCPSupervisor:
         threading.Thread(target=self._monitor, name="harn-mcp-sup",
                          daemon=True).start()
 
+    def _maybe_respawn(self) -> None:
+        """Check-and-spawn critical section used by the monitor loop.
+        Atomic under self._lock: dead-proc detection, the restart-budget
+        decision, the _stop re-check, and the spawn itself all happen while
+        holding the lock, so a concurrent stop()/restart() can't race a
+        respawn in here."""
+        with self._lock:
+            if self._stop.is_set():
+                return
+            if not (self.proc and self.proc.poll() is not None):
+                return
+            now = time.time()
+            self._restarts = [t for t in self._restarts if now - t < 60]
+            if len(self._restarts) >= 5:
+                return   # too many restarts this minute — leave it down
+            self._restarts.append(now)
+            try:
+                self._spawn_locked()
+            except Exception:
+                pass
+
     def _monitor(self) -> None:
         while not self._stop.is_set():
             time.sleep(2)
             if self._stop.is_set():
                 return
-            if self.proc and self.proc.poll() is not None:
-                now = time.time()
-                self._restarts = [t for t in self._restarts if now - t < 60]
-                if len(self._restarts) >= 5:
-                    continue   # too many restarts this minute — leave it down
-                self._restarts.append(now)
-                try:
-                    self._spawn()
-                except Exception:
-                    pass
+            self._maybe_respawn()
 
     def restart(self) -> None:
-        self.stop(_final=False)
-        self._spawn()
+        with self._lock:
+            self._terminate_locked()
+            # Best-effort: wait for the OS to release the listening socket
+            # before respawning on the same port. Never blocks indefinitely.
+            if self.proc is not None:
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    pass
+            self._spawn_locked()
 
-    def stop(self, _final: bool = True) -> None:
-        if _final:
-            self._stop.set()
+    def _terminate_locked(self) -> None:
+        """Terminate the current child if alive. Caller MUST hold self._lock."""
         p = self.proc
         if p and p.poll() is None:
             try:
                 p.terminate()
             except Exception:
                 pass
+
+    def stop(self, _final: bool = True) -> None:
+        with self._lock:
+            if _final:
+                self._stop.set()
+            self._terminate_locked()
         if _final:
             try:
                 (self.env_dir / "state" / "ui_mcp.pid").unlink(missing_ok=True)
