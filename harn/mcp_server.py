@@ -900,18 +900,19 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
 
     if register_custom:
         for custom_tool in tools_mod.discover(_env_dir()):
-            # Defense-in-depth: `tools.save()` validates param names before a tool
-            # ever reaches disk, but `discover()` reads harn_env/tools/*.json
+            # Defense-in-depth: `tools.save()` validates a tool before it ever
+            # reaches disk, but `discover()` reads harn_env/tools/*.json
             # directly with no validation of its own — a hand-edited file, a
-            # future Import feature, or a tool bundle shared by another user could
-            # land an unsafe param name here. `_make_tool_function` splices param
-            # names into a Python source string and `exec()`s it, so re-check
-            # every param here and skip (never crash) a tool that fails.
-            unsafe = [p for p in custom_tool.params
-                      if not tools_mod.is_safe_param_name(p)]
-            if unsafe:
-                _log(f"custom tool '{custom_tool.name}' skipped: unsafe param "
-                     f"name(s) {unsafe!r} (must match [a-z0-9_]+)")
+            # future Import feature, or a tool bundle shared by another user
+            # could land a name colliding with a built-in, a non-list
+            # `params`, or an unsafe param name here. `_custom_tool_is_registerable`
+            # is the single shared predicate (also used by `_reconcile_custom_tools`
+            # and `start_tool_reload`'s seed) so this boot loop can never drift
+            # out of sync with the reconciler again.
+            if not _custom_tool_is_registerable(custom_tool, builtin_names):
+                _log(f"custom tool '{custom_tool.name}' skipped at boot: "
+                     f"fails safety predicate (built-in name, non-list "
+                     f"params, or unsafe param name)")
                 continue
             fn = _make_tool_function(custom_tool, _env_dir().parent,
                                      _record_tool_used)
@@ -925,6 +926,28 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         start_tool_reload(mcp, interval, builtin_names)
 
     return mcp
+
+
+def _custom_tool_is_registerable(ct, builtin_names: set) -> bool:
+    """True iff this discovered custom tool is safe to register: its name is
+    not a built-in, `params` is a list, and every param is a safe string.
+
+    The single source of truth for "may this discovered tool touch the live
+    ToolManager" — used by the `build_server` boot loop, `_reconcile_custom_tools`
+    (building `safe`), AND `start_tool_reload`'s `_loop` seed. Before this
+    helper existed the three sites re-implemented the same checks by hand and
+    drifted: the boot loop had no params-is-a-list guard (a malformed
+    `"params": 123` on disk crashed `build_server()` at every startup) and the
+    daemon's seed had no `builtin_names` filter at all (a planted
+    `read_skill.json` could enter the seed `registered` set, so the very next
+    reconcile tick saw it in `registered` but not in `safe` and deleted the
+    real `read_skill` built-in via the remove-path). Never raises — `discover()`
+    reads untrusted json off disk with no schema validation of its own."""
+    if ct.name in builtin_names:
+        return False
+    if not isinstance(ct.params, list):
+        return False
+    return all(tools_mod.is_safe_param_name(p) for p in ct.params)
 
 
 def _tools_dir_signature(env_dir: Path) -> tuple:
@@ -967,33 +990,23 @@ def _reconcile_custom_tools(mcp, env_dir: Path, registered: set,
         return registered
     safe = {}
     for name, ct in discovered.items():
-        if name in builtin_names:
-            _log(f"tool reload: '{name}' skipped: shadows a built-in tool "
-                 f"name — a custom tool may never add/remove/replace a "
-                 f"built-in")
-            continue
-        # Defense-in-depth: `discover()` reads harn_env/tools/*.json directly
-        # with no schema validation, so `ct.params` may not even be a list
-        # (e.g. a hand-edited/planted file) — guard the shape before
-        # iterating it below.
-        if not isinstance(ct.params, list):
-            _log(f"tool reload: '{name}' skipped: params is not a list "
-                 f"({type(ct.params).__name__})")
-            continue
-        # Same defense-in-depth as the boot loop: `discover()` reads
-        # harn_env/tools/*.json directly with no validation of its own, so
-        # re-check every param name before it can reach `_make_tool_function`'s
-        # exec()'d source string. `is_safe_param_name` itself now tolerates a
-        # non-string param (returns False instead of raising TypeError).
-        unsafe = [p for p in ct.params if not tools_mod.is_safe_param_name(p)]
-        if unsafe:
-            _log(f"tool reload: '{name}' skipped: unsafe param(s) {unsafe!r}")
+        # Single shared predicate — also used by the `build_server` boot loop
+        # and `start_tool_reload`'s seed — so the three sites can't drift out
+        # of sync (that drift is exactly what let a planted read_skill.json
+        # delete the real built-in; see the helper's docstring).
+        if not _custom_tool_is_registerable(ct, builtin_names):
+            _log(f"tool reload: '{name}' skipped: fails safety predicate "
+                 f"(built-in name, non-list params, or unsafe param name)")
             continue
         safe[name] = ct
     changed = False
-    # Remove tools that vanished or became unsafe.
+    # Remove tools that vanished or became unsafe. `name not in builtin_names`
+    # is defense-in-depth: `safe` above already excludes built-in names, so
+    # `registered` (built from `safe` on a prior tick) should never contain
+    # one — but this guarantees `remove_tool` can never touch a built-in even
+    # if `registered` were somehow poisoned (e.g. a caller seeding it by hand).
     for name in list(registered):
-        if name not in safe:
+        if name not in safe and name not in builtin_names:
             try:
                 tm.remove_tool(name)
             except Exception:
@@ -1030,6 +1043,33 @@ def _notify_tools_changed(mcp) -> None:
         pass
 
 
+def _seed_registered(mcp, env_dir: Path, builtin_names: set | None = None) -> set:
+    """Compute `start_tool_reload`'s initial `registered` set: the names the
+    reconcile loop is allowed to consider "ours" on its very first tick.
+
+    A discovered custom tool only counts if it passes `_custom_tool_is_registerable`
+    — in particular, a name that collides with a built-in (e.g. an attacker or
+    a hand-edited file planting `harn_env/tools/read_skill.json` BEFORE the
+    daemon starts) must never enter this set. Without that filter the built-in
+    would be seeded into `registered`, then the first reconcile tick would see
+    it correctly absent from `safe` (the reconciler excludes built-ins) and
+    delete it via the remove-path — destroying a real built-in tool and never
+    re-adding it. Factored out as a standalone module-level function (rather
+    than an inline closure in `_loop`) so it's independently unit-testable.
+    Never raises — falls back to an empty set on any `discover()` failure."""
+    builtin_names = builtin_names or set()
+    try:
+        discovered = {c.name: c for c in tools_mod.discover(env_dir)}
+        live_names = {t.name for t in mcp._tool_manager.list_tools()}
+        return {
+            name for name, ct in discovered.items()
+            if name in live_names
+            and _custom_tool_is_registerable(ct, builtin_names)
+        }
+    except Exception:
+        return set()
+
+
 def start_tool_reload(mcp, interval_s: int, builtin_names: set | None = None) -> None:
     """Daemon watcher: poll harn_env/tools/ every interval_s and reconcile the
     live server. interval_s <= 0 disables it. Never blocks server startup and
@@ -1045,11 +1085,7 @@ def start_tool_reload(mcp, interval_s: int, builtin_names: set | None = None) ->
     builtin_names = builtin_names or set()
 
     def _loop():
-        try:
-            registered = {t.name for t in mcp._tool_manager.list_tools()
-                          if t.name in {c.name for c in tools_mod.discover(env_dir)}}
-        except Exception:
-            registered = set()
+        registered = _seed_registered(mcp, env_dir, builtin_names)
         last = _tools_dir_signature(env_dir)
         while True:
             try:
