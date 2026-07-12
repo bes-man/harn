@@ -15,8 +15,12 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import os
 import re
+import subprocess
+import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +28,7 @@ from pathlib import Path
 
 from . import attachments as attachments_mod
 from . import events as events_mod
+from . import mcp_server
 from . import runner as runner_mod
 from . import skills as skills_mod
 from . import state as state_mod
@@ -162,7 +167,7 @@ def tools_catalog_payload(env_dir: Path) -> dict:
     note (what/why/when) from tool_notes.py. The note is UI-only — it never
     touches the agent-facing docstring, so the agent's fixed context budget
     is unaffected by how much explanation a human browsing the UI needs."""
-    from . import mcp_server, tool_notes
+    from . import tool_notes
     catalog = mcp_server.tool_catalog()
     custom = [
         {"name": t.name, "description": t.description, "params": t.params,
@@ -187,7 +192,6 @@ def save_custom_tool_payload(env_dir: Path, payload: dict) -> dict:
     (e.g. "bash lint.sh") can find it at the agent's next MCP session —
     custom tools are only re-registered when a new session starts, never
     picked up by one already running."""
-    from . import mcp_server
     name = (payload.get("name") or "").strip()
     description = payload.get("description") or ""
     params = payload.get("params") or []
@@ -243,7 +247,6 @@ def import_custom_tool_bundle_payload(env_dir: Path, payload: dict) -> dict:
     routes through the SAME tools_mod.save() gate as every other tool
     creation path; this function does not write the tool's JSON or any
     sibling script itself."""
-    from . import mcp_server
     try:
         data = base64.b64decode(payload.get("content_b64") or "", validate=True)
     except Exception:
@@ -974,6 +977,8 @@ def _make_handler(default_env: Path):
                 self._json(blocked_question_payload(env, self._query("task") or ""))
             elif route == "/api/models":
                 self._json(models_payload(env))
+            elif route == "/api/mcp/health":
+                self._json(mcp_health_payload(env))
             elif route == "/api/task_plan":
                 self._json(task_plan_payload(env, self._query("task") or ""))
             elif route == "/api/task_plan/step_prompt":
@@ -1067,6 +1072,8 @@ def _make_handler(default_env: Path):
                 self._json(save_task_plan_route(env, body))
             elif route == "/api/defaults":
                 self._json(save_defaults(env, body))
+            elif route == "/api/mcp/restart":
+                self._json(restart_mcp_payload(env))
             elif route == "/api/task_plan/step_prompt/export":
                 self._json(step_prompt_export_payload(
                     env, body.get("task", ""), body.get("step", ""),
@@ -1077,11 +1084,116 @@ def _make_handler(default_env: Path):
     return Handler
 
 
+def mcp_health_payload(env_dir: Path) -> dict:
+    """What the studio's MCP badge needs. `running`/`tools_count` come from a
+    fresh healthcheck subprocess; `stale` is true when a custom tool exists on
+    disk but the live server isn't serving it — the exact PRJ-044 condition."""
+    cfg = Config.load(env_dir)
+    disk = sorted(t.name for t in tools_mod.discover(env_dir))
+    try:
+        ok, tools, err = mcp_server.healthcheck(env_dir)
+    except Exception as exc:
+        ok, tools, err = False, [], str(exc)
+    live_custom = sorted(n for n in tools if n in set(disk))
+    stale = ok and bool(set(disk) - set(live_custom))
+    return {"running": bool(ok), "port": cfg.mcp_ui_port,
+            "tools_count": len(tools), "custom_names": live_custom,
+            "disk_custom_names": disk, "stale": stale, "error": err or "",
+            "supervised": bool(cfg.mcp_ui_supervise)}
+
+
+class _MCPSupervisor:
+    """Owns a `harn mcp --http` child for the studio: starts it, restarts it if
+    it dies (bounded to avoid hot-looping), stops it on shutdown. Best-effort —
+    the studio serves fine even if the child never comes up (the badge shows
+    'down')."""
+    def __init__(self, env_dir: Path, port: int):
+        self.env_dir = env_dir
+        self.port = port
+        self.proc: subprocess.Popen | None = None
+        self._stop = threading.Event()
+        self._restarts: list[float] = []   # timestamps, rolling 60s window
+
+    def _spawn(self) -> None:
+        env = {**os.environ, "HARN_ENV_DIR": str(self.env_dir)}
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "harn", "mcp", "--http",
+             "--host", "127.0.0.1", "--port", str(self.port)],
+            cwd=str(self.env_dir.parent), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        (self.env_dir / "state").mkdir(parents=True, exist_ok=True)
+        (self.env_dir / "state" / "ui_mcp.pid").write_text(
+            str(self.proc.pid), encoding="utf-8")
+
+    def start(self) -> None:
+        try:
+            self._spawn()
+        except Exception:
+            return
+        threading.Thread(target=self._monitor, name="harn-mcp-sup",
+                         daemon=True).start()
+
+    def _monitor(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(2)
+            if self._stop.is_set():
+                return
+            if self.proc and self.proc.poll() is not None:
+                now = time.time()
+                self._restarts = [t for t in self._restarts if now - t < 60]
+                if len(self._restarts) >= 5:
+                    continue   # too many restarts this minute — leave it down
+                self._restarts.append(now)
+                try:
+                    self._spawn()
+                except Exception:
+                    pass
+
+    def restart(self) -> None:
+        self.stop(_final=False)
+        self._spawn()
+
+    def stop(self, _final: bool = True) -> None:
+        if _final:
+            self._stop.set()
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if _final:
+            try:
+                (self.env_dir / "state" / "ui_mcp.pid").unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+_SUPERVISOR: _MCPSupervisor | None = None
+
+
+def restart_mcp_payload(env_dir: Path) -> dict:
+    if _SUPERVISOR is None:
+        return {"ok": False, "error": "MCP supervision is off "
+                "([mcp] ui_supervise = false)"}
+    try:
+        _SUPERVISOR.restart()
+        return {"ok": True, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def serve(env_dir: Path, *, host: str = "127.0.0.1", port: int = 9999,
           open_browser: bool = True) -> None:
     """Block serving the studio until Ctrl-C. `env_dir` is the DEFAULT project;
     other projects open via ?env=<path> (multi-project, one server)."""
+    global _SUPERVISOR
     workflow_mod.write(env_dir)  # ensure WORKFLOW.md exists
+    cfg = Config.load(env_dir)
+    if cfg.mcp_ui_supervise:
+        _SUPERVISOR = _MCPSupervisor(env_dir, cfg.mcp_ui_port)
+        _SUPERVISOR.start()
     httpd = ThreadingHTTPServer((host, port), _make_handler(env_dir))
     url = f"http://{host}:{port}"
     print(f"[harn] studio at {url}  (Ctrl-C to stop)")
@@ -1093,6 +1205,8 @@ def serve(env_dir: Path, *, host: str = "127.0.0.1", port: int = 9999,
     except KeyboardInterrupt:
         print("\n[harn] studio stopped.")
     finally:
+        if _SUPERVISOR is not None:
+            _SUPERVISOR.stop()
         httpd.server_close()
 
 
