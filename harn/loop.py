@@ -17,6 +17,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -658,7 +659,8 @@ def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> Non
 
 
 def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
-                      step: dict, steps: list[dict], cfg: Config, adapter) -> str:
+                      step: dict, steps: list[dict], cfg: Config, adapter,
+                      spend: "_RunSpend | None" = None) -> str:
     """Run a `type: command` step's shell command (harn/feedback.py's
     run_feedback) instead of an agent turn. Unlike agent-turn steps, a
     command step's ledger entry is written UNCONDITIONALLY — even in `auto`
@@ -719,11 +721,13 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     # callers that never hit a live on_fail handler (the common case) should
     # never have to resolve or even validate one.
     adapter = adapter or _pick_adapter(cfg)
-    return _run_onfail_handler(env_dir, project_root, task, step, handler, cfg, adapter)
+    return _run_onfail_handler(env_dir, project_root, task, step, handler, cfg,
+                               adapter, spend=spend)
 
 
 def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
-                        failing_step: dict, handler: dict, cfg: Config, adapter) -> str:
+                        failing_step: dict, handler: dict, cfg: Config, adapter,
+                        spend: "_RunSpend | None" = None) -> str:
     """Dispatch a command step's `on_fail` target as ONE agent turn, reusing
     the same machinery `run()`'s main branch uses for agent steps. The
     handler's prompt gets an extra context block describing the failure
@@ -752,7 +756,8 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
     result = _run_turn(handler_adapter, env_dir, prompt, project_root,
                        task_id=task.id, stage=hid, step_title=handler.get("title", ""),
                        overrides=_step_overrides(cfg, handler),
-                       tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+                       tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg,
+                       spend=spend)
     ended = tasks._now_iso()
     state_dir = env_dir / "state"
     st = state.State.load(state_dir)
@@ -767,6 +772,22 @@ def _run_onfail_handler(env_dir: Path, project_root: Path, task: "tasks.Task",
                               "tokens": result.total_tokens}
     tasks._save(task)
     return "handled"
+
+
+class _RunSpend:
+    """Thread-safe cumulative spend for ONE run() call. Parallel-wave members
+    call add() concurrently, so the += is lock-guarded. Never reset within a
+    run — this is the budget guard's source of truth across ALL agent turns
+    (sequential, wave members, on_fail handlers, merge turns)."""
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.cost = 0.0
+        self.tok = 0
+
+    def add(self, cost_usd, total_tokens) -> None:
+        with self._lock:
+            self.cost += (cost_usd or 0.0)
+            self.tok += (total_tokens or 0)
 
 
 def _over_budget(run_cost: float, run_tok: int, cfg) -> str:
@@ -786,11 +807,35 @@ def _over_budget(run_cost: float, run_tok: int, cfg) -> str:
     return ""
 
 
+def _block_on_budget(env_dir: Path, cfg: Config, st: "state.State", state_dir: Path,
+                     task: "tasks.Task", over: str, *, sid: str | None = None,
+                     agent_name: str = "", auto: bool = False) -> None:
+    """The shared BLOCKED write-sequence for the run-level budget guard,
+    fired at each of run()'s checkpoints — after a sequential step's turn,
+    after a command/on_fail-handler step, and after a parallel wave — so an
+    overspend from ANY in-run agent turn stops the run the same way. Mirrors
+    the exact write order Task 2 established (and that the `unused_required`
+    BLOCKED path also uses): marker file -> state transition -> save ->
+    event -> best-effort ledger/progress note. `sid` is omitted for the
+    wave checkpoint (no single step "owns" a fan-out overspend)."""
+    state.blocked_marker(state_dir).write_text(over, encoding="utf-8")
+    st.block(over)
+    st.save(state_dir)
+    events.emit(env_dir, "block", task_id=task.id, stage=sid, detail=over[:300])
+    if not auto:
+        if sid:
+            task.step_results[sid] = {**task.step_results.get(sid, {}),
+                                      "status": "blocked"}
+            tasks._save(task)
+        progress.log(env_dir, f"{task.id}: {over}", agent=agent_name)
+    print(f"[harn] {task.id}: {over}")
+
+
 def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
               task_id: str, stage: str, tok_totals: dict, tok_costs: dict,
               cfg: Config, verdict: str | None = None,
               overrides: dict | None = None, step_title: str | None = None,
-              timeout: int | None = None):
+              timeout: int | None = None, spend: "_RunSpend | None" = None):
     """Run one agent turn and emit a structured stage_start/stage_end pair.
 
     Centralising the run_turn call guarantees that EVERY completed agent cycle
@@ -803,6 +848,13 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     that step's human title, emitted alongside so the trace reads clearly.
     `overrides` are the run_turn kwargs (model/effort/temperature) for this
     step — the caller passes `_step_overrides(cfg, step)`.
+
+    `spend`, when given, is fed this turn's usage too — this is THE single
+    choke point every in-run agent turn passes through (sequential, wave
+    members, on_fail handlers, merge turns), so feeding the run-level budget
+    accumulator here guarantees complete coverage regardless of call site.
+    `None` (the `run_step` single-step entry point's call, which has no
+    run-level budget) is a perfect no-op.
     """
     events.emit(env_dir, "stage_start", task_id=task_id, stage=stage,
                 agent=adapter.name, step_title=step_title)
@@ -818,6 +870,8 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
         raise
     dur_ms = int((time.time() - t0) * 1000)
     _accumulate(tok_totals, tok_costs, task_id, res)
+    if spend is not None:
+        spend.add(res.cost_usd, res.total_tokens)
     lines = [ln for ln in (res.text or "").strip().splitlines() if ln.strip()]
     events.emit(env_dir, "stage_end", task_id=task_id, stage=stage,
                 agent=adapter.name, ok=res.ok, step_title=step_title,
@@ -1412,7 +1466,7 @@ def _conflict_markers_in_tree(project_root: Path) -> dict[str, str]:
 
 def _run_merge_agent_turn(env_dir: Path, project_root: Path, task: "tasks.Task",
                           merged_so_far: list[dict], conflicting_step: dict,
-                          cfg: Config) -> str:
+                          cfg: Config, spend: "_RunSpend | None" = None) -> str:
     """Dispatch ONE agent turn, in the MAIN tree, to resolve a wave-merge
     conflict left by a failed `gitutil.apply_patch` call. Reuses the normal
     `_run_turn`/`_handle_block` machinery (same shape as
@@ -1451,7 +1505,7 @@ def _run_merge_agent_turn(env_dir: Path, project_root: Path, task: "tasks.Task",
     _run_turn(adapter, env_dir, prompt, project_root,
              task_id=task.id, stage=stage,
              step_title=f"Merge: {conflicting_step.get('title', '')}",
-             tok_totals={}, tok_costs={}, cfg=cfg)
+             tok_totals={}, tok_costs={}, cfg=cfg, spend=spend)
     state_dir = env_dir / "state"
     st = state.State.load(state_dir)
     b = _handle_block(env_dir, cfg, st, state_dir, task, auto=False)
@@ -1466,7 +1520,7 @@ def _run_merge_agent_turn(env_dir: Path, project_root: Path, task: "tasks.Task",
 
 def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
                         wave: list[dict], results: dict, base_ref: str,
-                        cfg: Config) -> str:
+                        cfg: Config, spend: "_RunSpend | None" = None) -> str:
     """Apply each wave member's captured patch into the main tree, ONE AT A
     TIME, in wave order, and ledger the outcome.
 
@@ -1557,7 +1611,7 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
         # with whatever's already been merged into the tree.
         tasks._save(task)
         outcome_turn = _run_merge_agent_turn(env_dir, project_root, task,
-                                             merged_so_far, step, cfg)
+                                             merged_so_far, step, cfg, spend=spend)
         if outcome_turn == "blocked":
             task.step_results[sid] = {"status": "blocked", "started": started,
                                       "ended": tasks._now_iso()}
@@ -1575,7 +1629,8 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
 
 
 def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
-                       wave: list[dict], cfg: Config, default_adapter) -> str:
+                       wave: list[dict], cfg: Config, default_adapter,
+                       spend: "_RunSpend | None" = None) -> str:
     """Run every step in `wave` concurrently, each in its own git worktree
     checked out from a shared checkpoint, then hand the captured patches to
     `_merge_wave_patches`.
@@ -1647,7 +1702,8 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                     result = _run_turn(step_adapter, env_dir, prompt, wt,
                                       task_id=task.id, stage=sid, step_title=title,
                                       overrides=_step_overrides(cfg, step),
-                                      tok_totals={}, tok_costs={}, cfg=cfg)
+                                      tok_totals={}, tok_costs={}, cfg=cfg,
+                                      spend=spend)
                     ok = result.ok
                 except Exception:
                     # _run_turn already emitted the `error` event before
@@ -1674,7 +1730,7 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                 gitutil.remove_worktree(project_root, wt)
 
         return _merge_wave_patches(env_dir, project_root, task, wave, results,
-                                   base_ref, cfg)
+                                   base_ref, cfg, spend=spend)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -1722,8 +1778,14 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     feedback_tail = ""
     tok_totals: dict[str, int] = {}
     tok_costs: dict[str, float] = {}
-    run_cost_total = 0.0     # cumulative across the WHOLE run (never popped)
-    run_tok_total = 0        # — the budget guard's source of truth
+    # Cumulative across the WHOLE run (never reset) — the budget guard's
+    # source of truth across EVERY in-run agent turn: sequential steps, an
+    # on_fail handler's turn, a wave-merge conflict turn, and each parallel
+    # wave member's turn (the last of these adds concurrently, hence the
+    # lock inside _RunSpend). Threaded down through _run_command_step /
+    # _run_parallel_wave into _run_turn, the single choke point every agent
+    # turn passes through.
+    spend = _RunSpend()
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
     # Debounces the post-step required-usage enforcement retry (Phase 4) to
@@ -1830,7 +1892,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 pending_wave = [s for s in wave if not _step_done(s.get("id"))]
                 if pending_wave:
                     outcome = _run_parallel_wave(env_dir, project_root, task,
-                                                 pending_wave, cfg, adapter)
+                                                 pending_wave, cfg, adapter,
+                                                 spend=spend)
                     if outcome in ("blocked", "conflict_unresolved"):
                         # _merge_wave_patches (inside _run_parallel_wave) loads
                         # and saves its OWN `state.State` instance when it
@@ -1838,13 +1901,32 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                         # reflects that before `_run_end` reports it.
                         st = state.State.load(state_dir)
                         return _run_end(env_dir, st)
+                    # A wave runs to completion before this check fires — it
+                    # cannot be cleanly killed mid-wave (members are already
+                    # dispatched/merged). That's expected: the guard stops
+                    # the NEXT iteration from starting, bounding the overspend
+                    # to at most one wave rather than letting it run unbounded.
+                    over = _over_budget(spend.cost, spend.tok, cfg)
+                    if over:
+                        _block_on_budget(env_dir, cfg, st, state_dir, task, over,
+                                        agent_name=adapter.name, auto=auto)
+                        return _run_end(env_dir, st)
                     for s in pending_wave:
                         done_ids.add(s.get("id") or "")
                 continue
 
             if step.get("type") == "command":
                 outcome = _run_command_step(env_dir, project_root, task, step, steps,
-                                            cfg, adapter)
+                                            cfg, adapter, spend=spend)
+                # Checked here (not just after the sequential-step turn below)
+                # so an on_fail-handler-driven overspend — invisible to the
+                # old sequential-only guard — stops the run before the same
+                # command step is naturally re-selected next iteration.
+                over = _over_budget(spend.cost, spend.tok, cfg)
+                if over:
+                    _block_on_budget(env_dir, cfg, st, state_dir, task, over,
+                                    sid=sid, agent_name=adapter.name, auto=auto)
+                    return _run_end(env_dir, st)
                 if outcome == "blocked":
                     return _run_end(env_dir, st)
                 if outcome == "advance":
@@ -1904,25 +1986,14 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 project_root, task_id=task.id, stage=sid, step_title=title,
                 overrides=_step_overrides(cfg, step),
                 tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg,
-                timeout=cfg.turn_timeout_seconds)
+                timeout=cfg.turn_timeout_seconds, spend=spend)
             st.current_step = None
             st.save(state_dir)
 
-            run_cost_total += (result.cost_usd or 0.0)
-            run_tok_total += (result.total_tokens or 0)
-            over = _over_budget(run_cost_total, run_tok_total, cfg)
+            over = _over_budget(spend.cost, spend.tok, cfg)
             if over:
-                state.blocked_marker(state_dir).write_text(over, encoding="utf-8")
-                st.block(over)
-                st.save(state_dir)
-                events.emit(env_dir, "block", task_id=task.id, stage=sid,
-                            detail=over[:300])
-                if not auto:
-                    task.step_results[sid] = {**task.step_results.get(sid, {}),
-                                              "status": "blocked"}
-                    tasks._save(task)
-                    progress.log(env_dir, f"{task.id}: {over}", agent=step_adapter.name)
-                print(f"[harn] {task.id}: {over}")
+                _block_on_budget(env_dir, cfg, st, state_dir, task, over,
+                                sid=sid, agent_name=step_adapter.name, auto=auto)
                 return _run_end(env_dir, st)
 
             last_step_text = result.text or ""
