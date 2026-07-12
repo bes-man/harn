@@ -45,6 +45,15 @@ class AgentResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+    # Of `input_tokens`, how many were CACHE READS (already-processed context
+    # re-fed on each internal agentic round). Reported separately because a
+    # single normal Claude Code turn re-reads its context many times, so cache
+    # reads dominate the raw token count (a $0.12 turn can report 540k
+    # "tokens", ~410k of them cache reads). They cost ~10x less than fresh
+    # input, so the run-budget guard EXCLUDES them (see loop._RunSpend) —
+    # otherwise the token cap trips on the first normal turn. Kept folded into
+    # `input_tokens` for display continuity; the budget subtracts this.
+    cache_read_tokens: int | None = None
 
     @property
     def total_tokens(self) -> int | None:

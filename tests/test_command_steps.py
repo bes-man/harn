@@ -55,6 +55,82 @@ def _step(title, **kw):
     return base
 
 
+def test_failing_test_cmd_does_not_loop_a_step_that_changed_nothing(tmp_path, monkeypatch):
+    # Regression (found live on a real project): the test-feedback gate re-ran
+    # a step whenever test_cmd failed, even if that step changed ZERO files. A
+    # data-fetch/analysis step (or any turn that touches no code) can't have
+    # broken the build, so a pre-existing test failure there is not its
+    # concern -- looping it just burns turns until the attempt cap BLOCKs the
+    # run. With test_cmd = "false" (always fails) and an agent that changes
+    # nothing, the step must ADVANCE (task -> review), not loop.
+    _git(["init", "-q"], tmp_path); _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = "false"\nrequire_tests = false\n'
+        "[loop]\nmax_iterations = 20\n[notify]\nwait_for_reply = false\n")
+    (tmp_path / "app.py").write_text("x = 1\n")
+    _git(["add", "-A"], tmp_path); _git(["commit", "-qm", "base"], tmp_path)
+    # Simulate a REAL project: the developer already has unrelated uncommitted
+    # changes in the working tree. The guard must diff against the STEP's
+    # checkpoint, not the whole tree, so this pre-existing edit does NOT count
+    # as "this step changed code" (the earlier whole-tree version wrongly did).
+    (tmp_path / "app.py").write_text("x = 999  # developer's own WIP\n")
+    t = make_task(env, "PRJ-001", title="Fetch data")
+    workflows.save_task_plan(env, t.id, {"preamble": "", "nodes": [
+        _step("Fetch", id="step-f1")]})   # agent-turn step, changes nothing itself
+
+    fake = RecordingAdapter()               # ok=True, writes nothing
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 1             # ran ONCE, not looped to the cap
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["step-f1"]["status"] == "ok"
+    assert fresh.status == tasks.REVIEW     # advanced to review, not blocked
+
+
+def test_failing_test_cmd_still_loops_when_the_step_changed_code(tmp_path, monkeypatch):
+    # Companion to the above: when the step DOES change a project file and
+    # tests fail, the gate must still loop (its original, correct behavior) so
+    # the agent gets a chance to fix what it broke.
+    _git(["init", "-q"], tmp_path); _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = "false"\nrequire_tests = false\n'
+        "[loop]\nmax_iterations = 20\n[notify]\nwait_for_reply = false\n")
+    (tmp_path / "app.py").write_text("x = 1\n")
+    _git(["add", "-A"], tmp_path); _git(["commit", "-qm", "base"], tmp_path)
+    t = make_task(env, "PRJ-002", title="Change code")
+    workflows.save_task_plan(env, t.id, {"preamble": "", "nodes": [
+        _step("Edit", id="step-e1")]})
+
+    # This adapter writes a project file on every turn — a real code change.
+    class WritingAdapter(RecordingAdapter):
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            (Path(cwd) / "app.py").write_text(f"x = {len(self.calls)+2}\n")
+            return super().run_turn(prompt, cwd, timeout=timeout, **kw)
+
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+    loop.run(tmp_path, env)
+
+    # Changed code + failing tests → looped (not a single advance); the attempt
+    # cap eventually stops it, but it must have re-run more than once.
+    assert len(fake.calls) >= 2
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["step-e1"]["status"] == "blocked"
+
+
 def test_successful_command_step_advances_without_agent_call(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Tests", id="step-t1", type="command", command="true"),

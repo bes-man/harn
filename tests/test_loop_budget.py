@@ -74,6 +74,25 @@ def test_run_spend_add_tolerates_none():
     assert spend.tok == 50
 
 
+def test_run_spend_excludes_cache_read_tokens():
+    # Regression: a normal $0.12 Claude turn reports ~540k tokens, ~410k of
+    # them cache reads (cheap context re-reads). Counting those made the token
+    # budget trip on the FIRST turn of every task. The budget must count only
+    # non-cache tokens (fresh input + cache creation + output).
+    spend = _RunSpend()
+    spend.add(0.12, 541626, 410000)      # total 541626, of which 410000 cache reads
+    assert spend.cost == pytest.approx(0.12)
+    assert spend.tok == 541626 - 410000  # 131626 counted, not 541626
+    # A pathological/garbage cache_read larger than total must not go negative.
+    spend2 = _RunSpend()
+    spend2.add(0.0, 100, 999999)
+    assert spend2.tok == 0
+    # cache_read defaults to 0 (older adapters that don't report it).
+    spend3 = _RunSpend()
+    spend3.add(0.0, 100)
+    assert spend3.tok == 100
+
+
 def test_run_turn_spend_none_is_a_no_op():
     """The run_step path calls _run_turn without `spend` at all — confirm the
     default is None and behavior (return value) is identical either way."""

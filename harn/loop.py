@@ -805,10 +805,19 @@ class _RunSpend:
         self.cost = 0.0
         self.tok = 0
 
-    def add(self, cost_usd, total_tokens) -> None:
+    def add(self, cost_usd, total_tokens, cache_read_tokens=0) -> None:
+        # EXCLUDE cache-read tokens from the budget count: they are re-reads of
+        # already-processed context (each internal agentic round re-feeds the
+        # cached prompt), cost ~10x less than fresh input, and dominate the raw
+        # count — one normal $0.12 Claude turn reports ~540k tokens of which
+        # ~410k are cache reads. Counting them made the token cap trip on the
+        # FIRST normal turn of every task while real cost was trivial. What
+        # remains (fresh input + cache creation + output) is the real
+        # new-token spend, the meaningful runaway signal; `cost` is the primary
+        # guard. Never let the subtraction go negative.
         with self._lock:
             self.cost += (cost_usd or 0.0)
-            self.tok += (total_tokens or 0)
+            self.tok += max(0, (total_tokens or 0) - (cache_read_tokens or 0))
 
 
 def _over_budget(run_cost: float, run_tok: int, cfg) -> str:
@@ -892,7 +901,7 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     dur_ms = int((time.time() - t0) * 1000)
     _accumulate(tok_totals, tok_costs, task_id, res)
     if spend is not None:
-        spend.add(res.cost_usd, res.total_tokens)
+        spend.add(res.cost_usd, res.total_tokens, res.cache_read_tokens)
     lines = [ln for ln in (res.text or "").strip().splitlines() if ln.strip()]
     events.emit(env_dir, "stage_end", task_id=task_id, stage=stage,
                 agent=adapter.name, ok=res.ok, step_title=step_title,
@@ -2067,9 +2076,33 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 continue  # let the agent decide and retry the same step
 
             # 2) Feedback signal (project test command) — re-run the SAME step
+            #    ONLY if this step actually changed code. A step that touched
+            #    no files (a data-fetch/read/analysis step, or an agent that
+            #    just answered a question) cannot have broken the build, so a
+            #    failing test_cmd there is PRE-EXISTING and not this step's
+            #    concern — looping it just burns turns until the attempt cap
+            #    (seen live: a "fetch weather + rate" step that changed nothing
+            #    got re-run to death because the project's own validate script
+            #    was already failing). When the step DID change files, the gate
+            #    behaves exactly as before: failing tests → loop to fix them.
             fb = run_feedback(cfg.test_cmd, project_root)
             feedback_tail = fb.tail()
-            if fb.ran and not fb.ok:
+            # Loop on a failing test_cmd ONLY when THIS step actually changed
+            # project code. Diff against the step's own pre-turn checkpoint
+            # (stage_checkpoints[sid], captured by _checkpoint_stage right
+            # before the turn) — NOT the whole working tree, which in a real
+            # project is full of the developer's own unrelated uncommitted
+            # changes — and exclude harn's own bookkeeping under harn_env/.
+            # A step that fetched data / answered a question / read code and
+            # touched nothing cannot have broken the build, so a pre-existing
+            # test_cmd failure there is not its concern; looping it just burns
+            # turns until the attempt cap (seen live: a "fetch weather + rate"
+            # step re-run to death because the project's own validate script
+            # was already failing regardless).
+            step_changed_code = bool(gitutil.files_touched_vs(
+                task.stage_checkpoints.get(sid, ""), project_root,
+                exclude=(env_dir.name + "/",)))
+            if fb.ran and not fb.ok and step_changed_code:
                 print("[harn] Tests failing; looping to let the agent fix them.")
                 continue  # same step, with failure as feedback
 

@@ -110,6 +110,25 @@ def diffstat_since(ref: str, cwd: Path) -> str:
     return out if code == 0 else ""
 
 
+def files_touched_vs(ref: str, cwd: Path, exclude: tuple[str, ...] = ()) -> list[str]:
+    """Files that differ between `ref` and the CURRENT working tree — i.e. ONLY
+    what changed SINCE that checkpoint, precisely.
+
+    Unlike `changed_since` (which also unions the raw index-vs-worktree diff and
+    is meant for rollback), this runs a single `git diff --name-only <ref>`, so
+    when `ref` is a pre-turn checkpoint that already captured the developer's
+    unrelated WIP, the result is exactly what THIS turn added — the developer's
+    pre-existing uncommitted edits do not leak in. `exclude` skips path prefixes
+    (e.g. 'harn_env/'). Empty/invalid ref → [] (best-effort, never raises)."""
+    if not ref:
+        return []
+    code, out, _ = _run(["diff", "--name-only", ref], cwd)
+    if code != 0 or not out:
+        return []
+    return [f for f in out.splitlines()
+            if f and not any(f.startswith(p) for p in exclude)]
+
+
 @dataclass
 class RollbackResult:
     ok: bool

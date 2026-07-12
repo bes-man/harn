@@ -2615,6 +2615,11 @@ $('#surface').addEventListener('pointerdown',e=>{
   const node=e.target.closest('.node');
   if(node&&node.classList.contains('terminal')) return;   // not a workflow step — never draggable/selectable
   if(node){
+    // Clicking a step means "I want THIS step's settings" — leave the run-log
+    // view so the 1.5s poll's renderFlowTerminal() stops overwriting the
+    // inspector with the log every tick (that overwrite was the bug where a
+    // step click still showed the run log instead of the step editor).
+    VIEWING_RUN_LOG=false;
     const i=+node.dataset.i; selNode=S.workflow.nodes[i]; bodyMode='preview'; highlight(); renderInsp();
     drag={el:node,title:selNode.title,sx:e.clientX,sy:e.clientY,
           ox:node.offsetLeft,oy:node.offsetTop,moved:false};
@@ -3066,6 +3071,7 @@ function editSkill(name){ showTab('skills'); skillSel=S.skills.findIndex(s=>s.na
   renderSkills(); renderSkillEditor(); }
 function goToNode(title){
   showTab('flow');
+  VIEWING_RUN_LOG=false;   // selecting a node → show its settings, not the log
   selNode=S.workflow.nodes.find(n=>n.title===title)||selNode;
   highlight(); renderInsp();
   const el=document.querySelector('.node.sel');

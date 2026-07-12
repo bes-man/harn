@@ -38,7 +38,20 @@ class ClaudeAdapter(Adapter):
                 ok=False,
                 text="claude CLI not found on PATH. Install claude first.",
             )
-        argv = ([self.binary, "-p", prompt, "--output-format", "json"]
+        # `--permission-mode bypassPermissions` is REQUIRED for headless
+        # operation: in `-p` mode there is no human to approve a tool call, so
+        # without this every MCP/Bash/Edit tool the agent tries to use is
+        # silently denied and the turn burns its whole budget writing "I need
+        # permission to call these tools" instead of doing the work (confirmed
+        # live: a task needing two custom MCP tools produced ZERO tool_used
+        # events across many runs, each turn ending with a permission plea).
+        # harn is by definition an autonomous background runner — the studio's
+        # own Launch dialog says "an agent will start making changes in the
+        # background" — so bypassing the interactive gate is the correct trust
+        # model here, not a shortcut. (Per Claude Code docs this is the CLI
+        # equivalent of the deprecated --dangerously-skip-permissions.)
+        argv = ([self.binary, "-p", prompt, "--output-format", "json",
+                 "--permission-mode", "bypassPermissions"]
                 + self._model_args(model, effort, temperature))
         r = self._exec(argv, cwd, timeout)
         if r.timed_out:
@@ -67,4 +80,5 @@ class ClaudeAdapter(Adapter):
             input_tokens=inp,
             output_tokens=usage.get("output_tokens"),
             cost_usd=data.get("total_cost_usd"),
+            cache_read_tokens=usage.get("cache_read_input_tokens"),
         )
