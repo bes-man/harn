@@ -644,6 +644,18 @@ _REQUIRED_UNUSED_RETRY_NOTE = (
     "finishing this step."
 )
 
+# Cross-relaunch attempt cap for agent-turn steps. Every OTHER retry guard in
+# this file (enforcement_retried, _RunSpend) lives in a local variable inside
+# run() — it resets the moment a NEW `harn run` process starts, which is
+# exactly what studio/watch does on every relaunch. A task whose step keeps
+# hitting the SAME dead end (an un-callable tool, a permission gate) then gets
+# a fresh in-memory retry/budget allowance on every relaunch, so the
+# AGGREGATE spend across relaunches is unbounded even though each individual
+# process behaved correctly on its own — this is what actually happened on a
+# real task that burned its budget three separate times in a row. `attempts`
+# is persisted on task.step_results[sid], so this cap survives relaunches.
+_MAX_STEP_ATTEMPTS = 2
+
 
 def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> None:
     """Snapshot the working tree right before this stage's turn runs (see
@@ -1950,6 +1962,26 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
 
             step_adapter = _adapter_for_step(cfg, step, adapter)
 
+            # Persisted attempt cap — see _MAX_STEP_ATTEMPTS's comment for why
+            # this can't just be an in-memory set like enforcement_retried.
+            prior_attempts = (task.step_results.get(sid) or {}).get("attempts", 0)
+            if not auto and prior_attempts >= _MAX_STEP_ATTEMPTS:
+                detail = (f"Step '{title}' ({sid}) has already been attempted "
+                         f"{prior_attempts} times without succeeding — stopping "
+                         "to avoid repeating the same failure across relaunches. "
+                         "Check the step's tools/prompt (or grant any needed "
+                         "permissions), then Resume.")
+                state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+                st.block(detail)
+                st.save(state_dir)
+                events.emit(env_dir, "block", task_id=task.id, stage=sid,
+                            detail=detail[:300])
+                task.step_results[sid] = {**task.step_results.get(sid, {}),
+                                          "status": "blocked"}
+                tasks._save(task)
+                print(f"[harn] {task.id} · {title}: BLOCKED — {detail}")
+                return _run_end(env_dir, st)
+
             # ── STEP TURN ────────────────────────────────────────────────────
             if not auto:
                 tasks.set_status(task, tasks.IN_PROGRESS)
@@ -1983,7 +2015,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             started = tasks._now_iso()
             if not auto:
                 task.step_results[sid] = {"status": "running",
-                                          "started": started, "ended": None}
+                                          "started": started, "ended": None,
+                                          "attempts": prior_attempts + 1}
                 tasks._save(task)
             _checkpoint_stage(project_root, task, sid)
             st.current_step = sid
@@ -2065,7 +2098,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                         names=", ".join(unused_required))
                     task.step_results[sid] = {"status": "running",
                                               "started": started, "ended": None,
-                                              "usage": usage}
+                                              "usage": usage,
+                                              "attempts": prior_attempts + 1}
                     tasks._save(task)
                     print(f"[harn] {task.id} · {title}: required skill/tool "
                          f"unused ({', '.join(unused_required)}); retrying once.")
@@ -2083,7 +2117,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                     task.step_results[sid] = {"status": "blocked",
                                               "started": started,
                                               "ended": tasks._now_iso(),
-                                              "usage": usage}
+                                              "usage": usage,
+                                              "attempts": prior_attempts + 1}
                     tasks._save(task)
                     print(f"[harn] {task.id} · {title}: BLOCKED — {detail}")
                     return _run_end(env_dir, st)
@@ -2203,6 +2238,21 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
     st.answer(text)
     state.clear_block_marker(state_dir)
     state.clear_block_skill(state_dir)
+    # A human just intervened — grant the current task's steps a fresh
+    # _MAX_STEP_ATTEMPTS budget rather than leaving them permanently capped
+    # from before the intervention (e.g. a permission was just granted, a
+    # broken tool just got fixed). Resetting only on an explicit human
+    # answer, never automatically, keeps the persisted cap meaningful.
+    if st.current_task:
+        cur_task = tasks.find(env_dir, st.current_task)
+        if cur_task and cur_task.step_results:
+            changed = False
+            for res in cur_task.step_results.values():
+                if isinstance(res, dict) and res.get("attempts"):
+                    res["attempts"] = 0
+                    changed = True
+            if changed:
+                tasks._save(cur_task)
     with (state_dir / "ANSWERS.md").open("a", encoding="utf-8") as fh:
         fh.write(f"\n## Q: {question}\n{text}\n")
     st.save(state_dir)
