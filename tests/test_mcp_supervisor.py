@@ -60,6 +60,24 @@ def test_maybe_respawn_noop_after_final_stop(monkeypatch, tmp_path):
     spawn_mock.assert_not_called()
 
 
+def test_restart_after_final_stop_never_spawns(monkeypatch, tmp_path):
+    """An HTTP-triggered restart() racing serve()'s Ctrl-C shutdown must NOT
+    spawn a new child once stop(_final=True) has run — otherwise it orphans a
+    process the finally-block stop() will never reap. restart() returns False
+    without spawning in that case."""
+    sup = _make_supervisor(tmp_path)
+    dead_proc = MagicMock()
+    dead_proc.poll.return_value = 1  # dead
+    sup.proc = dead_proc
+
+    spawn_mock = MagicMock()
+    monkeypatch.setattr(sup, "_spawn_locked", spawn_mock)
+
+    sup.stop(_final=True)
+    assert sup.restart() is False
+    spawn_mock.assert_not_called()
+
+
 def test_restart_then_maybe_respawn_only_one_spawn(monkeypatch, tmp_path):
     """restart() and a concurrent monitor _maybe_respawn() must not both
     spawn — this is the restart race (leak #1). After restart() finishes,

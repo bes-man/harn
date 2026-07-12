@@ -1168,8 +1168,15 @@ class _MCPSupervisor:
                 return
             self._maybe_respawn()
 
-    def restart(self) -> None:
+    def restart(self) -> bool:
+        """Terminate and respawn the child. Returns False (without spawning) if
+        the supervisor is already stopping/stopped — otherwise an HTTP-triggered
+        restart racing serve()'s Ctrl-C shutdown could spawn an orphan the
+        finally-block stop() would never reap. The `_stop` check sits INSIDE the
+        lock so a concurrent stop() can't race past it."""
         with self._lock:
+            if self._stop.is_set():
+                return False
             self._terminate_locked()
             # Best-effort: wait for the OS to release the listening socket
             # before respawning on the same port. Never blocks indefinitely.
@@ -1179,6 +1186,7 @@ class _MCPSupervisor:
                 except Exception:
                     pass
             self._spawn_locked()
+            return True
 
     def _terminate_locked(self) -> None:
         """Terminate the current child if alive. Caller MUST hold self._lock."""
@@ -1209,8 +1217,9 @@ def restart_mcp_payload(env_dir: Path) -> dict:
         return {"ok": False, "error": "MCP supervision is off "
                 "([mcp] ui_supervise = false)"}
     try:
-        _SUPERVISOR.restart()
-        return {"ok": True, "error": ""}
+        if _SUPERVISOR.restart():
+            return {"ok": True, "error": ""}
+        return {"ok": False, "error": "MCP supervisor is shutting down"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
