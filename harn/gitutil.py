@@ -6,6 +6,8 @@ disabled result) when the project isn't a git repo or git isn't installed.
 from __future__ import annotations
 
 import subprocess
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,8 +55,33 @@ def checkpoint(cwd: Path, task_id: str, stage: str) -> str:
     """
     if not is_repo(cwd):
         return ""
-    code, out, _ = _run(["stash", "create", f"harn:{task_id}:{stage}"], cwd)
-    ref = out.strip() if code == 0 and out.strip() else head(cwd)
+    if not is_dirty(cwd):
+        ref = head(cwd)
+    else:
+        fd, index_path = tempfile.mkstemp(prefix="harn-snapshot-index-")
+        os.close(fd)
+        try:
+            os.unlink(index_path)
+            env = {**os.environ, "GIT_INDEX_FILE": index_path}
+            def run(args, *, input_text=None):
+                return subprocess.run(["git", *args], cwd=cwd, env=env,
+                                      input=input_text, capture_output=True,
+                                      text=True, timeout=30)
+            base = head(cwd)
+            if not base or run(["read-tree", base]).returncode != 0 \
+                    or run(["add", "-A"]).returncode != 0:
+                return ""
+            tree = run(["write-tree"]).stdout.strip()
+            commit = run(["commit-tree", tree, "-p", base],
+                         input_text=f"harn:{task_id}:{stage}\n")
+            ref = commit.stdout.strip() if commit.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            ref = ""
+        finally:
+            try:
+                os.unlink(index_path)
+            except OSError:
+                pass
     if not ref:
         return ""
     _run(["update-ref", f"refs/harn/checkpoints/{task_id}/{stage}", ref], cwd)
@@ -198,30 +225,83 @@ def remove_worktree(cwd: Path, worktree_path: Path) -> None:
         _run(["worktree", "prune"], cwd)
 
 
-def diff_as_patch(worktree_path: Path, base_ref: str) -> str:
+def diff_as_patch(worktree_path: Path, base_ref: str,
+                  exclude: tuple[str, ...] = ()) -> str:
     """Full unified diff of `worktree_path` against `base_ref`, covering
     staged, unstaged, and untracked-but-new files. Returns "" if there's no
     diff (or on any git failure)."""
     if not is_repo(worktree_path) or not base_ref:
         return ""
-    _run(["add", "-A"], worktree_path)
-    code, out, _ = _run(["diff", "--cached", base_ref], worktree_path)
+    pathspec = [".", *[f":(exclude){p}" for p in exclude]]
+    _run(["add", "-A", "--", *pathspec], worktree_path)
+    code, out, _ = _run(["diff", "--cached", base_ref, "--", *pathspec], worktree_path)
     return out + "\n" if code == 0 and out else ""
 
 
-def apply_patch(cwd: Path, patch_text: str, *, reverse: bool = False) -> bool:
+def patch_since(ref: str, cwd: Path, exclude: tuple[str, ...] = ()) -> str:
+    """Return the exact working-tree patch since ``ref`` without touching index."""
+    if not is_repo(cwd) or not ref:
+        return ""
+    fd, index_path = tempfile.mkstemp(prefix="harn-index-")
+    os.close(fd)
+    try:
+        os.unlink(index_path)  # read-tree requires a missing or valid index
+        env = {**os.environ, "GIT_INDEX_FILE": index_path}
+        def run(args):
+            return subprocess.run(["git", *args], cwd=cwd, env=env,
+                                  capture_output=True, text=True, timeout=30)
+        if run(["read-tree", ref]).returncode != 0:
+            return ""
+        pathspec = [".", *[f":(exclude){p}" for p in exclude]]
+        if run(["add", "-A", "--", *pathspec]).returncode != 0:
+            return ""
+        result = run(["diff", "--cached", "--binary", ref, "--", *pathspec])
+        return result.stdout if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        try:
+            os.unlink(index_path)
+        except OSError:
+            pass
+
+
+def apply_patch(cwd: Path, patch_text: str, *, reverse: bool = False,
+                three_way: bool = True) -> bool:
     """Apply `patch_text` to the working tree at `cwd` via `git apply --3way`
     (reverse-applies if `reverse=True`). Returns whether it applied cleanly;
     never raises."""
     if not is_repo(cwd) or not patch_text:
         return False
-    args = ["apply", "--3way"]
+    args = ["apply"]
+    if three_way:
+        args.append("--3way")
     if reverse:
         args.append("--reverse")
     try:
         r = subprocess.run(
             ["git", *args], cwd=cwd, input=patch_text, capture_output=True,
             text=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def patch_reverse_is_moot(cwd: Path, patch_text: str) -> bool:
+    """True if reverse-applying `patch_text` is unnecessary because the tree
+    is already in the patch's PRE-state -- i.e. forward-applying it (dry run)
+    would succeed cleanly. Covers the case a task-owned patch recorded a step
+    ADDING a file that something else (a later cleanup, a stray `git clean`,
+    manual deletion) has since removed: there is nothing left for the reverse
+    apply to delete, but the desired end state (file absent) already holds, so
+    the reversal should count as satisfied rather than a hard conflict."""
+    if not is_repo(cwd) or not patch_text:
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "apply", "--check"], cwd=cwd, input=patch_text,
+            capture_output=True, text=True, timeout=15,
         )
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -273,3 +353,19 @@ def load_patch_ref(cwd: Path, task_id: str, step_id: str) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout if r.returncode == 0 else ""
+
+
+def clear_patch_refs(cwd: Path, task_id: str) -> None:
+    if not is_repo(cwd):
+        return
+    code, out, _ = _run(["for-each-ref", "--format=%(refname)",
+                         f"refs/harn/patches/{task_id}"], cwd)
+    if code == 0:
+        for ref in out.splitlines():
+            if ref.strip():
+                _run(["update-ref", "-d", ref.strip()], cwd)
+
+
+def delete_patch_ref(cwd: Path, task_id: str, name: str) -> None:
+    if is_repo(cwd):
+        _run(["update-ref", "-d", f"refs/harn/patches/{task_id}/{name}"], cwd)

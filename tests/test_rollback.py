@@ -59,6 +59,100 @@ def test_rollback_restores_working_tree(tmp_path):
     assert (root / "app.py").read_text() == "def f():\n    return 1\n"
 
 
+def test_task_patch_rollback_preserves_unrelated_later_wip(tmp_path):
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = make_task(env, "PRJ-001")
+    (root / "preexisting.txt").write_text("WIP before task\n")
+    before = gitutil.checkpoint(root, t.id, "step-a")
+    (root / "app.py").write_text("task change\n")
+    patch = gitutil.patch_since(before, root, exclude=("harn_env/",))
+    gitutil.save_patch_ref(root, t.id, "turn-1", patch)
+    t.task_patch_refs = ["turn-1"]
+    tasks._save(t)
+    (root / "personal.txt").write_text("unrelated later WIP\n")
+
+    result = loop.rollback(root, env, t.id, apply=True, reopen=True)
+
+    assert result.ok
+    assert (root / "app.py").read_text() == "def f():\n    return 1\n"
+    assert (root / "personal.txt").read_text() == "unrelated later WIP\n"
+    assert (root / "preexisting.txt").read_text() == "WIP before task\n"
+    assert tasks.find(env, t.id).task_patch_refs == []
+
+
+def test_rollback_tolerates_a_task_patch_whose_added_file_is_already_gone(tmp_path):
+    """Reproduces a real Studio Restart failure: a task-owned patch records a
+    step having ADDED a new file; something else (a later cleanup, a stray
+    `git clean`, manual deletion) removes that file from the tree before the
+    user restarts the task. Reverse-applying the patch then has nothing to
+    delete, and `git apply --reverse` (non-3way) hard-fails on a nonexistent
+    target -- but the tree is already in the patch's PRE-state, so there is
+    nothing left to undo. Restart must not abort with "task patch conflicts
+    with newer changes" in this case -- it should treat the reversal as
+    already-satisfied and proceed to reopen the task."""
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = make_task(env, "PRJ-001")
+    before = gitutil.checkpoint(root, t.id, "step-a")
+    (root / "weather_result.json").write_text('{"temp": 22}\n')
+    patch = gitutil.patch_since(before, root, exclude=("harn_env/",))
+    gitutil.save_patch_ref(root, t.id, "turn-1", patch)
+    t.task_patch_refs = ["turn-1"]
+    tasks._save(t)
+    (root / "weather_result.json").unlink()  # deleted out from under the task
+
+    result = loop.rollback(root, env, t.id, apply=True, reopen=True)
+
+    assert result.ok, result.message
+    assert not (root / "weather_result.json").exists()
+    fresh = tasks.find(env, t.id)
+    assert fresh.task_patch_refs == []
+    assert fresh.status == tasks.TODO
+
+
+def test_rollback_still_rejects_a_genuine_conflict(tmp_path):
+    """The tolerance added for an already-deleted new file (previous test)
+    must not swallow a REAL conflict: if someone edited the exact lines the
+    task's patch touched, reversing is genuinely impossible and rollback must
+    still fail with the original message, untouched, and touch nothing."""
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = make_task(env, "PRJ-001")
+    before = gitutil.checkpoint(root, t.id, "step-a")
+    (root / "app.py").write_text("def f():\n    return 999  # task change\n")
+    patch = gitutil.patch_since(before, root, exclude=("harn_env/",))
+    gitutil.save_patch_ref(root, t.id, "turn-1", patch)
+    t.task_patch_refs = ["turn-1"]
+    tasks._save(t)
+    # Someone else edits the SAME line afterwards -- a genuine conflict.
+    (root / "app.py").write_text("def f():\n    return 42  # someone else's edit\n")
+
+    result = loop.rollback(root, env, t.id, apply=True, reopen=True)
+
+    assert not result.ok
+    assert "conflicts with newer changes" in result.message
+    assert "someone else's edit" in (root / "app.py").read_text()
+    fresh = tasks.find(env, t.id)
+    assert fresh.task_patch_refs == ["turn-1"]
+
+
+def test_completed_turn_appends_task_owned_patch_ref(tmp_path):
+    root = _repo(tmp_path)
+    env = _env(root)
+    t = make_task(env, "PRJ-001")
+    ref = gitutil.checkpoint(root, t.id, "step-a")
+    t.stage_checkpoints["step-a"] = ref
+    tasks._save(t)
+    (root / "app.py").write_text("owned by task\n")
+
+    loop._record_task_turn_patch(root, env, t.id, "step-a")
+
+    fresh = tasks.find(env, t.id)
+    assert len(fresh.task_patch_refs) == 1
+    assert gitutil.load_patch_ref(root, t.id, fresh.task_patch_refs[0])
+
+
 def test_rollback_reopen_resets_task(tmp_path):
     root = _repo(tmp_path)
     env = _env(root)

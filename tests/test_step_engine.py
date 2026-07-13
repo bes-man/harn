@@ -73,6 +73,29 @@ def test_build_step_prompt_auto_mode_swaps_ask_for_decide(tmp_path):
     assert "AUTONOMOUS MODE" in p_auto and "AUTONOMOUS MODE" not in p_human
 
 
+def test_build_step_prompt_parallel_note_does_not_contradict_itself(tmp_path):
+    """Reproduces a real, observed bug: a step running inside a parallel wave
+    got `parallel_note=_PARALLEL_NOTE` ("other steps in this wave are running
+    CONCURRENTLY... until this wave finishes and merges") AND the generic
+    unconditional closing line "the next step runs as a separate session
+    with this task's updated state" -- written for the SEQUENTIAL case. The
+    agent parroted the sequential line back near-verbatim in its final
+    summary ("the next step... will run in a separate session"), even though
+    its sibling step was already running (and had already finished)
+    concurrently in the SAME wave. The two statements contradict each other;
+    a step inside a parallel wave must not see the sequential-session line."""
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    step = _step()
+    prompt = loop._build_step_prompt(env, Config.load(env), t, step,
+                                     parallel_note=loop._PARALLEL_NOTE)
+    assert "running CONCURRENTLY" in prompt          # the parallel note itself
+    assert "runs as a separate session" not in prompt  # the contradicting line
+
+
 def test_build_step_prompt_appends_feedback_tail(tmp_path):
     scaffold.setup(tmp_path)
     env = tmp_path / ENV_DIRNAME

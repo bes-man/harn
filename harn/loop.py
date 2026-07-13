@@ -14,6 +14,7 @@ agent that runs next picks up with full knowledge of what's done and planned.
 from __future__ import annotations
 
 import itertools
+import inspect
 import json
 import re
 import shutil
@@ -22,8 +23,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import design as design_mod, events, gitutil, progress, \
-    prd as prd_mod, semble_bridge, skills, state, tasks, workflows
+from . import design as design_mod, events, gitutil, progress, transcript, \
+    prd as prd_mod, semble_bridge, skills, state, tasks, tools as tools_mod, workflows
 from .adapters import Adapter, get_adapter
 from .config import Config
 from .feedback import run_feedback
@@ -93,7 +94,9 @@ _ASK_GUIDANCE = (
     "When you call `ask_user`, write the question EXPANDED so the human can "
     "decide fast: (1) the context and WHY the question arose, (2) the concrete "
     "options with each one's trade-off, (3) your recommended option and a "
-    "one-line reason. Never ask a bare one-liner, and never guess."
+    "one-line reason. Format choices as `A) ...`, `B) ...`, and mark one "
+    "`(Recommended)` so Studio can render native sidebar buttons. Never ask "
+    "a bare one-liner, and never guess."
 )
 
 # Injected in --auto runs: the agent decides for itself instead of asking.
@@ -507,7 +510,7 @@ def _adapter_for_step(cfg: Config, step: dict, default: Adapter) -> Adapter:
 def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
                        auto: bool = False, onfail_context: str = "",
-                       parallel_note: str = "") -> str:
+                       parallel_note: str = "", tool_results: str = "") -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
     stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
@@ -547,16 +550,29 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
     if tools_rec:
         tools_lines += ("\n\nRecommended tools for this step (optional): "
                         + ", ".join(tools_rec))
+    # The sequential-handoff framing ("the next step runs as a separate
+    # session") is only true for a NON-parallel step. A parallel-wave member
+    # gets `parallel_note` instead (below), which says the opposite — its
+    # siblings are running CONCURRENTLY right now, not "next" and not later.
+    # Saying both to the same step is a direct contradiction; a real agent
+    # run parroted the sequential line back verbatim in its final summary
+    # ("the next step will run in a separate session") even though its
+    # sibling had already run — and finished — concurrently in the same wave.
+    next_step_note = (
+        "\n\nDo ONLY this step's work, then end your turn — the next step "
+        "runs as a separate session with this task's updated state."
+    ) if not parallel_note else ""
     parts.append(
         f"## THIS STEP: {step.get('title', '')}\n"
         + (step.get("body") or "").strip()
         + tools_lines
-        + "\n\nDo ONLY this step's work, then end your turn — the next step "
-          "runs as a separate session with this task's updated state.")
+        + next_step_note)
     if onfail_context:
         parts.append(onfail_context)
     if parallel_note:
         parts.append(parallel_note)
+    if tool_results:
+        parts.append(tool_results)
     cont = _continuity_block(task)
     if cont:
         parts.append(cont)
@@ -637,15 +653,72 @@ def _audit_step_usage(env_dir: Path, task: "tasks.Task", step: dict) -> dict:
     return {"skills": skills_out, "tools": tools_out}
 
 
-_REQUIRED_UNUSED_RETRY_NOTE = (
-    "## You skipped a required skill or tool last time\n"
-    "Your previous attempt at this step did NOT use the following REQUIRED "
-    "skill(s)/tool(s): {names}. You MUST use it/them this time before "
-    "finishing this step."
-)
+def _missing_required_usage(usage: dict) -> list[str]:
+    """Return required declarations that have no matching scoped event."""
+    return [name for group in (usage.get("skills") or {}, usage.get("tools") or {})
+            for name, tier in group.items() if tier == "unused_required"]
 
-# Cross-relaunch attempt cap for agent-turn steps. Every OTHER retry guard in
-# this file (enforcement_retried, _RunSpend) lives in a local variable inside
+
+def _run_required_custom_tools(env_dir: Path, project_root: Path,
+                               task: "tasks.Task", step: dict,
+                               attempt: int) -> tuple[str, str]:
+    """Run required zero-argument custom tools without model selection."""
+    outputs: list[str] = []
+    sid = step.get("id") or ""
+    for name in [n for n in (step.get("tools") or []) if n]:
+        custom = tools_mod.read(env_dir, name)
+        if custom is None or custom.params:
+            continue
+        transcript.append(
+            env_dir, task_id=task.id, step_id=sid,
+            run_id=events.current_run(env_dir), attempt=max(1, attempt),
+            kind="tool", phase="started", title=name,
+            text="Required custom tool started by Harn.")
+        result = tools_mod.execute_checked(custom, {}, project_root)
+        events.emit(env_dir, "tool_used", task_id=task.id, step_id=sid, tool=name)
+        detail = result.output.strip()
+        if not result.ok:
+            suffix = (f"exit {result.returncode}" if result.returncode is not None
+                      else "execution failed")
+            detail = f"Required tool '{name}' failed ({suffix})." + (
+                f"\n{detail}" if detail else "")
+        transcript.append(
+            env_dir, task_id=task.id, step_id=sid,
+            run_id=events.current_run(env_dir), attempt=max(1, attempt),
+            kind="tool" if result.ok else "error",
+            phase="completed" if result.ok else "failed", title=name,
+            text=detail)
+        if not result.ok:
+            return "", detail
+        outputs.append(f"### {name}\n{detail or '(completed with no output)'}")
+    if not outputs:
+        return "", ""
+    return ("## Verified required tool results\n"
+            "Harn executed these mandatory tools successfully. Use these "
+            "results as the source of truth; do not replace them with web search.\n\n"
+            + "\n\n".join(outputs), "")
+
+
+def _block_tool_failure(env_dir: Path, task: "tasks.Task", step: dict,
+                        detail: str, attempts: int) -> None:
+    sid = step.get("id") or ""
+    task.step_results[sid] = {
+        "status": "blocked", "started": tasks._now_iso(),
+        "ended": tasks._now_iso(), "attempts": attempts,
+        "tokens": 0, "output": detail,
+        "usage": _audit_step_usage(env_dir, task, step),
+    }
+    tasks._save(task)
+    state_dir = env_dir / "state"
+    state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+    blocked_state = state.State.load(state_dir)
+    blocked_state.block(detail)
+    blocked_state.save(state_dir)
+    events.emit(env_dir, "block", task_id=task.id, stage=sid, detail=detail[:300])
+
+
+# Cross-relaunch attempt cap for agent-turn failures. The spend guard lives in
+# a local variable inside
 # run() — it resets the moment a NEW `harn run` process starts, which is
 # exactly what studio/watch does on every relaunch. A task whose step keeps
 # hitting the SAME dead end (an un-callable tool, a permission gate) then gets
@@ -669,6 +742,90 @@ def _checkpoint_stage(project_root: Path, task: "tasks.Task", stage: str) -> Non
     if ref:
         task.stage_checkpoints[stage] = ref
         tasks._save(task)
+
+
+def _restore_since_checkpoint(project_root: Path, env_dir: Path,
+                              task: "tasks.Task", step_id: str,
+                              ref: str) -> "gitutil.RollbackResult":
+    """Undo THIS step's own turns, PRECISELY: reverse-apply its own recorded
+    patches (`task.task_patch_refs` entries labeled `step_id`, one per
+    attempt -- appended by `_record_task_turn_patch` the instant each turn
+    finishes, before anything else could touch the tree), most-recent-first.
+
+    This is deliberately NOT a live diff against `ref` (nor
+    `gitutil.rollback_to(ref, ...)`, a blanket "restore everything that
+    differs from ref" sweep): `ref` is an old per-step checkpoint, and by the
+    time a rerun fires, unrelated work (another task's step, a human,
+    another process) may have touched the SAME project_root in between. Any
+    diff/restore computed AT RERUN TIME against that old ref can't tell
+    "changed by the attempt we're undoing" from "changed by something else
+    since" -- it would sweep up anything absent from `ref`'s tree regardless
+    of who created it. A real incident: a stale checkpoint's blanket restore
+    deleted hundreds of legitimate, unrelated source files across an active
+    project. This step's own recorded patches were captured immediately
+    after each of ITS turns, before that contamination could happen, so
+    reverse-applying them only ever touches what THIS step actually wrote.
+
+    If reverse-applying one fails outright, `gitutil.patch_reverse_is_moot`
+    checks whether it's simply unnecessary (e.g. a file it added was already
+    removed by something else -- nothing left to undo). Only a GENUINE
+    conflict (someone edited the exact lines THIS step's own patch touched)
+    falls back to the guaranteed-safe but broader `rollback_to` -- mirroring
+    the same precise-then-whole-fallback contract `rollback_parallel_step`
+    already uses for the parallel-wave case.
+    """
+    names = [n for n in task.task_patch_refs if n.startswith(f"{step_id}-")]
+    if not names:
+        return gitutil.RollbackResult(True, "no recorded patch for this step", [])
+    env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
+    for name in reversed(names):
+        patch = gitutil.load_patch_ref(project_root, task.id, name)
+        if patch and not (gitutil.apply_patch(project_root, patch, reverse=True,
+                                              three_way=False) or
+                          gitutil.patch_reverse_is_moot(project_root, patch)):
+            tasks._save(task)
+            res = gitutil.rollback_to(ref, project_root, apply=True,
+                                      exclude=(env_rel + "/",))
+            return gitutil.RollbackResult(
+                res.ok,
+                f"precise rollback wasn't possible for '{step_id}' (its own "
+                "recorded edits no longer reverse cleanly against the "
+                "current tree) -- restored the WHOLE tree to this step's "
+                "checkpoint instead, which may also discard unrelated work "
+                "done elsewhere since then",
+                res.files)
+        task.task_patch_refs.remove(name)
+        gitutil.delete_patch_ref(project_root, task.id, name)
+    tasks._save(task)
+    return gitutil.RollbackResult(True, f"reversed {len(names)} recorded patch(es)", [])
+
+
+def _append_task_patch(project_root: Path, task: "tasks.Task", label: str,
+                       patch: str) -> None:
+    if not patch:
+        return
+    name = f"{label}-{len(task.task_patch_refs) + 1}"
+    gitutil.save_patch_ref(project_root, task.id, name, patch)
+    if gitutil.load_patch_ref(project_root, task.id, name):
+        task.task_patch_refs.append(name)
+        tasks._save(task)
+
+
+def _record_task_turn_patch(project_root: Path, env_dir: Path, task_id: str,
+                            stage: str) -> None:
+    """Append one main-worktree turn to the task's isolated git stage."""
+    if project_root.resolve() != env_dir.parent.resolve():
+        return  # parallel member patches are appended when merged into main
+    task = tasks.find(env_dir, task_id)
+    if task is None:
+        return
+    ref = task.stage_checkpoints.get(stage, "")
+    try:
+        env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        env_rel = env_dir.name
+    patch = gitutil.patch_since(ref, project_root, exclude=(env_rel + "/",))
+    _append_task_patch(project_root, task, stage or "turn", patch)
 
 
 def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
@@ -696,8 +853,14 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     command = step.get("command", "")
     _checkpoint_stage(project_root, task, sid)
     started = tasks._now_iso()
-    task.step_results[sid] = {"status": "running", "started": started, "ended": None}
+    attempt = int((task.step_results.get(sid) or {}).get("attempts") or 0) + 1
+    task.step_results[sid] = {"status": "running", "started": started,
+                              "ended": None, "attempts": attempt}
     tasks._save(task)
+    transcript.append(
+        env_dir, task_id=task.id, step_id=sid, run_id=events.current_run(env_dir),
+        attempt=attempt, kind="command", phase="started", title=title,
+        text=command)
     # stage_start/stage_end mirror _run_turn's event pair so the studio's
     # progress view (keyed generically by `stage` = step id) paints a command
     # step's live status exactly like an agent step, with zero changes needed
@@ -713,6 +876,7 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     print(f"[harn] {task.id} · {title} (command): {command[:200]}")
     t0 = time.time()
     result = run_feedback(command, project_root)
+    _record_task_turn_patch(project_root, env_dir, task.id, sid)
     dur_ms = int((time.time() - t0) * 1000)
     ended = tasks._now_iso()
     lines = [ln for ln in (result.output or "").strip().splitlines() if ln.strip()]
@@ -720,14 +884,22 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
     events.emit(env_dir, "stage_end", task_id=task.id, stage=sid,
                 agent="command", step_title=title, ok=result.ok, dur_ms=dur_ms,
                 summary=(lines[-1][:200] if lines else None))
+    transcript.append(
+        env_dir, task_id=task.id, step_id=sid, run_id=events.current_run(env_dir),
+        attempt=attempt, kind="command",
+        phase="completed" if result.ok else "failed", title=title,
+        text=(result.output or ("Command completed successfully" if result.ok
+                                else "Command failed")))
     if result.ok:
         task.step_results[sid] = {"status": "ok", "started": started,
-                                  "ended": ended, "output": result.tail(40)}
+                                  "ended": ended, "output": result.tail(40),
+                                  "attempts": attempt}
         tasks._save(task)
         progress.log(env_dir, f"{task.id}: {title} (command) — ok")
         return "advance"
     task.step_results[sid] = {"status": "failed", "started": started,
-                              "ended": ended, "output": result.tail(40)}
+                              "ended": ended, "output": result.tail(40),
+                              "attempts": attempt}
     tasks._save(task)
     progress.log(env_dir, f"{task.id}: {title} (command) — failed")
     on_fail_id = str(step.get("on_fail") or "").strip()
@@ -865,7 +1037,8 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
               task_id: str, stage: str, tok_totals: dict, tok_costs: dict,
               cfg: Config, verdict: str | None = None,
               overrides: dict | None = None, step_title: str | None = None,
-              timeout: int | None = None, spend: "_RunSpend | None" = None):
+              timeout: int | None = None, spend: "_RunSpend | None" = None,
+              attempt: int | None = None):
     """Run one agent turn and emit a structured stage_start/stage_end pair.
 
     Centralising the run_turn call guarantees that EVERY completed agent cycle
@@ -888,16 +1061,49 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     """
     events.emit(env_dir, "stage_start", task_id=task_id, stage=stage,
                 agent=adapter.name, step_title=step_title)
+    if attempt is None:
+        task = tasks.find(env_dir, task_id)
+        attempt = int(((task.step_results.get(stage) if task else {}) or {})
+                      .get("attempts") or 1)
+    emitted: list[dict] = []
+
+    def on_event(event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+        kind = str(event.get("kind") or "status")
+        phase = str(event.get("phase") or "updated")
+        visible = transcript.append(
+            env_dir, task_id=task_id, step_id=stage,
+            run_id=events.current_run(env_dir), attempt=attempt or 1,
+            kind=kind, phase=phase, title=str(event.get("title") or ""),
+            text=str(event.get("text") or ""),
+            item_id=str(event.get("item_id") or ""),
+        )
+        emitted.append(visible)
+
     t0 = time.time()
     try:
         call_kw = dict(overrides or {})
         if timeout:               # 0 / None → adapter's own 1800s default
             call_kw["timeout"] = timeout
+        if "on_event" in inspect.signature(adapter.run_turn).parameters:
+            call_kw["on_event"] = on_event
         res = adapter.run_turn(prompt, project_root, **call_kw)
     except Exception as e:
+        on_event({"kind": "error", "phase": "failed", "title": adapter.name,
+                  "text": str(e)})
         events.emit(env_dir, "error", task_id=task_id, stage=stage,
                     detail=str(e)[:300])
+        _record_task_turn_patch(project_root, env_dir, task_id, stage)
         raise
+    final_text = (res.text or "").strip()
+    already_streamed = any(
+        row.get("kind") == "message" and row.get("text", "").strip() == final_text
+        for row in emitted)
+    if final_text and not already_streamed:
+        on_event({"kind": "message" if res.ok else "error",
+                  "phase": "completed" if res.ok else "failed",
+                  "title": adapter.name, "text": final_text})
     dur_ms = int((time.time() - t0) * 1000)
     _accumulate(tok_totals, tok_costs, task_id, res)
     if spend is not None:
@@ -908,6 +1114,7 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
                 tok_in=res.input_tokens, tok_out=res.output_tokens,
                 cost_usd=res.cost_usd, dur_ms=dur_ms, verdict=verdict,
                 summary=(lines[-1][:200] if lines else None))
+    _record_task_turn_patch(project_root, env_dir, task_id, stage)
     return res
 
 
@@ -933,7 +1140,7 @@ def _telegram_wait(env_dir: Path, cfg: Config, text: str) -> str | None:
     """
     if not cfg.wait_for_reply:
         return None
-    tg = TelegramHIL.from_env()
+    tg = TelegramHIL.from_env(env_dir)
     if tg is None:
         return None
     return tg.wait_for_reply(
@@ -959,7 +1166,7 @@ def _await_answer(
     if not cfg.wait_for_reply:
         return (None, "")
     state_dir = env_dir / "state"
-    tg = TelegramHIL.from_env()
+    tg = TelegramHIL.from_env(env_dir)
     # chat-only, or Telegram not configured → just poll for a local answer.
     if cfg.hil_channel == "chat" or tg is None:
         if cfg.hil_channel != "chat" and cfg.wait_for_reply:
@@ -1313,7 +1520,10 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         # rerun) — so skip the checkpoint-based restore entirely in that case.
         ref = task.stage_checkpoints.get(step_id)
         if ref:
-            gitutil.rollback_to(ref, project_root, apply=True)
+            res = _restore_since_checkpoint(project_root, env_dir, task, step_id, ref)
+            if not res.ok:
+                progress.log(env_dir, f"{task_id}: rerun restore for "
+                                      f"'{step_id}' — {res.message}")
 
     adapter = _pick_adapter(cfg)
     step_adapter = _adapter_for_step(cfg, step, adapter)
@@ -1321,29 +1531,58 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
     if not task.baseline_ref:
         tasks.set_baseline(task, gitutil.head(project_root))
 
-    started = tasks._now_iso()
-    task.step_results[step_id] = {"status": "running", "started": started,
-                                  "ended": None}
-    tasks._save(task)
+    prior_attempts = int((task.step_results.get(step_id) or {}).get("attempts") or 0)
     _checkpoint_stage(project_root, task, step_id)
 
     tok_totals: dict = {}
     tok_costs: dict = {}
-    result = _run_turn(
-        step_adapter, env_dir,
-        _build_step_prompt(env_dir, cfg, task, step),
-        project_root, task_id=task_id, stage=step_id, step_title=title,
-        overrides=_step_overrides(cfg, step),
-        tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg)
+    result = None
+    usage = {"skills": {}, "tools": {}}
+    tool_results, tool_error = _run_required_custom_tools(
+        env_dir, project_root, task, step, prior_attempts + 1)
+    if tool_error:
+        _block_tool_failure(env_dir, task, step, tool_error, prior_attempts)
+        return {"ok": False, "step_id": step_id, "title": title,
+                "text": "", "error": tool_error}
+    for offset in range(1, 3):
+        attempt = prior_attempts + offset
+        started = tasks._now_iso()
+        task.step_results[step_id] = {"status": "running", "started": started,
+                                      "ended": None, "attempts": attempt}
+        tasks._save(task)
+        result = _run_turn(
+            step_adapter, env_dir, _build_step_prompt(
+                env_dir, cfg, task, step, tool_results=tool_results),
+            project_root, task_id=task_id, stage=step_id, step_title=title,
+            overrides=_step_overrides(cfg, step), tok_totals=tok_totals,
+            tok_costs=tok_costs, cfg=cfg, attempt=attempt)
+        task = tasks.find(env_dir, task_id) or task
+        usage = _audit_step_usage(env_dir, task, step)
+        missing = _missing_required_usage(usage)
+        if result.ok and not missing:
+            break
+        if not missing:
+            break
 
-    task = tasks.find(env_dir, task_id) or task
-    task.step_results[step_id] = {"status": "ok" if result.ok else "failed",
-                                  "started": started, "ended": tasks._now_iso(),
-                                  "tokens": result.total_tokens}
+    missing = _missing_required_usage(usage)
+    status = "blocked" if missing else ("ok" if result and result.ok else "failed")
+    task.step_results[step_id] = {"status": status, "started": started,
+                                  "ended": tasks._now_iso(),
+                                  "tokens": result.total_tokens if result else 0,
+                                  "attempts": attempt,
+                                  "output": (result.text or "")[-4000:] if result else "",
+                                  "usage": usage}
     tasks._save(task)
-
-    return {"ok": bool(result.ok), "step_id": step_id, "title": title,
-            "text": result.text}
+    if missing:
+        detail = (f"Step '{title}' ({step_id}) did not use required skill/tool(s): "
+                  f"{', '.join(missing)} after two attempts.")
+        state.blocked_marker(env_dir / "state").write_text(detail, encoding="utf-8")
+        blocked_state = state.State.load(env_dir / "state")
+        blocked_state.block(detail)
+        blocked_state.save(env_dir / "state")
+    return {"ok": status == "ok", "step_id": step_id, "title": title,
+            "text": result.text if result else "",
+            "error": ("Missing required usage: " + ", ".join(missing)) if missing else ""}
 
 
 def rollback_parallel_step(project_root: Path, env_dir: Path, task_id: str,
@@ -1381,19 +1620,20 @@ def rollback_parallel_step(project_root: Path, env_dir: Path, task_id: str,
                 "error": f"no task '{task_id}'"}
 
     patch = gitutil.load_patch_ref(project_root, task.id, step_id)
-    if patch and gitutil.apply_patch(project_root, patch, reverse=True):
+    if patch and gitutil.apply_patch(project_root, patch, reverse=True,
+                                     three_way=False):
+        matching = next((name for name in reversed(task.task_patch_refs)
+                         if gitutil.load_patch_ref(project_root, task.id, name) == patch), None)
+        if matching:
+            task.task_patch_refs.remove(matching)
+            gitutil.delete_patch_ref(project_root, task.id, matching)
+            tasks._save(task)
         return {"ok": True, "mode": "single-step"}
-
-    base_ref = task.stage_checkpoints.get(step_id, "")
-    result = gitutil.rollback_to(base_ref, project_root, apply=True)
     return {
-        "ok": result.ok,
-        "mode": "whole-wave-fallback",
-        "note": "Single-step rollback was no longer possible for this step "
-                "(its saved patch no longer reverses cleanly against the "
-                "current tree) — reverted the WHOLE parallel wave to its "
-                "starting point instead, undoing every sibling step's edits "
-                "along with this one.",
+        "ok": False,
+        "mode": "conflict",
+        "note": "This step's task-owned patch no longer reverses cleanly. "
+                "Nothing else was rolled back; resolve the overlapping change first.",
     }
 
 
@@ -1435,7 +1675,8 @@ def _collect_wave(steps: list[dict], first: dict) -> list[dict]:
 
 
 def _replicate_connectors(project_root: Path, worktree_path: Path,
-                          env_dir: Path, step_id: str = "") -> None:
+                          env_dir: Path, step_id: str = "",
+                          task_id: str = "", run_id: str = "") -> None:
     """Copy whichever connector files exist at `project_root` into the same
     relative paths under `worktree_path`, so ANY agent CLI run there (Claude,
     Cursor, ...) discovers the harn MCP server exactly like it would in the
@@ -1464,8 +1705,12 @@ def _replicate_connectors(project_root: Path, worktree_path: Path,
             if harn_server is not None:
                 env_block = harn_server.setdefault("env", {})
                 env_block["HARN_ENV_DIR"] = str(env_dir.resolve())
+                if task_id:
+                    env_block["HARN_TASK_ID"] = task_id
                 if step_id:
                     env_block["HARN_STEP_ID"] = step_id
+                if run_id:
+                    env_block["HARN_RUN_ID"] = run_id
             dst.write_text(json.dumps(cfg_json, indent=2), encoding="utf-8")
         except (ValueError, OSError):
             shutil.copy(src, dst)  # best-effort: copy verbatim if we can't parse it
@@ -1473,6 +1718,22 @@ def _replicate_connectors(project_root: Path, worktree_path: Path,
         src = project_root / rel
         if src.exists():
             shutil.copy(src, worktree_path / rel)
+    codex_src = project_root / ".codex" / "config.toml"
+    if codex_src.exists():
+        from . import scaffold as scaffold_mod
+        codex_dst = worktree_path / ".codex" / "config.toml"
+        codex_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(codex_src, codex_dst)
+        servers = scaffold_mod._mcp_servers(project_root)
+        harn_env = servers.setdefault("harn", {}).setdefault("env", {})
+        harn_env["HARN_ENV_DIR"] = str(env_dir.resolve())
+        if task_id:
+            harn_env["HARN_TASK_ID"] = task_id
+        if step_id:
+            harn_env["HARN_STEP_ID"] = step_id
+        if run_id:
+            harn_env["HARN_RUN_ID"] = run_id
+        scaffold_mod.write_codex_mcp_config(worktree_path, servers)
 
 
 def _conflict_markers_in_tree(project_root: Path) -> dict[str, str]:
@@ -1620,21 +1881,40 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
                                       "ended": ended,
                                       "output": "worktree creation failed"}
             continue
-        ok, patch = outcome
+        ok, patch, usage, missing_required, tool_error = outcome
         if sid == blocked_sid:
             task.step_results[sid] = {"status": "blocked", "started": started,
                                       "ended": ended}
             wave_blocked = True
             continue
+        if tool_error:
+            _block_tool_failure(env_dir, task, step, tool_error, 0)
+            wave_blocked = True
+            continue
+        if missing_required:
+            detail = (f"Step '{step.get('title', '')}' ({sid}) did not use required "
+                      f"skill/tool(s): {', '.join(missing_required)} after two attempts.")
+            state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+            blocked_state = state.State.load(state_dir)
+            blocked_state.block(detail)
+            blocked_state.save(state_dir)
+            task.step_results[sid] = {"status": "blocked", "started": started,
+                                      "ended": ended, "attempts": 2,
+                                      "usage": usage, "output": detail}
+            wave_blocked = True
+            continue
         if not patch:
             task.step_results[sid] = {"status": "ok" if ok else "failed",
-                                      "started": started, "ended": ended}
+                                      "started": started, "ended": ended,
+                                      "usage": usage}
             continue
         applied = gitutil.apply_patch(project_root, patch)
         if applied:
             gitutil.save_patch_ref(project_root, task.id, sid, patch)
+            _append_task_patch(project_root, task, sid, patch)
             task.step_results[sid] = {"status": "ok" if ok else "failed",
-                                      "started": started, "ended": ended}
+                                      "started": started, "ended": ended,
+                                      "usage": usage}
             merged_so_far.append(step)
             continue
         # Conflict: one agent-merge turn, scoped to just this step's collision
@@ -1648,6 +1928,7 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
             tasks._save(task)
             return "blocked"
         gitutil.save_patch_ref(project_root, task.id, sid, patch)
+        _append_task_patch(project_root, task, sid, patch)
         task.step_results[sid] = {"status": "ok", "started": started,
                                   "ended": tasks._now_iso(),
                                   "output": "merged via agent-resolved conflict"}
@@ -1673,6 +1954,7 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
     import tempfile
 
     wave_id = wave[0].get("parallel") or "wave"
+    run_id = events.current_run(env_dir)
     base_ref = gitutil.checkpoint(project_root, task.id, f"{wave_id}-base")
     # Stamp every member's OWN `stage_checkpoints[step_id]` with the wave's
     # shared base ref (not `_checkpoint_stage`, which would key it under
@@ -1703,7 +1985,8 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                             detail="On fail is not supported inside a parallel wave (Phase 3 non-goal)")
             wt = tmp_root / (sid or wave_id)
             if gitutil.create_worktree(project_root, base_ref, wt):
-                _replicate_connectors(project_root, wt, env_dir, step_id=sid)
+                _replicate_connectors(project_root, wt, env_dir, step_id=sid,
+                                      task_id=task.id, run_id=run_id)
                 worktrees[sid] = wt
             else:
                 events.emit(env_dir, "config_error", task_id=task.id, stage=sid,
@@ -1715,6 +1998,8 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
             if wt is None:
                 return sid, None  # worktree creation failed — nothing to run
             title = step.get("title", "")
+            usage = {"skills": {}, "tools": {}}
+            missing_required: list[str] = []
             if step.get("type") == "command":
                 events.emit(env_dir, "stage_start", task_id=task.id, stage=sid,
                             agent="command", step_title=title)
@@ -1726,24 +2011,38 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
                 ok = res.ok
             else:
                 step_adapter = _adapter_for_step(cfg, step, default_adapter)
+                tool_results, tool_error = _run_required_custom_tools(
+                    env_dir, wt, task, step, 1)
+                if tool_error:
+                    usage = _audit_step_usage(env_dir, task, step)
+                    patch = gitutil.diff_as_patch(
+                        wt, base_ref,
+                        exclude=(env_dir.name + "/", ".mcp.json", ".cursor/",
+                                 ".codex/", "AGENTS.md", "CLAUDE.md"))
+                    return sid, (False, patch, usage, [], tool_error)
                 prompt = _build_step_prompt(env_dir, cfg, task, step,
-                                           parallel_note=_PARALLEL_NOTE)
-                try:
-                    result = _run_turn(step_adapter, env_dir, prompt, wt,
-                                      task_id=task.id, stage=sid, step_title=title,
-                                      overrides=_step_overrides(cfg, step),
-                                      tok_totals={}, tok_costs={}, cfg=cfg,
-                                      spend=spend)
-                    ok = result.ok
-                except Exception:
-                    # _run_turn already emitted the `error` event before
-                    # re-raising. A raising adapter must not crash the whole
-                    # run() — degrade this member to a failed step instead,
-                    # the same "never let a turn crash the dispatcher"
-                    # convention used by oracle_review/reconcile_headless.
-                    ok = False
-            patch = gitutil.diff_as_patch(wt, base_ref)
-            return sid, (ok, patch)
+                                           parallel_note=_PARALLEL_NOTE,
+                                           tool_results=tool_results)
+                ok = False
+                for _attempt in range(2):
+                    try:
+                        result = _run_turn(step_adapter, env_dir, prompt, wt,
+                                          task_id=task.id, stage=sid, step_title=title,
+                                          overrides=_step_overrides(cfg, step),
+                                          tok_totals={}, tok_costs={}, cfg=cfg,
+                                          spend=spend, attempt=_attempt + 1)
+                        ok = result.ok
+                    except Exception:
+                        ok = False
+                    usage = _audit_step_usage(env_dir, task, step)
+                    missing_required = _missing_required_usage(usage)
+                    if not missing_required:
+                        break
+            patch = gitutil.diff_as_patch(
+                wt, base_ref,
+                exclude=(env_dir.name + "/", ".mcp.json", ".cursor/", ".codex/",
+                         "AGENTS.md", "CLAUDE.md"))
+            return sid, (ok, patch, usage, missing_required, "")
 
         results: dict = {}
         try:
@@ -1780,6 +2079,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     stops once it leaves the runnable pool (done/blocked/review) rather than
     picking up whatever else is next.
     """
+    from . import scaffold as scaffold_mod
+    scaffold_mod.refresh_agent_connectors(project_root)
     cfg = Config.load(env_dir)
     auto = auto or cfg.auto
     state_dir = env_dir / "state"
@@ -1818,13 +2119,6 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     spend = _RunSpend()
     handled: set[str] = set()
     tests_nudged: set[str] = set()   # test-writing gate fires once per task
-    # Debounces the post-step required-usage enforcement retry (Phase 4) to
-    # fire at most ONCE per (task, step) within this run() call — in-memory
-    # only, never persisted to the task's JSON, matching `tests_nudged`'s own
-    # per-run debounce idiom right above. Sequential steps only (see the
-    # design spec's parallel-wave Non-goal); `_run_parallel_wave` never
-    # consults this set.
-    enforcement_retried: set[tuple[str, str]] = set()
     last_step_text = ""              # last step's output (for the review summary)
     # In auto mode task files are never mutated, so step progress is tracked
     # in memory instead of the on-disk ledger (task.step_results).
@@ -1983,11 +2277,20 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             # this can't just be an in-memory set like enforcement_retried.
             prior_attempts = (task.step_results.get(sid) or {}).get("attempts", 0)
             if not auto and prior_attempts >= _MAX_STEP_ATTEMPTS:
-                detail = (f"Step '{title}' ({sid}) has already been attempted "
-                         f"{prior_attempts} times without succeeding — stopping "
-                         "to avoid repeating the same failure across relaunches. "
-                         "Check the step's tools/prompt (or grant any needed "
-                         "permissions), then Resume.")
+                prior_result = task.step_results.get(sid) or {}
+                prior_usage = prior_result.get("usage") or {}
+                missing = [name for group in (prior_usage.get("skills") or {},
+                                              prior_usage.get("tools") or {})
+                           for name, tier in group.items()
+                           if tier == "unused_required"]
+                missing_note = (f" Missing required usage: {', '.join(missing)}."
+                                if missing else "")
+                detail = (f"Step '{title}' ({sid}) stopped after {prior_attempts} "
+                          "unsuccessful attempts to prevent an endless relaunch "
+                          f"loop.{missing_note} Review the step prompt and required "
+                          "skills/tools. Submit an answer in the sidebar after "
+                          "making a change; this resets the attempt counter, then "
+                          "run the flow again.")
                 state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
                 st.block(detail)
                 st.save(state_dir)
@@ -2038,9 +2341,17 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             _checkpoint_stage(project_root, task, sid)
             st.current_step = sid
             st.save(state_dir)
+            tool_results, tool_error = _run_required_custom_tools(
+                env_dir, project_root, task, step, prior_attempts + 1)
+            if tool_error:
+                st.current_step = None
+                st.save(state_dir)
+                _block_tool_failure(env_dir, task, step, tool_error, prior_attempts)
+                return _run_end(env_dir, state.State.load(state_dir))
             result = _run_turn(
                 step_adapter, env_dir,
-                _build_step_prompt(env_dir, cfg, task, step, feedback_tail, auto=auto),
+                _build_step_prompt(env_dir, cfg, task, step, feedback_tail,
+                                   auto=auto, tool_results=tool_results),
                 project_root, task_id=task.id, stage=sid, step_title=title,
                 overrides=_step_overrides(cfg, step),
                 tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg,
@@ -2128,43 +2439,21 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 done_ids.add(sid)
             else:
                 usage = _audit_step_usage(env_dir, task, step)
-                unused_required = [n for n, v in {**usage["skills"], **usage["tools"]}.items()
-                                   if v == "unused_required"]
-                retry_key = (task.id, sid)
-                if unused_required and retry_key not in enforcement_retried:
-                    # One retry only: reuse the SAME step, with an explicit
-                    # reminder appended to its prompt as feedback.
-                    enforcement_retried.add(retry_key)
-                    feedback_tail = _REQUIRED_UNUSED_RETRY_NOTE.format(
-                        names=", ".join(unused_required))
-                    task.step_results[sid] = {"status": "running",
-                                              "started": started, "ended": None,
-                                              "usage": usage,
-                                              "attempts": prior_attempts + 1}
+                missing_required = _missing_required_usage(usage)
+                if missing_required:
+                    task.step_results[sid] = {"status": "running", "started": started,
+                                              "ended": None,
+                                              "attempts": prior_attempts + 1,
+                                              "tokens": result.total_tokens,
+                                              "output": (result.text or "")[-4000:],
+                                              "usage": usage}
                     tasks._save(task)
-                    print(f"[harn] {task.id} · {title}: required skill/tool "
-                         f"unused ({', '.join(unused_required)}); retrying once.")
-                    continue  # same step, one retry, with the reminder as feedback
-                if unused_required:
-                    # Already retried once and it's STILL unused — the
-                    # harness itself (not the agent) blocks, exactly like any
-                    # other block, for a human to resolve.
-                    detail = ("Required skill(s)/tool(s) still unused after "
-                             f"one retry of step '{title}' ({sid}): "
-                             f"{', '.join(unused_required)}.")
-                    state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
-                    st.block(detail)
-                    st.save(state_dir)
-                    task.step_results[sid] = {"status": "blocked",
-                                              "started": started,
-                                              "ended": tasks._now_iso(),
-                                              "usage": usage,
-                                              "attempts": prior_attempts + 1}
-                    tasks._save(task)
-                    print(f"[harn] {task.id} · {title}: BLOCKED — {detail}")
-                    return _run_end(env_dir, st)
+                    print(f"[harn] {task.id} · {title}: missing required usage "
+                          f"({', '.join(missing_required)}); step remains pending.")
+                    continue
                 task.step_results[sid] = {"status": "ok", "started": started,
                                           "ended": tasks._now_iso(),
+                                          "attempts": prior_attempts + 1,
                                           "tokens": result.total_tokens,
                                           "output": (result.text or "")[-4000:],
                                           "usage": usage}
@@ -2243,15 +2532,55 @@ def rollback(project_root: Path, env_dir: Path, task_id: str, *, apply: bool = F
     task = tasks.find(env_dir, task_id)
     if task is None:
         return gitutil.RollbackResult(False, f"no task '{task_id}'", [])
-    # Never roll back harn's own bookkeeping (task JSON, PROGRESS, state).
-    env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
-    res = gitutil.rollback_to(task.baseline_ref, project_root, apply=apply,
-                              exclude=(env_rel + "/",))
+    # A task-owned ordered patch journal is the authoritative rollback scope.
+    # It never sweeps unrelated worktree differences into the operation.
+    if task.task_patch_refs:
+        patches = [(name, gitutil.load_patch_ref(project_root, task.id, name))
+                   for name in task.task_patch_refs]
+        missing = [name for name, patch in patches if not patch]
+        if missing:
+            return gitutil.RollbackResult(False,
+                "task patch ref(s) missing: " + ", ".join(missing), [])
+        files = sorted({line.split(" b/", 1)[-1] for _, patch in patches
+                        for line in patch.splitlines() if line.startswith("diff --git a/")})
+        if not apply:
+            return gitutil.RollbackResult(True,
+                f"would reverse {len(patches)} task-owned patch(es)", files)
+        reversed_patches = []
+        for _, patch in reversed(patches):
+            if gitutil.apply_patch(project_root, patch, reverse=True,
+                                   three_way=False):
+                reversed_patches.append(patch)
+                continue
+            # The reverse-apply failed -- before treating it as a genuine
+            # conflict, check whether it's actually unnecessary: e.g. this
+            # patch recorded a step ADDING a file that something else has
+            # since deleted, so there's nothing left to undo and the tree is
+            # already in the patch's pre-state. Only a real conflict (someone
+            # edited the SAME lines this patch touches) aborts the rollback.
+            if gitutil.patch_reverse_is_moot(project_root, patch):
+                continue
+            for prior in reversed(reversed_patches):
+                gitutil.apply_patch(project_root, prior, three_way=False)
+            return gitutil.RollbackResult(False,
+                "task patch conflicts with newer changes; nothing else was rolled back",
+                files)
+        task.task_patch_refs = []
+        gitutil.clear_patch_refs(project_root, task.id)
+        res = gitutil.RollbackResult(True,
+            f"reversed {len(patches)} task-owned patch(es)", files)
+    else:
+        # Legacy tasks created before task patch journals use their baseline.
+        # New executions always populate task_patch_refs.
+        env_rel = env_dir.resolve().relative_to(project_root.resolve()).as_posix()
+        res = gitutil.rollback_to(task.baseline_ref, project_root, apply=apply,
+                                  exclude=(env_rel + "/",))
     if apply and res.ok and reopen:
         task.scratchpad = ""
         task.decisions = []
         task.baseline_ref = ""
         task.stage_checkpoints = {}
+        task.task_patch_refs = []
         gitutil.clear_checkpoints(project_root, task_id)
         task.review_log.append(tasks.ReviewEntry(
             ts=tasks._now_iso(), event="rolled_back", by="user",
@@ -2386,7 +2715,7 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
         if (not question and not idle_notified and cfg.wait_for_reply):
             idle_s = time.time() - last_progress_time
             if idle_s >= cfg.chat_grace_minutes * 60:
-                tg = TelegramHIL.from_env()
+                tg = TelegramHIL.from_env(env_dir)
                 if tg:
                     st_idle = state.State.load(state_dir)
                     current = st_idle.current_task

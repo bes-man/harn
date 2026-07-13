@@ -6,7 +6,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from harn import loop, tasks, gitutil, scaffold, workflows, ENV_DIRNAME
+from harn import loop, tasks, gitutil, scaffold, workflows, transcript, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from .conftest import make_task
 
@@ -97,6 +97,8 @@ def test_run_step_executes_one_turn_and_checkpoints(tmp_path, monkeypatch):
     t = tasks.find(env, "PRJ-001")
     assert "step-000001" in t.stage_checkpoints
     assert t.step_results["step-000001"]["status"] == "ok"
+    assert t.step_results["step-000001"]["output"] == "did work (call 1)"
+    assert t.step_results["step-000001"]["attempts"] == 1
 
 
 def test_run_step_runs_only_the_named_step_prompt(tmp_path, monkeypatch):
@@ -150,6 +152,57 @@ def test_rerun_discards_previous_attempts_edit(tmp_path, monkeypatch):
     assert (root / "app.py").read_text() == "second attempt, clean"
 
 
+def test_rerun_preserves_unrelated_work_created_since_the_checkpoint(tmp_path, monkeypatch):
+    """Reproduces a real data-loss bug: `run_step`'s rerun-restore used to call
+    gitutil.rollback_to(checkpoint, project_root, apply=True) unscoped -- that
+    treats ANY file absent from the checkpoint's tree as "created by this
+    step's attempt" and deletes it, including unrelated work created by
+    something else (another task, a human, another process) in the meantime.
+    Rerun must undo only what THIS step's own attempt changed."""
+    root = _repo(tmp_path)
+    env = _env(root)
+    fake = WritingAdapter(root, texts=["first attempt broke it",
+                                       "second attempt, clean"])
+    _wire(monkeypatch, fake)
+
+    loop.run_step(root, env, "PRJ-001", "step-000001")
+    assert (root / "app.py").read_text() == "first attempt broke it"
+
+    # Unrelated work lands in the tree AFTER this step's checkpoint but
+    # BEFORE the rerun -- e.g. another task's step, or a human editing.
+    (root / "unrelated.py").write_text("someone else's work\n")
+
+    r = loop.run_step(root, env, "PRJ-001", "step-000001", rerun=True)
+    assert r["ok"] is True
+    assert (root / "unrelated.py").read_text() == "someone else's work\n"
+    assert (root / "app.py").read_text() == "second attempt, clean"
+
+
+def test_rerun_falls_back_to_whole_checkpoint_on_a_genuine_conflict(tmp_path, monkeypatch):
+    """If something else edits the EXACT lines this step's own last attempt
+    touched, the precise per-step patch can't reverse cleanly -- a genuine
+    conflict, not the "already gone" case. Rerun must still succeed (fall
+    back to the guaranteed-safe whole-checkpoint restore) rather than
+    silently doing nothing or crashing."""
+    root = _repo(tmp_path)
+    env = _env(root)
+    fake = WritingAdapter(root, texts=["first attempt broke it",
+                                       "second attempt, clean"])
+    _wire(monkeypatch, fake)
+
+    loop.run_step(root, env, "PRJ-001", "step-000001")
+    assert (root / "app.py").read_text() == "first attempt broke it"
+
+    # Someone else edits the SAME file the step's own patch touched.
+    (root / "app.py").write_text("someone else's conflicting edit\n")
+
+    r = loop.run_step(root, env, "PRJ-001", "step-000001", rerun=True)
+    assert r["ok"] is True
+    # Whole-checkpoint fallback restores to the ORIGINAL baseline, discarding
+    # the conflicting edit too -- then the new attempt's own edit lands.
+    assert (root / "app.py").read_text() == "second attempt, clean"
+
+
 def test_run_step_executes_command_type_without_agent_call(tmp_path, monkeypatch):
     root = _repo(tmp_path)
     env = _env(root)
@@ -168,6 +221,9 @@ def test_run_step_executes_command_type_without_agent_call(tmp_path, monkeypatch
     assert "text" not in r
     fresh = tasks.find(env, t.id)
     assert fresh.step_results["step-cmd1"]["status"] == "ok"
+    entries = transcript.read(env, task_id=t.id, step_id="step-cmd1")["entries"]
+    assert [(e["kind"], e["phase"]) for e in entries] == [
+        ("command", "started"), ("command", "completed")]
 
 
 def test_run_step_command_rerun_restores_checkpoint(tmp_path, monkeypatch):
