@@ -379,6 +379,39 @@ def test_import_route_surfaces_non_list_params_as_error(tmp_path):
     assert tools_mod.discover(env) == []
 
 
+def test_upload_flow_js_builds_a_runnable_command_for_the_script(tmp_path):
+    """The Upload-tool JS in studio._HTML auto-builds `command` for an
+    uploaded script. Every execution path (mcp_server._make_tool_function ->
+    tools_mod.execute) runs with cwd=project_root, but save_custom_tool_payload
+    writes the script to <env_dir>/tools/<script_name> -- so the generated
+    command must reference the script via its ENV_DIRNAME-relative path, not
+    a bare filename that only resolves if the script coincidentally also sits
+    at the project root."""
+    assert "command:`bash ${file.name} ${argList}`" not in studio._HTML
+    assert "command:`bash harn_env/tools/${file.name} ${argList}`" in studio._HTML
+
+
+def test_uploaded_tool_script_runs_from_project_root_as_cwd(tmp_path):
+    """End-to-end: save a tool the way the (fixed) Upload flow does -- command
+    references the script at its real ENV_DIRNAME-relative path -- then run it
+    exactly like a live MCP session would (tools_mod.execute with
+    cwd=project_root, mirroring mcp_server._make_tool_function). Must find and
+    run the script, not fail with 'command not found'."""
+    import base64
+    env, project_root = _env(tmp_path)
+    content_b64 = base64.b64encode(b"echo hello-from-script\n").decode()
+    result = studio.save_custom_tool_payload(env, {
+        "name": "run_lint", "description": "d", "params": [],
+        "command": "bash harn_env/tools/lint.sh", "source": "upload",
+        "script_name": "lint.sh", "content_b64": content_b64,
+    })
+    assert result["ok"] is True
+    tool = tools_mod.read(env, "run_lint")
+    output = tools_mod.execute(tool, {}, cwd=project_root)
+    assert "hello-from-script" in output
+    assert "command not found" not in output
+
+
 def test_import_route_rejects_an_oversized_bundle(tmp_path):
     import base64
     env, project_root = _env(tmp_path)

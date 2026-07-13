@@ -3988,7 +3988,7 @@ async function importOrUploadToolFile(input){
   const params=paramsRaw.split(',').map(s=>s.trim()).filter(Boolean);
   const argList=params.map(p=>'{'+p+'}').join(' ');
   const r=await post_('/api/tools/save',{name,description,params,
-    command:`bash ${file.name} ${argList}`.trim(), source:'upload', script_name:file.name, content_b64});
+    command:`bash harn_env/tools/${file.name} ${argList}`.trim(), source:'upload', script_name:file.name, content_b64});
   if(!r.ok){ alert(r.error||'save failed'); return; }
   input.value='';
   await loadToolsData(true);
