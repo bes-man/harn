@@ -185,6 +185,8 @@ class Task:
     # a new attempt on top of a half-finished previous one. Distinct from
     # `baseline_ref` (the task's very first checkpoint, for a full rerun).
     stage_checkpoints: dict = field(default_factory=dict)
+    # Ordered hidden patch refs that form this task's isolated git stage.
+    task_patch_refs: list[str] = field(default_factory=list)
     # Durable per-step results ledger ({step_id: {...}}) — the step-execution
     # engine's record of what happened for each step in the task's workflow
     # snapshot (harn_env/tasks/<id>.workflow.json). Keyed by step id so it
@@ -273,6 +275,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         workflow=d.get("workflow") or None,
         workflow_confirmed=bool(d.get("workflow_confirmed", False)),
         stage_checkpoints=dict(d.get("stage_checkpoints") or {}),
+        task_patch_refs=list(d.get("task_patch_refs") or []),
         step_results=dict(d.get("step_results") or {}),
     )
 
@@ -302,6 +305,7 @@ def _to_dict(task: Task) -> dict:
         "workflow":    task.workflow,
         "workflow_confirmed": task.workflow_confirmed,
         "stage_checkpoints": task.stage_checkpoints,
+        "task_patch_refs": task.task_patch_refs,
         "step_results": task.step_results,
     }
 
@@ -555,7 +559,7 @@ def create_task(
 # mutations (all round-trip through _save)
 # ---------------------------------------------------------------------------
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def set_status(task: Task, status: str) -> None:

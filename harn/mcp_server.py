@@ -174,10 +174,53 @@ def _make_tool_function(tool, project_root: Path, record_used=None):
 # own docstring — test_guidance.py's fixed-overhead budget sweeps every
 # triple-quoted string found in build_server's source as a proxy for
 # agent-facing token cost, and this note is maintainer-facing only.)
+def _scoped_tool_allowlist() -> set[str] | None:
+    """The set of tool names this MCP session may register, or None for
+    unrestricted (every registered tool available, today's only behavior).
+
+    Every tool -- all ~35 built-ins plus every custom tool -- is otherwise
+    visible to EVERY step's agent turn regardless of what that step's own
+    `tools`/`tools_recommended` declare (those were prompt hints only, never
+    enforced). A real incident: a parallel-wave step called its SIBLING's
+    tool, then used project-wide navigation tools (`get_next_task`, `board`)
+    to wander off into an entirely unrelated task mid-turn.
+
+    A step opts into this by setting `tool_mode: "scoped"` in its own plan
+    (Studio's per-step "Tool mode" control) -- restricting is NOT safe to
+    force by default, since some steps genuinely need the full catalog.
+    Resolved from HARN_TASK_ID/HARN_STEP_ID (set by `_replicate_connectors`
+    for a parallel-wave worktree, or by a single-step delegated run) against
+    that task's OWN saved plan. Four effective states fall out of just
+    `tool_mode` + the two existing lists:
+      - unset/"auto" (or no step context at all)      -> None (unrestricted)
+      - "scoped", tools=[], tools_recommended=[]        -> empty set (no tools)
+      - "scoped", tools_recommended=[...]               -> those, optional
+      - "scoped", tools=[...]                           -> those, required
+    """
+    task_id = os.environ.get("HARN_TASK_ID", "")
+    step_id = os.environ.get("HARN_STEP_ID", "")
+    if not task_id or not step_id:
+        return None
+    try:
+        from . import workflows as workflows_mod
+        plan = workflows_mod.load_task_plan(_env_dir(), task_id)
+    except Exception:
+        return None
+    if not plan:
+        return None
+    step = next((n for n in plan.get("nodes", [])
+                if n.get("kind") == "step" and n.get("id") == step_id), None)
+    if step is None or (step.get("tool_mode") or "auto") != "scoped":
+        return None
+    return ({t for t in (step.get("tools") or []) if t} |
+            {t for t in (step.get("tools_recommended") or []) if t})
+
+
 def build_server(start_watch: bool = True, register_custom: bool = True):
     from mcp.server.fastmcp import FastMCP, Image  # lazy: core CLI has no hard dep
 
     mcp = FastMCP("harn")
+    _scoped_allowed = _scoped_tool_allowlist()
 
     # Tag every MCP tool call with the currently claimed task (and, for a
     # sequential step, the currently running step) so studio can later show
@@ -194,11 +237,13 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         try:
             env = _env_dir()
             st = state_mod.State.load(env / "state")
-            if not st.current_task:
+            task_id = os.environ.get("HARN_TASK_ID", "") or st.current_task or ""
+            if not task_id:
                 return
             step_id = os.environ.get("HARN_STEP_ID", "") or st.current_step or ""
-            events_mod.emit(env, "tool_used", task_id=st.current_task,
-                            step_id=step_id or None, tool=tool_name)
+            events_mod.emit(env, "tool_used", task_id=task_id,
+                            step_id=step_id or None, tool=tool_name,
+                            run_id=os.environ.get("HARN_RUN_ID") or None)
         except Exception:
             pass
 
@@ -208,6 +253,8 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         inner_decorator = _orig_tool(*deco_args, **deco_kwargs)
 
         def wrap(fn):
+            if _scoped_allowed is not None and fn.__name__ not in _scoped_allowed:
+                return fn  # this step is scoped and didn't declare this tool
             import functools
 
             @functools.wraps(fn)
@@ -223,7 +270,9 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
     # registered custom tools that the boot loop below uses.
     mcp._harn_record_tool_used = _record_tool_used
 
-    if start_watch:
+    # A workflow worker inherits its parent's correlation id. It must not
+    # create a competing chat run in the shared event stream.
+    if start_watch and not os.environ.get("HARN_RUN_ID"):
         # Auto-start the watch dispatcher so Telegram escalation, oracle, and
         # live status work without the user having to run a separate command.
         _ensure_watch_running(_env_dir())
@@ -371,38 +420,6 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         out += "\n\n" + autonomy_directive(cfg.autonomy)
         out += "\n\n" + codebase_mod.prompt_note(env)
 
-        # Low autonomy (≤ 30%): MCP itself gates on developer confirmation so
-        # the block fires regardless of Auto Mode / headless hints.
-        if cfg.autonomy <= 0.3:
-            q = (
-                f"Task {t.id} claimed: \"{t.title}\".\n\n"
-                "Before I make ANY file changes, please tell me:\n"
-                "1. What should I focus on or get right?\n"
-                "2. Any constraints or things to avoid?\n"
-                "3. Or simply confirm: \"proceed as the task describes.\"\n\n"
-                "(Autonomy is ≤ 30% — every implementation decision needs "
-                "explicit approval before I act.)"
-            )
-            state_dir = env / "state"
-            state_dir.mkdir(parents=True, exist_ok=True)
-            if not state_mod.read_block_question(state_dir):
-                state_mod.blocked_marker(state_dir).write_text(
-                    q, encoding="utf-8")
-                st = state_mod.State.load(state_dir)
-                st.block(q)
-                st.current_task = t.id
-                st.save(state_dir)
-                _log(f"{t.id}: awaiting developer confirmation (autonomy ≤ 30%)")
-            out += (
-                "\n\n⛔ CONFIRMATION REQUIRED (autonomy ≤ 30%)\n"
-                "harn has registered a clarifying question in BLOCKED state — "
-                "`harn watch` will escalate to Telegram if unanswered.\n"
-                "PRESENT THE QUESTION BELOW to the developer NOW via your "
-                "native `AskUserQuestion` tool, then STOP.\n"
-                "Do NOT make any file changes until you call "
-                "`answer_question(their_answer)` to clear the block.\n\n"
-                f"Question to show:\n---\n{q}\n---"
-            )
         note = skill_library.gap_note(env, t)
         if note:
             out += "\n\n" + note
@@ -914,6 +931,8 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
                      f"fails safety predicate (built-in name, non-list "
                      f"params, or unsafe param name)")
                 continue
+            if _scoped_allowed is not None and custom_tool.name not in _scoped_allowed:
+                continue  # this step is scoped and didn't declare this tool
             fn = _make_tool_function(custom_tool, _env_dir().parent,
                                      _record_tool_used)
             mcp.add_tool(fn, name=custom_tool.name,
@@ -1142,7 +1161,8 @@ def serve(http: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None
     # the exact cause of the Flow tab getting stuck showing "starting…"
     # forever while a real run is actively executing under a different id.
     probe = os.environ.get("HARN_MCP_PROBE") == "1"
-    mcp = build_server(start_watch=not probe)
+    managed_worker = bool(os.environ.get("HARN_RUN_ID"))
+    mcp = build_server(start_watch=not probe and not managed_worker)
     if http:
         mcp.settings.host = host
         mcp.settings.port = port

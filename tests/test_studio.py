@@ -6,7 +6,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from harn import workflow, skills, studio, scaffold, ENV_DIRNAME
+from harn import workflow, skills, studio, scaffold, transcript, ENV_DIRNAME
+from .conftest import make_task
 
 
 # --- parse / compose round-trip -------------------------------------------- #
@@ -238,6 +239,23 @@ def test_progress_complete_when_run_ends_ok(tmp_path):
     assert p["ended"] is True
 
 
+def test_progress_for_task_is_not_stolen_by_unrelated_chat_run(tmp_path):
+    """A MCP/chat session may start while a workflow step is running.  The
+    flow sidebar must keep following its selected task, not the last global
+    run_start event in the shared telemetry file."""
+    from harn import events
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    events.new_run(env, kind="loop")
+    events.emit(env, "stage_start", task_id="PRJ-044", stage="step-weather")
+    events.new_run(env, kind="chat")
+
+    p = studio.progress_payload(env, task_id="PRJ-044")
+
+    assert p["active"] == "step-weather"
+    assert p["stages"]["step-weather"]["status"] == "active"
+
+
 def test_node_stage_keyword_mapping():
     assert studio._node_stage("Implement") == "execute"
     assert studio._node_stage("Tests") == "test"
@@ -406,3 +424,332 @@ def test_server_serves_html_and_api(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_studio_polling_defers_panel_renders_while_interacting():
+    """Polling must preserve editors, pointer drags, and browser text selections."""
+    html = studio._HTML
+    assert "function panelIsEditing(el)" in html
+    assert "function panelHasTextSelection(el)" in html
+    assert "window.getSelection" in html
+    assert "!selection.isCollapsed" in html
+    assert "function panelIsInteracting(el)" in html
+    assert "ACTIVE_TEXT_DRAG_PANEL===el" in html
+    assert "pollingCanReplace($('#listView'))" in html
+    assert "pollingCanReplace($('#insp'))" in html
+
+
+def test_studio_board_poll_renders_only_changed_data():
+    html = studio._HTML
+    assert "let BOARD_LIST_RENDER_KEY=null" in html
+    assert "let BOARD_DETAIL_RENDER_KEY=null" in html
+    assert "const listChanged=boardListRenderKey()!==BOARD_LIST_RENDER_KEY" in html
+    assert "const detailChanged=boardDetailRenderKey()!==BOARD_DETAIL_RENDER_KEY" in html
+
+
+def test_studio_activity_entries_show_second_precision_launch_time():
+    """Reported gap: diagnosing a run that took over 2 minutes for a trivial
+    task, every Agent activity entry looked the same age -- no way to see
+    WHEN each tool call/message actually fired, only their relative order.
+    Each entry's own `ts` (already second-precision from transcript.append)
+    must now render as a local HH:MM:SS clock next to it."""
+    html = studio._HTML
+    assert "function fmtClock(ts)" in html
+    assert "fmtClock(e.ts)" in html
+
+
+def test_studio_step_editor_has_tool_mode_selector_and_cycle_tool():
+    """Studio's per-step Tool mode control (auto/scoped) and the 3-state
+    required/recommended/off tool cycle, backing mcp_server's per-step tool
+    registration scoping."""
+    html = studio._HTML
+    assert "function cycleTool(name)" in html
+    assert "setStepField('tool_mode'" in html
+    assert 'value="scoped"' in html
+    assert 'value="auto"' in html
+
+
+def test_studio_review_log_preserves_scroll_across_required_render():
+    html = studio._HTML
+    assert 'id="reviewLog"' in html
+    assert "const reviewScroll=previousReview?previousReview.scrollTop:0" in html
+    assert "nextReview.scrollTop=reviewScroll" in html
+    assert "panel.scrollTop=panelScroll" in html
+
+
+def test_studio_polling_discards_stale_responses():
+    """A slower prior poll must not overwrite the result of a newer poll."""
+    html = studio._HTML
+    assert "let boardPollGeneration=0" in html
+    assert "if(generation!==boardPollGeneration) return;" in html
+    assert "let progressPollGeneration=0" in html
+    assert "if(generation!==progressPollGeneration) return;" in html
+
+
+def test_studio_settings_expose_autonomy_telegram_and_grace():
+    html = studio._HTML
+    assert 'id="setAutonomy"' in html
+    assert "numField('setChatGrace'" in html
+    assert 'id="setTelegramApiKey"' in html
+    assert 'id="setTelegramUserId"' in html
+
+
+def test_studio_blocked_question_supports_sidebar_options():
+    html = studio._HTML
+    assert "function questionOptions(question)" in html
+    assert "submitAnswer(option.value)" in html
+    assert "Recommended" in html
+
+
+def test_flow_progress_poll_remains_live_while_an_editor_is_focused():
+    html = studio._HTML
+    progress = html[html.index("async function pollProgress()"):
+                    html.index("/* ---------- board tab")]
+    assert "PROG=next;" in progress
+    assert "applyProgress();" in progress
+    assert progress.index("applyProgress();") < progress.index("pollingCanReplace(term)")
+    assert "if(term && pollingCanReplace(term)" in progress
+
+
+def test_header_keeps_primary_actions_inside_viewport():
+    html = studio._HTML
+    assert '<div class="header-actions">' in html
+    assert ".header-actions{display:flex" in html
+    assert "@media (max-width:1500px)" in html
+    assert ".wfdesc,.proj,.toggles{display:none}" in html
+
+
+def test_flow_sidebar_renders_visual_step_timeline_and_usage_states():
+    html = studio._HTML
+    assert 'class="run-progress"' in html
+    assert 'class="progress-rail"' in html
+    assert 'class="run-step ${status}"' in html
+    assert "usagePill('skill'" in html
+    assert "usagePill('tool'" in html
+    assert "usage-used" in html
+    assert "usage-unused-recommended" in html
+    assert "usage-unused-required" in html
+    assert "replaceAll('_','-')" in html
+
+
+def test_launching_flow_opens_visual_progress_sidebar():
+    html = studio._HTML
+    run = html[html.index("async function launchCurrentFlow()"):
+               html.index("async function runWholeWorkflow()")]
+    assert "RUN_HISTORY_OPEN=true" in run
+    assert "RUN_HISTORY_MODE='execution'" in run
+    assert run.index("RUN_HISTORY_OPEN=true") < run.index("post_('/api/tasks/launch_workflow'")
+
+
+def test_launching_flow_warns_about_context_loss_only_for_a_restart():
+    html = studio._HTML
+    run = html[html.index("async function launchCurrentFlow()"):
+               html.index("async function runWholeWorkflow()")]
+    assert "taskHasExecutionHistory(task)" in run
+    assert "Git will restore project files to the task baseline" in run
+    assert "All saved execution context" in run
+    assert "prior errors, attempts, transcripts, scratchpad, and decisions" in run
+    assert run.index("taskHasExecutionHistory(task)") < run.index("post_('/api/tasks/launch_workflow'")
+
+
+def test_restart_clears_optimistic_sidebar_artifacts_before_render():
+    html = studio._HTML
+    run = html[html.index("async function launchCurrentFlow()"):
+               html.index("async function runWholeWorkflow()")]
+    assert "const restarting=taskHasExecutionHistory(task)" in run
+    assert "task.step_results={}" in run
+    assert "task.review_log=[]" in run
+    assert "task.context_reads=[]" in run
+    assert "resetRunClientState(taskId)" in run
+    assert run.index("task.step_results={}") < run.index("renderRunHistory();")
+
+
+def test_launch_clears_transcript_again_after_server_confirms_clean_restart():
+    html = studio._HTML
+    run = html[html.index("async function launchCurrentFlow()"):
+               html.index("async function runWholeWorkflow()")]
+    post = run.index("post_('/api/tasks/launch_workflow'")
+    success = run.index("if(!r.ok)")
+    assert "resetRunClientState(taskId)" in run[success:]
+    assert run.index("resetRunClientState(taskId)", success) > post
+
+
+def test_blocked_sidebar_restart_uses_full_workflow_reset_not_attempt_only_retry():
+    html = studio._HTML
+    render = html[html.index("const renderRunStep=(n)=>"):
+                  html.index("const rows=executionPlanGroups")]
+    assert "Restart flow from scratch" in render
+    assert "rerunSidebarWorkflow()" in render
+    assert "retryBlockedStep" not in render
+
+
+def test_sidebar_restart_warns_that_old_attempt_log_and_context_are_deleted():
+    html = studio._HTML
+    fn = html[html.index("async function rerunSidebarWorkflow()"):
+              html.index("async function rerunWholeWorkflow()")]
+    assert "Old attempts, errors, transcript, and saved execution context will be deleted" in fn
+
+
+def test_all_clean_restart_actions_reset_client_run_context():
+    html = studio._HTML
+    assert "function resetRunClientState(taskId)" in html
+    assert "RUN_TRANSCRIPT={taskId,cursor:0,entries:[]}" in html
+    assert "PROG={stages:{},totals:{},active:null,ended:false}" in html
+    for start, end in [
+        ("async function launchCurrentFlow()", "async function runWholeWorkflow()"),
+        ("async function rerunSidebarWorkflow()", "async function rerunWholeWorkflow()"),
+        ("async function rerunWholeWorkflow()", "/* ---------- per-step Run/Rerun"),
+    ]:
+        assert "resetRunClientState(taskId)" in html[html.index(start):html.index(end)]
+
+
+def test_resume_remains_non_destructive():
+    html = studio._HTML
+    resume = html[html.index("async function resumeFrozenFlow()"):
+                  html.index("async function rerunSidebarWorkflow()")]
+    assert "/api/tasks/launch" in resume
+    assert "/api/tasks/launch_workflow" not in resume
+    assert "/api/tasks/rerun_workflow" not in resume
+    assert "resetRunClientState" not in resume
+
+
+def test_run_history_renders_before_waiting_for_task_plan():
+    html = studio._HTML
+    fn = html[html.index("async function openRunHistory()"):
+              html.index("function renderRunHistory()")]
+    assert fn.index("renderRunHistory();") < fn.index("await (await fetch(api('/api/task_plan?")
+    assert "RUN_HISTORY_PLAN={taskId, nodes:null};" in fn
+    assert "if(RUN_HISTORY_MODE==='preview')" in fn
+    assert "nodes:S.workflow.nodes" in fn
+    assert "retryBlockedStep" in html
+
+
+def test_clicking_run_workflow_heading_opens_progress_sidebar():
+    html = studio._HTML
+    assert 'class="ttl run-launch" onclick="openRunHistory()"' in html
+
+
+def test_transcript_payload_filters_and_pages(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    make_task(env, "PRJ-1")
+    make_task(env, "PRJ-2")
+    first = transcript.append(
+        env, task_id="PRJ-1", step_id="step-a", run_id="r-1", attempt=1,
+        kind="status", phase="started", title="Start", text="one")
+    transcript.append(
+        env, task_id="PRJ-1", step_id="step-b", run_id="r-1", attempt=1,
+        kind="message", phase="completed", title="Agent", text="two")
+    transcript.append(
+        env, task_id="PRJ-2", step_id="step-a", run_id="r-2", attempt=1,
+        kind="message", phase="completed", title="Agent", text="private")
+
+    page = studio.transcript_payload(env, "PRJ-1", after=str(first["seq"]))
+    assert page["ok"] is True
+    assert [e["text"] for e in page["entries"]] == ["two"]
+    assert studio.transcript_payload(env, "missing")["ok"] is False
+    assert studio.transcript_payload(env, "PRJ-1", step_id="step-a")["entries"][0]["text"] == "one"
+
+
+def test_run_sidebar_has_live_per_step_transcript():
+    html = studio._HTML
+    assert "async function pollRunTranscript()" in html
+    assert "/api/tasks/transcript?task=" in html
+    assert 'data-step-transcript="${esc(n.id)}"' in html
+    assert "Waiting for agent output…" in html
+    assert "function transcriptEntryHtml" in html
+    assert "RUN_TRANSCRIPT.cursor" in html
+    assert "rememberTranscriptOpen" in html
+
+
+def test_run_sidebar_polling_uses_render_key_and_interaction_guard():
+    html = studio._HTML
+    assert "let RUN_HISTORY_RENDER_KEY=null" in html
+    assert "function runHistoryRenderKey()" in html
+    assert "function renderRunHistoryIfChanged()" in html
+    assert "if(!pollingCanReplace($('#insp')))return" in html
+    assert "runHistoryRenderKey()===RUN_HISTORY_RENDER_KEY" in html
+    board = html[html.index("async function pollBoard()"):html.index("let BLOCKED_Q_TASK")]
+    assert "renderRunHistoryIfChanged()" in board
+    terminal = html[html.index("function renderFlowTerminal(el)"):
+                    html.index("async function launchCurrentFlow()")]
+    assert "renderRunHistory();" not in terminal
+    assert terminal.count("renderRunHistoryIfChanged()") >= 3
+
+
+def test_polling_dom_replacement_stops_for_any_document_selection():
+    html = studio._HTML
+    assert "function documentHasTextSelection()" in html
+    assert "function pollingCanReplace(el)" in html
+    assert "!documentHasTextSelection()" in html
+    progress = html[html.index("async function pollProgress()"):
+                    html.index("/* ---------- board tab")]
+    assert "pollingCanReplace(term)" in progress
+    board = html[html.index("async function pollBoard()"):
+                 html.index("let BLOCKED_Q_TASK")]
+    assert "pollingCanReplace($('#listView'))" in board
+    assert "pollingCanReplace($('#insp'))" in board
+
+
+def test_run_sidebar_preserves_nested_transcript_scroll():
+    html = studio._HTML
+    assert 'data-run-scroll="${esc(e.seq)}"' in html
+    assert "const nestedScroll=new Map()" in html
+    assert "panel.querySelectorAll('[data-run-scroll]')" in html
+    assert "el.scrollTop=nestedScroll.get(el.dataset.runScroll)" in html
+
+
+def test_flow_history_prefers_completed_task_with_step_results_after_reload():
+    html = studio._HTML
+    fn = html[html.index("function flowSelectedTaskId()"):
+              html.index("function flowSelectedTask()")]
+    assert "withResults" in fn
+    assert "Object.keys(t.step_results||{}).length" in fn
+
+
+def test_polling_tracks_native_form_interactions_beyond_active_element():
+    html = studio._HTML
+    assert "let ACTIVE_FORM_CONTROL=null" in html
+    assert "function formControlFromEvent" in html
+    assert "document.addEventListener('pointerdown',trackFormInteraction,true)" in html
+    assert "document.addEventListener('focusin',trackFormInteraction,true)" in html
+    assert "document.addEventListener('change',releaseFormInteraction,true)" in html
+    assert "ACTIVE_FORM_CONTROL&&el.contains(ACTIVE_FORM_CONTROL)" in html
+
+
+def test_every_poll_driven_form_render_has_editing_guard():
+    html = studio._HTML
+    progress = html[html.index("async function pollProgress()"):
+                    html.index("/* ---------- board tab")]
+    assert "pollingCanReplace(term)" in progress
+    board = html[html.index("async function pollBoard()"):
+                 html.index("let BLOCKED_Q_TASK")]
+    assert "if(RUN_HISTORY_OPEN && tab==='flow')" in board
+    assert "pollingCanReplace($('#listView'))" in board
+    assert "pollingCanReplace($('#insp'))" in board
+    blocked = html[html.index("async function pollBlockedQuestion()"):
+                   html.index("async function submitAnswer")]
+    assert "if(!pollingCanReplace(el)) return" in blocked
+
+
+def test_run_sidebar_previews_canvas_and_uses_shared_launch_action():
+    html = studio._HTML
+    assert "let RUN_HISTORY_MODE='preview'" in html
+    assert "RUN_HISTORY_MODE==='preview' ? S.workflow.nodes" in html
+    assert "async function launchCurrentFlow()" in html
+    assert "/api/tasks/launch_workflow" in html
+    assert html.count('onclick="launchCurrentFlow()"') >= 2
+
+
+def test_execution_plan_groups_parallel_wave_members():
+    html = studio._HTML
+    assert "function executionPlanGroups(steps)" in html
+    assert 'class="run-wave"' in html
+    assert "∥ parallel · ${esc(group.id)}" in html
+    assert "group.steps.map(renderRunStep)" in html
+
+
+def test_sidebar_runtime_status_uses_same_progress_ids_as_canvas():
+    html = studio._HTML
+    assert "function runtimeStepStatus(stepId,ledgerStatus)" in html
+    assert "(PROG.stages||{})[stepId]" in html

@@ -522,7 +522,19 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
     parts: list[str] = [base]
     if auto:
         parts.append(_AUTO_NOTE)
-    if cfg.loop_aware:
+    # _LIFECYCLE_NOTE explicitly tells the agent to use get_next_task/
+    # run_tests/board/submit_for_review -- correct framing for run()'s own
+    # top-level autonomous cycle, but wrong for one step delegated out of a
+    # parallel wave (which must do ONLY its own declared work and stop, not
+    # navigate the whole project queue or decide the task is done). A real
+    # incident: a parallel step followed this note into calling all four
+    # tools, then used `board` to pick up and start resuming an unrelated
+    # task mid-turn. Same reasoning applies to `tool_mode: "scoped"` (Studio's
+    # per-step tool restriction): those four tools plus most others simply
+    # aren't registered for a scoped step's session, so telling it to use
+    # them would be actively misleading, not just off-scope.
+    scoped = (step.get("tool_mode") or "auto") == "scoped"
+    if cfg.loop_aware and not parallel_note and not scoped:
         parts.append(_LIFECYCLE_NOTE)
     parts.append(
         "## Available skills (load only what you need)\n"

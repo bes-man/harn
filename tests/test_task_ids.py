@@ -15,6 +15,16 @@ def test_is_tracker_key():
     assert not ids.is_tracker_key("auth")
 
 
+def test_now_iso_has_second_precision():
+    """`_now_iso()` timestamps every step_results started/ended entry the
+    studio Activity view renders. Minute-only precision made concurrent
+    parallel-wave steps (or several quick tool calls) indistinguishable in
+    the UI -- a real, reported gap when diagnosing why a "simple" run took
+    over two minutes: every timestamp in view read the same "HH:MM"."""
+    import re
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", tasks._now_iso())
+
+
 def test_task_with_multiple_prds(tmp_path):
     (tmp_path / "tasks").mkdir()
     path = tmp_path / "tasks" / "AUTH-42.json"

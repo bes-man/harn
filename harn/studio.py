@@ -35,6 +35,8 @@ from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
 from . import tools as tools_mod
+from . import telegram as telegram_mod
+from . import transcript as transcript_mod
 from . import workflow as workflow_mod
 from . import workflows as workflows_mod
 from .config import Config
@@ -456,7 +458,7 @@ def models_payload(env_dir: Path) -> dict:
         agents[name] = {"model": bool(a.MODEL_FLAG), "effort": bool(a.EFFORT_FLAG),
                         "temperature": bool(a.TEMPERATURE_FLAG),
                         "available": a.available(),
-                        "models": list(a.MODELS), "efforts": list(a.EFFORTS),
+                        "models": list(a.discover_models()), "efforts": list(a.EFFORTS),
                         "temperatures": list(a.TEMPERATURES)}
     return {"agent_chain": cfg.agent_chain,
             "default_agent": (cfg.agent_chain[0] if cfg.agent_chain else cfg.agent),
@@ -502,23 +504,39 @@ def save_defaults(env_dir: Path, payload: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def settings_payload(env_dir: Path) -> dict:
     cfg = Config.load(env_dir)
+    telegram_api_key, telegram_user_id = telegram_mod.load_credentials(env_dir)
     return {"max_cost_usd": cfg.max_cost_usd, "max_tokens": cfg.max_tokens,
             "turn_timeout_seconds": cfg.turn_timeout_seconds,
             "max_iterations": cfg.max_iterations,
             "mcp_ui_supervise": cfg.mcp_ui_supervise,
             "mcp_ui_port": cfg.mcp_ui_port,
-            "mcp_tool_reload_seconds": cfg.mcp_tool_reload_seconds}
+            "mcp_tool_reload_seconds": cfg.mcp_tool_reload_seconds,
+            # Post-task pipeline stages (run by `harn watch` when a task hits
+            # review) — NOT workflow steps, so a minimal 1-step workflow still
+            # triggers them unless turned off here.
+            "oracle": cfg.oracle, "auto_reconcile": cfg.auto_reconcile,
+            "design": cfg.design,
+            "autonomy_percent": int(round(cfg.autonomy * 100)),
+            "chat_grace_minutes": cfg.chat_grace_minutes,
+            "telegram_configured": bool(telegram_api_key and telegram_user_id),
+            "telegram_user_id": telegram_user_id}
 
 
 # key -> (section, kind); kind: "float" | "int" | "bool"
 _SETTINGS_KEYS = {
+    "autonomy_percent": ("harn", "percent"),
+    "chat_grace_minutes": ("notify", "int"),
     "max_cost_usd": ("loop", "float"), "max_tokens": ("loop", "int"),
     "turn_timeout_seconds": ("loop", "int"), "max_iterations": ("loop", "int"),
     "mcp_ui_supervise": ("mcp", "bool"), "mcp_ui_port": ("mcp", "int"),
     "mcp_tool_reload_seconds": ("mcp", "int"),
+    # Extra pipeline stages that run OUTSIDE the chosen workflow's steps.
+    "oracle": ("loop", "bool"), "auto_reconcile": ("loop", "bool"),
+    "design": ("loop", "bool"),
 }
 # UI/config key name -> the harn.toml key name (they differ for the mcp_* ones).
 _SETTINGS_TOML_KEY = {
+    "autonomy_percent": "autonomy",
     "mcp_ui_supervise": "ui_supervise", "mcp_ui_port": "ui_port",
     "mcp_tool_reload_seconds": "tool_reload_seconds",
 }
@@ -541,6 +559,10 @@ def _coerce_setting(kind: str, raw):
         return None, "value must be a finite number"
     if val < 0:
         return None, "value cannot be negative"
+    if kind == "percent":
+        if val > 100:
+            return None, "percentage cannot exceed 100"
+        return val / 100, ""
     return val, ""
 
 
@@ -551,6 +573,10 @@ def save_loop_mcp_settings(env_dir: Path, payload: dict) -> dict:
     toml_path = env_dir / "harn.toml"
     text = toml_path.read_text(encoding="utf-8") if toml_path.exists() else ""
     saved = {}
+    if "telegram_api_key" in payload or "telegram_user_id" in payload:
+        telegram_mod.save_credentials(
+            env_dir, str(payload.get("telegram_api_key") or ""),
+            str(payload.get("telegram_user_id") or ""))
     for key, raw in payload.items():
         spec = _SETTINGS_KEYS.get(key)
         if not spec:
@@ -605,7 +631,7 @@ def _node_stage(title: str) -> str | None:
     return None
 
 
-def progress_payload(env_dir: Path) -> dict:
+def progress_payload(env_dir: Path, task_id: str = "") -> dict:
     """Per-node status + per-stage stats for the LATEST run, from events.jsonl.
 
     status per stage: 'active' (running), 'done' (finished, run still going),
@@ -615,11 +641,13 @@ def progress_payload(env_dir: Path) -> dict:
     evs = events_mod.read(env_dir)
     if not evs:
         return {"run": None, "stages": {}, "totals": {}, "active": None, "ended": False}
-    last_run = None
-    for e in evs:
-        if e.get("event") == "run_start":
-            last_run = e.get("run_id")
-    run = [e for e in evs if e.get("run_id") == last_run] if last_run else evs
+    # Events are shared with interactive MCP/chat sessions. A selected Flow
+    # must follow its task, not whichever unrelated chat wrote the last global
+    # run_start. Task telemetry is cleared on a clean restart, and this also
+    # retains every member of a parallel wave.
+    task_events = [e for e in evs if e.get("task_id") == task_id] if task_id else []
+    run = task_events or evs
+    last_run = next((e.get("run_id") for e in reversed(run) if e.get("run_id")), None)
     stages: dict[str, dict] = {}
     active = None
     ended = False
@@ -697,6 +725,25 @@ def board_payload(env_dir: Path) -> dict:
     return payload
 
 
+def transcript_payload(env_dir: Path, task_id: str, *, step_id: str = "",
+                       after: str | int = 0, limit: str | int = 500) -> dict:
+    """Visible, cursor-paged agent transcript for one task or step."""
+    if tasks_mod.find(env_dir, task_id) is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    try:
+        safe_after = max(0, int(after))
+    except (TypeError, ValueError):
+        safe_after = 0
+    try:
+        safe_limit = min(500, max(1, int(limit)))
+    except (TypeError, ValueError):
+        safe_limit = 500
+    result = transcript_mod.read(
+        env_dir, task_id=task_id, step_id=step_id or None,
+        after=safe_after, limit=safe_limit)
+    return {"ok": True, **result}
+
+
 def blocked_question_payload(env_dir: Path, task_id: str) -> dict:
     """The pending BLOCKED question for this env, if any, so the Board tab
     can show it and let a human answer without leaving studio. The question
@@ -721,6 +768,24 @@ def answer_payload(env_dir: Path, task_id: str, text: str) -> dict:
     from . import loop as loop_mod
     loop_mod.answer(env_dir, text, source="studio")
     return {"ok": True}
+
+
+def reset_step_attempts_payload(env_dir: Path, task_id: str, step_id: str) -> dict:
+    """Clear one blocked step's cap so the Studio Retry button can run it."""
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    entry = task.step_results.get(step_id)
+    if entry is None:
+        return {"ok": False, "error": f"no recorded step {step_id}"}
+    task.step_results[step_id] = {**entry, "attempts": 0, "status": "pending"}
+    tasks_mod._save(task)
+    st = state_mod.State.load(env_dir / "state")
+    if st.phase == state_mod.BLOCKED and st.current_task == task_id:
+        state_mod.blocked_marker(env_dir / "state").unlink(missing_ok=True)
+        st.answer(f"Retry requested for {step_id}.")
+        st.save(env_dir / "state")
+    return {"ok": True, "task_id": task_id, "step_id": step_id}
 
 
 def set_task_workflow(env_dir: Path, payload: dict) -> dict:
@@ -871,6 +936,103 @@ def launch_task(env_dir: Path, payload: dict) -> dict:
                              auto=bool(payload.get("auto")))
 
 
+def _clean_restart(env_dir: Path, task_id: str):
+    """Restore a task baseline, then discard all execution context."""
+    from . import loop as loop_mod
+    existing = tasks_mod.find(env_dir, task_id)
+    if existing is None:
+        return None, f"no task {task_id}"
+    if existing.task_patch_refs or existing.baseline_ref:
+        result = loop_mod.rollback(
+            env_dir.parent, env_dir, task_id, apply=True, reopen=True)
+        if not result.ok:
+            return None, result.message
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return None, f"no task {task_id} after rollback"
+    task.step_results = {}
+    task.stage_checkpoints = {}
+    task.scratchpad = ""
+    task.decisions = []
+    task.changelog = []
+    task.review_log = []
+    task.claimed_by = None
+    task.claimed_at = ""
+    task.status = tasks_mod.TODO
+    tasks_mod._save(task)
+    transcript_mod.clear_task(env_dir, task_id)
+    events_mod.clear_task(env_dir, task_id)
+    state_dir = env_dir / "state"
+    state_mod.State().save(state_dir)
+    state_mod.clear_block_marker(state_dir)
+    state_mod.clear_block_skill(state_dir)
+    return task, ""
+
+
+def _has_execution_history(env_dir: Path, task) -> bool:
+    """Runtime history exists independently of whether git captured a baseline."""
+    if (task.step_results or task.stage_checkpoints or task.scratchpad
+            or task.decisions or task.review_log or task.changelog
+            or task.claimed_by or task.claimed_at):
+        return True
+    if transcript_mod.read(env_dir, task_id=task.id).get("entries"):
+        return True
+    return bool(events_mod.read(env_dir, task_id=task.id))
+
+
+def launch_workflow(env_dir: Path, payload: dict) -> dict:
+    """Freeze the posted canvas plan for a task and launch that exact flow."""
+    task_id = (payload.get("task_id") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if runner_mod.active(env_dir):
+        return {"ok": False, "error": "another run is already active"}
+    plan = payload.get("plan") or {}
+    if not isinstance(plan, dict) or not isinstance(plan.get("nodes"), list):
+        return {"ok": False, "error": "missing canvas plan"}
+    workflow = (payload.get("workflow") or "").strip()
+    slug = workflows_mod._slug(workflow) if workflow else None
+    if slug and not any(m["name"] == slug for m in workflows_mod.list_workflows(env_dir)):
+        return {"ok": False, "error": f"unknown workflow '{workflow}'"}
+
+    if _has_execution_history(env_dir, task):
+        task, error = _clean_restart(env_dir, task_id)
+        if error:
+            return {"ok": False, "error": error}
+
+    old_plan = workflows_mod.load_task_plan(env_dir, task_id)
+    old_workflow, old_confirmed = task.workflow, task.workflow_confirmed
+    old_results = dict(task.step_results)
+    try:
+        workflows_mod.save_task_plan(env_dir, task_id, plan)
+        frozen = workflows_mod.load_task_plan(env_dir, task_id) or plan
+        task.workflow = slug
+        task.workflow_confirmed = True
+        task.stage_checkpoints = {}
+        task.step_results = {
+            n["id"]: {"status": "pending", "attempts": 0}
+            for n in frozen.get("nodes", [])
+            if n.get("kind") == "step" and n.get("enabled", True) and n.get("id")
+        }
+        tasks_mod._save(task)
+        result = runner_mod.launch(
+            env_dir.parent, env_dir, task_id, auto=bool(payload.get("auto")))
+        if result.get("ok"):
+            return {**result, "plan": frozen}
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+
+    if old_plan is not None:
+        workflows_mod.save_task_plan(env_dir, task_id, old_plan)
+    else:
+        workflows_mod.task_plan_path(env_dir, task_id).unlink(missing_ok=True)
+    task.workflow, task.workflow_confirmed = old_workflow, old_confirmed
+    task.step_results = old_results
+    tasks_mod._save(task)
+    return result
+
+
 def stop_task(env_dir: Path, payload: dict) -> dict:
     """Stop the active UI-launched run (best-effort SIGTERM)."""
     return runner_mod.stop(env_dir)
@@ -911,8 +1073,10 @@ def launch_step(env_dir: Path, payload: dict) -> dict:
         from . import loop as loop_mod
         rb = loop_mod.rollback_parallel_step(env_dir.parent, env_dir,
                                              task_id, step_id)
-        if rb.get("mode") == "whole-wave-fallback":
+        if rb.get("note"):
             note = rb.get("note", "")
+        if not rb.get("ok"):
+            return rb
     result = runner_mod.launch(env_dir.parent, env_dir, task_id,
                                step=step_id, rerun=rerun)
     if note:
@@ -938,13 +1102,12 @@ def rerun_workflow(env_dir: Path, payload: dict) -> dict:
     t = tasks_mod.find(env_dir, task_id)
     if t is None:
         return {"ok": False, "error": f"no task {task_id}"}
-    if not t.baseline_ref:
+    if not (t.task_patch_refs or t.baseline_ref):
         return {"ok": False, "error": "no baseline recorded yet — this task "
                 "hasn't started its first attempt"}
-    from . import loop as loop_mod
-    res = loop_mod.rollback(env_dir.parent, env_dir, task_id, apply=True, reopen=True)
-    if not res.ok:
-        return {"ok": False, "error": res.message}
+    _, error = _clean_restart(env_dir, task_id)
+    if error:
+        return {"ok": False, "error": error}
     return runner_mod.launch(env_dir.parent, env_dir, task_id,
                              auto=bool(payload.get("auto")))
 
@@ -1051,7 +1214,7 @@ def _make_handler(default_env: Path):
             elif route == "/api/config":
                 self._json(config_payload(env))
             elif route == "/api/progress":
-                self._json(progress_payload(env))
+                self._json(progress_payload(env, self._query("task") or ""))
             elif route == "/api/workflows":
                 self._json(list_workflows_payload(env))
             elif route == "/api/tools":
@@ -1060,6 +1223,10 @@ def _make_handler(default_env: Path):
                 self._json(board_payload(env))
             elif route == "/api/tasks/blocked_question":
                 self._json(blocked_question_payload(env, self._query("task") or ""))
+            elif route == "/api/tasks/transcript":
+                self._json(transcript_payload(
+                    env, self._query("task") or "", step_id=self._query("step") or "",
+                    after=self._query("after") or 0, limit=self._query("limit") or 500))
             elif route == "/api/models":
                 self._json(models_payload(env))
             elif route == "/api/mcp/health":
@@ -1141,10 +1308,15 @@ def _make_handler(default_env: Path):
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/launch":
                 self._json(launch_task(env, body))
+            elif route == "/api/tasks/launch_workflow":
+                self._json(launch_workflow(env, body))
             elif route == "/api/tasks/stop":
                 self._json(stop_task(env, body))
             elif route == "/api/tasks/answer":
                 self._json(answer_payload(env, body.get("task", ""), body.get("text", "")))
+            elif route == "/api/tasks/reset_step_attempts":
+                self._json(reset_step_attempts_payload(
+                    env, body.get("task_id", ""), body.get("step_id", "")))
             elif route == "/api/tasks/run_stage":
                 self._json(launch_stage(env, body))
             elif route == "/api/tasks/run_step":
@@ -1382,6 +1554,8 @@ _HTML = r"""<!DOCTYPE html>
     background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
   header{display:flex;align-items:center;gap:14px;padding:10px 16px;
     background:var(--panel);border-bottom:1px solid var(--line)}
+  .header-main{display:flex;align-items:center;gap:14px;min-width:0;overflow:hidden;flex:1 1 auto}
+  .header-main>*{flex:0 0 auto}
   header h1{font-size:15px;font-weight:600;margin:0;letter-spacing:.3px}
   header .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2)}
   header .sp{flex:1}
@@ -1396,6 +1570,17 @@ _HTML = r"""<!DOCTYPE html>
   .wfdesc{font-size:11px;color:var(--muted);max-width:200px;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap}
   button.ghost{padding:6px 8px;font-size:12px;line-height:1}
+  .header-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto;margin-left:auto}
+  @media (max-width:1500px){
+    header{gap:8px}
+    .wfdesc,.proj,.toggles{display:none}
+    .wfbar select{max-width:160px}
+  }
+  @media (max-width:1120px){
+    #mcpBadge,#status{display:none!important}
+    header h1{font-size:0}
+    header h1::after{content:'harn';font-size:15px}
+  }
   /* one consistent minimal trash icon for every delete affordance in the app */
   .icon-btn{display:inline-flex;align-items:center;justify-content:center;
     width:30px;height:30px;padding:0;border:1px solid var(--line);
@@ -1438,6 +1623,66 @@ _HTML = r"""<!DOCTYPE html>
   .pdot.dot-complete{border-color:var(--accent2);color:var(--accent2)}
   .pdot.dot-active{border-color:var(--accent);color:var(--accent);animation:blink 1s ease-in-out infinite}
   .runlog{max-height:200px;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  /* Flow run sidebar: a compact flight-recorder timeline, not a console dump. */
+  .run-progress{display:flex;flex-direction:column;gap:12px}
+  .run-progress-head{padding:12px;border:1px solid #3a4150;border-radius:12px;
+    background:linear-gradient(135deg,#202538 0%,#191d27 70%)}
+  .run-progress-title{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .run-progress-title strong{font-size:14px;letter-spacing:.1px}
+  .run-progress-meta{font:11px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-top:4px}
+  .progress-track{height:5px;border-radius:999px;background:#11141b;overflow:hidden;margin-top:10px}
+  .progress-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .25s ease}
+  .progress-rail{position:relative;padding-left:22px}
+  .progress-rail::before{content:'';position:absolute;left:7px;top:12px;bottom:12px;width:2px;background:#303644}
+  .run-wave{position:relative;margin:0 0 12px -8px;padding:9px 8px 1px 16px;
+    border:1px dashed #6575db;border-radius:12px;background:#1b1f2c}
+  .run-wave-label{font:10px/1.2 ui-monospace,Menlo,monospace;color:#91a0ff;
+    margin:-2px 0 8px;text-transform:uppercase;letter-spacing:.35px}
+  .run-wave .run-step{margin-left:0}
+  .run-step{position:relative;margin-bottom:10px;border:1px solid var(--line);border-radius:11px;
+    padding:10px 11px;background:#1a1e27;transition:border-color .2s,background .2s}
+  .run-step::before{content:'';position:absolute;left:-21px;top:13px;width:11px;height:11px;
+    border-radius:50%;background:#252b36;border:2px solid #4a5262;box-shadow:0 0 0 3px var(--panel)}
+  .run-step.running{border-color:#7c8cff88;background:#20243a}
+  .run-step.running::before{background:var(--accent);border-color:#b2bbff;animation:blink 1s ease-in-out infinite}
+  .run-step.ok::before,.run-step.complete::before,.run-step.done::before{background:var(--accent2);border-color:#8cebc9}
+  .run-step.failed{border-color:#e74c3c88}.run-step.failed::before{background:#e74c3c;border-color:#ff9d95}
+  .run-step.blocked{border-color:#e8b93a88}.run-step.blocked::before{background:#e8b93a;border-color:#ffe099}
+  .run-step-top{display:grid;grid-template-columns:22px minmax(0,1fr) auto;align-items:start;gap:8px}
+  .run-step-num{font:10px/20px ui-monospace,Menlo,monospace;text-align:center;border:1px solid var(--line);border-radius:6px;color:var(--muted)}
+  .run-step-name{font-size:12.5px;font-weight:650;line-height:1.35}
+  .run-step-state{font:10px/1.4 ui-monospace,Menlo,monospace;text-transform:uppercase;letter-spacing:.45px;color:var(--muted)}
+  .run-step-usage{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 2px 30px}
+  .usage-pill{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid #424957;color:#aeb6c5;background:#202530}
+  .usage-pill::before{display:inline-block;margin-right:4px;font-size:9px}
+  .usage-pill.skill::before{content:'◆'}.usage-pill.tool::before{content:'⚙'}
+  .usage-used{border-color:#2ecc7188;color:#7ce3a7;background:#173326}
+  .usage-unused-recommended{border-color:#f1c40f88;color:#f5d75c;background:#342f17}
+  .usage-unused-required{border-color:#e74c3c99;color:#ff9188;background:#381d20}
+  .usage-pending{opacity:.65}
+  .step-output{margin:8px 0 0 30px;border-top:1px solid #2b313d;padding-top:6px}
+  .step-output summary{cursor:pointer;color:var(--muted);font-size:10.5px;list-style:none}
+  .step-output summary::-webkit-details-marker{display:none}
+  .step-output pre{white-space:pre-wrap;margin:7px 0 0;font:11px/1.45 ui-monospace,Menlo,monospace;color:#cbd2df;max-height:180px;overflow:auto}
+  .step-transcript{margin:9px 0 0 30px;border-top:1px solid #2b313d;padding-top:7px}
+  .step-transcript>summary{cursor:pointer;display:flex;align-items:center;gap:6px;
+    color:#c5ccda;font-size:11px;list-style:none}
+  .step-transcript>summary::-webkit-details-marker{display:none}
+  .step-transcript>summary::before{content:'›';color:var(--muted);font-size:16px;line-height:10px;transition:transform .15s}
+  .step-transcript[open]>summary::before{transform:rotate(90deg)}
+  .transcript-feed{display:flex;flex-direction:column;gap:7px;margin-top:8px}
+  .transcript-entry{border:1px solid #303746;border-radius:8px;background:#151922;padding:7px 8px}
+  .transcript-entry.status{background:#191d29;border-color:#343b4d;color:#aeb7ca}
+  .transcript-entry.message{background:#1b2130;border-color:#3b465f}
+  .transcript-entry.command,.transcript-entry.tool,.transcript-entry.skill{background:#171d21;border-color:#33453f}
+  .transcript-entry.error{background:#2a191d;border-color:#6c3038}
+  .transcript-entry-head{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--muted);margin-bottom:4px}
+  .transcript-entry-head b{color:#cbd3df;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .transcript-entry.live .transcript-entry-head::after{content:'live';color:var(--accent);animation:blink 1s ease-in-out infinite}
+  .transcript-entry pre{margin:0;white-space:pre-wrap;word-break:break-word;font:11px/1.5 ui-monospace,Menlo,monospace;color:#cbd2df;max-height:260px;overflow:auto}
+  .transcript-entry.message pre,.transcript-entry.status pre{font-family:inherit;font-size:11.5px}
+  .prior-attempts{margin-top:7px}.prior-attempts summary{cursor:pointer;color:var(--muted);font-size:10px}
+  .transcript-empty{padding:8px 0;color:var(--muted);font-size:11px;font-style:italic}
   .attgrid{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
   .attcard{position:relative;width:96px;background:var(--panel2);border:1px solid var(--line);
     border-radius:8px;padding:6px;text-align:center}
@@ -1493,6 +1738,9 @@ _HTML = r"""<!DOCTYPE html>
   .nbtn:hover{border-color:var(--accent);color:var(--text)}
   .nbtn.on{color:var(--accent2);border-color:#2f5a48}
   .node .ttl{font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:8px;padding-right:24px}
+  /* The terminal heading is a shortcut to the detailed per-step run panel. */
+  .node.terminal .run-launch{cursor:pointer}
+  .node.terminal .run-launch:hover{color:var(--accent2)}
   /* stepbtns (▶/↻) sit further left of the enable/disable toggle, right:34
      onward, ~48px wide — the title needs enough reserved padding to never sit
      under them, on every wrapped line, not just the first. */
@@ -1622,33 +1870,36 @@ _HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <span class="dot"></span><h1>harn studio</h1>
-  <span class="proj" id="proj" title="current project (env)"></span>
-  <div class="wfbar" id="wfbar" title="active workflow — the flow agents follow">
-    <select id="wfSel" onchange="switchWorkflow(this.value)"></select>
-    <span class="wfdesc" id="wfDesc"></span>
-    <button class="ghost" onclick="newWorkflow()" title="New workflow preset">＋</button>
-    <button class="ghost" onclick="editWorkflowMeta()" title="Edit name / description / version">✎</button>
-    <button class="icon-btn" id="wfDelBtn" onclick="deleteWorkflow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg></button>
+  <div class="header-main">
+    <span class="dot"></span><h1>harn studio</h1>
+    <span class="proj" id="proj" title="current project (env)"></span>
+    <div class="wfbar" id="wfbar" title="active workflow — the flow agents follow">
+      <select id="wfSel" onchange="switchWorkflow(this.value)"></select>
+      <span class="wfdesc" id="wfDesc"></span>
+      <button class="ghost" onclick="newWorkflow()" title="New workflow preset">＋</button>
+      <button class="ghost" onclick="editWorkflowMeta()" title="Edit name / description / version">✎</button>
+      <button class="icon-btn" id="wfDelBtn" onclick="deleteWorkflow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg></button>
+    </div>
+    <div class="tabs">
+      <button id="tabFlow" class="active" onclick="showTab('flow')">Flow</button>
+      <button id="tabSkills" onclick="showTab('skills')">Skills</button>
+      <button id="tabTools" onclick="showTab('tools')">Tools</button>
+      <button id="tabBoard" onclick="showTab('board')">Board</button>
+      <button id="tabSettings" onclick="showTab('settings')">Settings</button>
+    </div>
+    <div class="toggles" id="toggles">
+      <label class="sw"><input type="checkbox" id="tgSemble" onchange="setToggle('semble',this.checked)"><span></span>semble</label>
+      <label class="sw"><input type="checkbox" id="tgSocratic" onchange="setToggle('socraticcode',this.checked)"><span></span>socraticode</label>
+    </div>
+    <span id="mcpBadge" class="mcpbadge" title="harn MCP status" style="display:none"></span>
+    <span class="status" id="status">loading…</span>
   </div>
-  <div class="tabs">
-    <button id="tabFlow" class="active" onclick="showTab('flow')">Flow</button>
-    <button id="tabSkills" onclick="showTab('skills')">Skills</button>
-    <button id="tabTools" onclick="showTab('tools')">Tools</button>
-    <button id="tabBoard" onclick="showTab('board')">Board</button>
-    <button id="tabSettings" onclick="showTab('settings')">Settings</button>
+  <div class="header-actions">
+    <button onclick="addStep()" id="addBtn">＋ Add step</button>
+    <button onclick="addSkill()" id="addSkillBtn" style="display:none">＋ Add skill</button>
+    <button onclick="autoArrange()" id="arrangeBtn">Auto-arrange</button>
+    <button class="primary" id="saveBtn" onclick="saveFlow()">Save flow</button>
   </div>
-  <div class="toggles" id="toggles">
-    <label class="sw"><input type="checkbox" id="tgSemble" onchange="setToggle('semble',this.checked)"><span></span>semble</label>
-    <label class="sw"><input type="checkbox" id="tgSocratic" onchange="setToggle('socraticcode',this.checked)"><span></span>socraticode</label>
-  </div>
-  <span class="sp"></span>
-  <span id="mcpBadge" class="mcpbadge" title="harn MCP status" style="display:none"></span>
-  <span class="status" id="status">loading…</span>
-  <button onclick="addStep()" id="addBtn">＋ Add step</button>
-  <button onclick="addSkill()" id="addSkillBtn" style="display:none">＋ Add skill</button>
-  <button onclick="autoArrange()" id="arrangeBtn">Auto-arrange</button>
-  <button class="primary" id="saveBtn" onclick="saveFlow()">Save flow</button>
 </header>
 <main>
   <div class="canvas" id="canvas">
@@ -1670,15 +1921,73 @@ _HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const $=s=>document.querySelector(s);
-// True when the user is mid-interaction with a form control inside `el`: a
-// focused input/textarea, or an OPEN native <select> (which keeps itself as
-// document.activeElement while its dropdown is showing). Poll-driven re-renders
-// check this so a 1.5s tick never rebuilds the DOM out from under an open
-// dropdown or a half-typed field.
-function isEditing(el){
-  const a=document.activeElement;
-  return !!(a && el && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+// Native macOS <select> popups do not reliably remain document.activeElement.
+// Remember the control from pointerdown/focus until it changes, blurs, or the
+// user clicks elsewhere, so polling can never replace its DOM while the popup
+// is open. The same latch protects every input/textarea/contenteditable field.
+let ACTIVE_FORM_CONTROL=null;
+const FORM_CONTROL_SELECTOR='input,textarea,select,[contenteditable="true"]';
+function formControlFromEvent(event){
+  const target=event&&event.target;
+  return target&&target.closest?target.closest(FORM_CONTROL_SELECTOR):null;
 }
+function trackFormInteraction(event){
+  const control=formControlFromEvent(event);
+  if(control) ACTIVE_FORM_CONTROL=control;
+  else if(event.type==='pointerdown') ACTIVE_FORM_CONTROL=null;
+}
+function releaseFormInteraction(event){
+  const control=formControlFromEvent(event);
+  if(!control||control!==ACTIVE_FORM_CONTROL)return;
+  setTimeout(()=>{
+    if(document.activeElement!==control) ACTIVE_FORM_CONTROL=null;
+    // A native select's change means its popup has closed even when the
+    // browser still reports the select as focused.
+    if(event.type==='change'&&control.tagName==='SELECT') ACTIVE_FORM_CONTROL=null;
+  },0);
+}
+document.addEventListener('pointerdown',trackFormInteraction,true);
+document.addEventListener('focusin',trackFormInteraction,true);
+document.addEventListener('input',trackFormInteraction,true);
+document.addEventListener('change',releaseFormInteraction,true);
+document.addEventListener('focusout',releaseFormInteraction,true);
+document.addEventListener('keydown',event=>{
+  if(event.key==='Escape') ACTIVE_FORM_CONTROL=null;
+},true);
+function panelIsEditing(el){
+  const a=document.activeElement;
+  return !!(el && (
+    (ACTIVE_FORM_CONTROL&&el.contains(ACTIVE_FORM_CONTROL)) ||
+    (a&&el.contains(a)&&(/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)||a.isContentEditable))));
+}
+let ACTIVE_TEXT_DRAG_PANEL=null;
+function panelHasTextSelection(el){
+  const selection=window.getSelection?window.getSelection():null;
+  if(!el||!selection||!selection.rangeCount) return false;
+  if(!selection.isCollapsed){
+    const inside=node=>!!(node&&el.contains(node.nodeType===1?node:node.parentNode));
+    return inside(selection.anchorNode)||inside(selection.focusNode);
+  }
+  return false;
+}
+function panelIsInteracting(el){
+  return panelIsEditing(el)||ACTIVE_TEXT_DRAG_PANEL===el||panelHasTextSelection(el);
+}
+function documentHasTextSelection(){
+  const selection=window.getSelection?window.getSelection():null;
+  return !!(selection&&selection.rangeCount&&!selection.isCollapsed);
+}
+function pollingCanReplace(el){
+  return !panelIsInteracting(el)&&!documentHasTextSelection();
+}
+document.addEventListener('pointerdown',event=>{
+  const target=event.target;
+  if(!target||!target.closest||target.closest(FORM_CONTROL_SELECTOR+',button')) return;
+  ACTIVE_TEXT_DRAG_PANEL=target.closest('#listView,#insp');
+},true);
+document.addEventListener('pointerup',()=>{
+  setTimeout(()=>{ ACTIVE_TEXT_DRAG_PANEL=null; },0);
+},true);
 // one consistent minimal trash icon, reused for every delete affordance.
 const TRASH_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '+
   'stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline>'+
@@ -1714,6 +2023,7 @@ let SAVED_SNAPSHOT=null;
 function snapshotWorkflow(){ SAVED_SNAPSHOT=JSON.stringify(S.workflow); }
 function checkDirty(){
   if(JSON.stringify(S.workflow)===SAVED_SNAPSHOT) clearDirty(); else markDirty();
+  if(RUN_HISTORY_OPEN&&!BOARD.run){ RUN_HISTORY_MODE='preview'; renderRunHistory(); }
 }
 
 let TOOL_DOCS={};   // name -> full MCP docstring; fetched once, static per install
@@ -1844,8 +2154,15 @@ async function setToggle(key,val){
 }
 /* ---------- live run animation (events.jsonl) ---------- */
 let pollPrevRun=null;   // track run state transitions across poll cycles
+let progressPollGeneration=0;
 async function pollProgress(){
-  try{ PROG=await (await fetch(api('/api/progress'))).json(); }catch(e){ return; }
+  const generation=++progressPollGeneration;
+  let next;
+  const taskId=(BOARD.run&&BOARD.run.task_id)||
+    (RUN_HISTORY_OPEN?historyTaskId():flowSelectedTaskId())||'';
+  try{ next=await (await fetch(api('/api/progress?task='+encodeURIComponent(taskId)))).json(); }catch(e){ return; }
+  if(generation!==progressPollGeneration) return;
+  PROG=next;
   if(tab==='flow'){
     applyProgress();
     // Re-render the terminal block when: actively running (live status),
@@ -1854,7 +2171,7 @@ async function pollProgress(){
     // the <select> mid-interaction and prevent the native dropdown from
     // opening.
     const term=document.querySelector('.node.terminal');
-    if(term && (BOARD.run || !!BOARD.run !== !!pollPrevRun)){
+    if(term && pollingCanReplace(term) && (BOARD.run || !!BOARD.run !== !!pollPrevRun)){
       renderFlowTerminal(term);
     }
     pollPrevRun=BOARD.run;
@@ -1863,39 +2180,76 @@ async function pollProgress(){
 
 /* ---------- board tab: tasks + per-task workflow + launch/observe a run ---------- */
 let BOARD={tasks:[],run:null,run_log:''}, boardSel=null;
+let BOARD_LIST_RENDER_KEY=null;
+let BOARD_DETAIL_RENDER_KEY=null;
+let RENDERED_BOARD_DETAIL_TASK=null;
+let boardPollGeneration=0;
 const BOARD_ORDER=['todo','in_progress','review','changes_requested','done'];
 const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your review',
   changes_requested:'Changes requested',done:'Done'};
+function boardListRenderKey(){
+  return JSON.stringify({tasks:BOARD.tasks||[],run:BOARD.run||null,selected:boardSel});
+}
+function boardDetailRenderKey(){
+  const task=(BOARD.tasks||[]).find(t=>t.id===boardSel)||null;
+  return JSON.stringify({task,run:BOARD.run||null,run_log:BOARD.run_log||'',progress:PROG});
+}
 
 async function pollBoard(){
-  try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
+  const generation=++boardPollGeneration;
+  let next;
+  try{ next=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
+  if(generation!==boardPollGeneration) return;
+  BOARD=next;
+  if(BOARD.run&&BOARD.run.task_id) LAST_RUN_TASK=BOARD.run.task_id;   // remember for the run-history panel
   // The blocked-question banner reflects per-ENV state (harn has one active
   // task at a time — see blocked_question_payload), not per-selected-task, so
   // it must poll on EVERY tab, not just Board — someone watching a run finish
   // on the Flow tab needs to see "needs your answer" right there, not only
   // after switching to Board and clicking the task.
   await pollBlockedQuestion();
+  if(generation!==boardPollGeneration) return;
+  if(RUN_HISTORY_OPEN && tab==='flow'){
+    await pollRunTranscript();
+    if(generation!==boardPollGeneration) return;
+    renderRunHistoryIfChanged();
+  }
   if(tab!=='board') return;
   // Don't rebuild the list out from under an open "＋ New task" form (even
   // before the user has focused a field in it) or a half-typed value inside
   // it — same guard pattern as the inspector re-render below.
-  if(!NEW_TASK_OPEN && !isEditing($('#listView'))) renderBoard();
+  const listChanged=boardListRenderKey()!==BOARD_LIST_RENDER_KEY;
+  if(listChanged && !NEW_TASK_OPEN && pollingCanReplace($('#listView'))) renderBoard();
   if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
     // Don't rebuild the inspector out from under an open <select> or a focused
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
     // steal focus mid-typing. The next tick refreshes once the user is done.
-    if(!isEditing($('#insp'))) renderTaskDetail();
+    const detailChanged=boardDetailRenderKey()!==BOARD_DETAIL_RENDER_KEY;
+    if(detailChanged && pollingCanReplace($('#insp'))) renderTaskDetail();
   } else{
-    boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
+    if(pollingCanReplace($('#insp'))){
+      boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
+      BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey(); RENDERED_BOARD_DETAIL_TASK=null;
+    }
   }
 }
-let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null;
+let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null, BLOCKED_OPTIONS=[];
+function questionOptions(question){
+  return (question||'').split('\n').map(line=>{
+    const m=line.match(/^\s*(?:[-*]\s*)?([A-C1-3])[\).:\-]\s+(.+)$/i);
+    if(!m) return null;
+    return {value:m[1].toUpperCase()+') '+m[2],
+      recommended:/recommended|recommendation|рекоменд/i.test(m[2])};
+  }).filter(Boolean).slice(0,3);
+}
+function submitOption(option){ submitAnswer(option.value); }
 async function pollBlockedQuestion(){
   const el=$('#blockedBanner');
   if(!el) return;
   let r;
   try{ r=await (await fetch(api(`/api/tasks/blocked_question?task=${encodeURIComponent(boardSel||'')}`))).json(); }
   catch(e){ return; }
+  if(!pollingCanReplace(el)) return;
   // Re-render ONLY when the question (or selected task) actually changed —
   // this poll fires every 1.5s, and blindly overwriting the banner's innerHTML
   // every tick would wipe out whatever the human is mid-typing in the answer
@@ -1903,9 +2257,14 @@ async function pollBlockedQuestion(){
   if(r.question){
     if(BLOCKED_Q_TASK===boardSel && BLOCKED_Q_TEXT===r.question && el.style.display==='block') return;
     BLOCKED_Q_TASK=boardSel; BLOCKED_Q_TEXT=r.question;
+    BLOCKED_OPTIONS=questionOptions(r.question);
+    const optionButtons=BLOCKED_OPTIONS.map((option,i)=>
+      `<button class="ghost" onclick="submitOption(BLOCKED_OPTIONS[${i}])">${esc(option.value)}`+
+      `${option.recommended?' <span class="live">Recommended</span>':''}</button>`).join('');
     el.style.display='block';
     el.innerHTML=`<div class="blockedq"><b>Blocked — needs your answer:</b>`+
       `<pre>${esc(r.question)}</pre>`+
+      `${optionButtons?`<div class="row" style="display:grid;gap:7px;margin-bottom:9px">${optionButtons}</div>`:''}`+
       `<textarea id="answerBox" rows="3" placeholder="Your answer..."></textarea>`+
       `<button onclick="submitAnswer()">Submit answer</button></div>`;
   } else {
@@ -1913,9 +2272,9 @@ async function pollBlockedQuestion(){
     el.style.display='none'; el.innerHTML='';
   }
 }
-async function submitAnswer(){
+async function submitAnswer(selectedAnswer){
   const box=$('#answerBox');
-  const text=box?box.value:'';
+  const text=selectedAnswer || (box?box.value:'');
   if(!text.trim()){ alert('Enter an answer first.'); return; }
   const r=await post_('/api/tasks/answer',{task:boardSel, text});
   if(r.error){ alert(r.error); return; }
@@ -1928,7 +2287,7 @@ function selectTask(id){
 }
 // Tracks whether the "＋ New task" form is open, independent of DOM focus —
 // a click on "＋ New task" or "Create"/"Cancel" doesn't leave an INPUT/TEXTAREA/
-// SELECT focused, so isEditing() alone can't stop the 1.5s poll from wiping the
+// SELECT focused, so panelIsEditing() alone can't stop the 1.5s poll from wiping the
 // form back to hidden the instant the user opens it before typing anything.
 let NEW_TASK_OPEN=false;
 function renderBoard(){
@@ -1957,6 +2316,7 @@ function renderBoard(){
   });
   if(!(BOARD.tasks||[]).length) html+='<div class="empty">No tasks yet — create one from an agent session (create_task).</div>';
   v.innerHTML=html;
+  BOARD_LIST_RENDER_KEY=boardListRenderKey();
 }
 function showNewTaskForm(){
   NEW_TASK_OPEN=true;
@@ -2005,7 +2365,12 @@ function renderPipelineDots(t){
 }
 function renderTaskDetail(){
   const t=(BOARD.tasks||[]).find(x=>x.id===boardSel);
-  if(!t){ $('#insp').innerHTML='<div class="empty">Select a task.</div>'; return; }
+  const panel=$('#insp');
+  const sameTask=!!(t&&RENDERED_BOARD_DETAIL_TASK===t.id);
+  const panelScroll=sameTask?panel.scrollTop:0;
+  const previousReview=sameTask?$('#reviewLog'):null;
+  const reviewScroll=previousReview?previousReview.scrollTop:0;
+  if(!t){ panel.innerHTML='<div class="empty">Select a task.</div>'; BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey(); RENDERED_BOARD_DETAIL_TASK=null; return; }
   const running=BOARD.run&&BOARD.run.task_id===t.id;
   const busy=!!BOARD.run;   // some run (maybe a different task) is active
   const wfOpts=(S.workflows||[]).map(w=>
@@ -2039,7 +2404,7 @@ function renderTaskDetail(){
         items.map(r=>`<span class="chip" title="loaded ${esc(r.ts||'')}">${esc(r.name)}</span>`).join(' ')+`</div>`
       ).join('')
     : '<span class="mut">nothing pulled into context yet — skill NAMES are always in the prompt, but a body only enters context when the agent calls read_skill/read_service/read_prd/read_guidance</span>';
-  $('#insp').innerHTML=`
+  panel.innerHTML=`
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">${esc(t.id)}</h2>
       <select onchange="changeTaskStatus('${esc(t.id)}',this.value)" style="color:${statusColor};border-color:${statusColor};background:transparent">
@@ -2077,9 +2442,16 @@ function renderTaskDetail(){
     <label>Decisions <span class="mut">(claims the oracle verifies)</span></label>
     <div class="skillgrid">${decisions}</div>
     <label>Review log</label>
-    <div class="toolDoc" style="max-height:160px;overflow:auto">${esc(reviewLog)}</div>
+    <div class="toolDoc" id="reviewLog" style="max-height:160px;overflow:auto;user-select:text">${esc(reviewLog)}</div>
     ${running?`<label>Run log <span class="mut">(live stdout/stderr tail)</span></label><div class="toolDoc runlog">${esc(BOARD.run_log||'(starting…)')}</div>`:''}
   `;
+  if(sameTask){
+    panel.scrollTop=panelScroll;
+    const nextReview=$('#reviewLog');
+    if(nextReview) nextReview.scrollTop=reviewScroll;
+  }
+  RENDERED_BOARD_DETAIL_TASK=t.id;
+  BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey();
 }
 async function assignWorkflow(taskId,name){
   await fetch(api('/api/tasks/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2192,6 +2564,15 @@ async function deleteAttachment(taskId,name){
 }
 function fmtDur(ms){ if(!ms) return '0s'; const s=Math.round(ms/1000); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
 function fmtBytes(n){ if(!n) return '0B'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB'; }
+// Second-precision local clock time for one transcript entry's own `ts`
+// (e.g. "2026-07-13T16:09:45Z" -> "16:09:45" in the browser's local zone) --
+// lets a human see exactly when each Agent activity item actually fired,
+// not just its relative order in the feed.
+function fmtClock(ts){
+  if(!ts) return '';
+  const d=new Date(ts);
+  return isNaN(d.getTime())?'':d.toLocaleTimeString([],{hour12:false});
+}
 function hasRun(){ return PROG.run && Object.keys(PROG.stages||{}).length>0; }
 // The selected task's `step_results` entry for a step — the same data
 // `run_step()`/the engine write for BOTH agent and command steps, but only
@@ -2276,7 +2657,12 @@ function flowSelectedTaskId(){
   if(sel&&sel.value&&flowAllTasks().some(t=>t.id===sel.value)) return sel.value;
   if(FLOW_SEL_TASK_ID&&flowAllTasks().some(t=>t.id===FLOW_SEL_TASK_ID)) return FLOW_SEL_TASK_ID;
   const runnable=flowAllTasks().find(t=>RUNNABLE_STATUSES.includes(t.status));
-  const first=runnable||flowAllTasks()[0];
+  // After a completed run/reload there may be no runnable task and
+  // LAST_RUN_TASK lives only in browser memory. Prefer a task with a real
+  // step ledger so RUN WORKFLOW reopens its results, not an unrelated first
+  // Board item that has never run.
+  const withResults=[...flowAllTasks()].reverse().find(t=>Object.keys(t.step_results||{}).length);
+  const first=runnable||withResults||flowAllTasks()[0];
   FLOW_SEL_TASK_ID=first?first.id:null;
   return FLOW_SEL_TASK_ID;
 }
@@ -2319,6 +2705,232 @@ function renderRunLogPanel(){
   const b=document.getElementById('runLogBody');
   if(b) b.scrollTop=b.scrollHeight;   // open scrolled to the newest line
 }
+
+// ---- Steps & results panel: per-step status + captured output for a run ----
+// Answers "what did each step do, and what did it produce" right on the Flow
+// tab — live during a run and still there AFTER it finishes (the task leaves
+// the runnable picker on completion, so we track the last run's task id).
+let RUN_HISTORY_OPEN=false, RUN_HISTORY_PLAN=null;   // {taskId, nodes}
+let RUN_HISTORY_MODE='preview';
+let RUN_HISTORY_ERROR='';
+let RUN_TRANSCRIPT={taskId:null,cursor:0,entries:[]};
+let RUN_HISTORY_RENDER_KEY=null;
+const TRANSCRIPT_OPEN_STEPS=new Set();
+const TRANSCRIPT_CLOSED_STEPS=new Set();
+let LAST_RUN_TASK=null;
+function resetRunClientState(taskId){
+  RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
+  PROG={stages:{},totals:{},active:null,ended:false};
+  TRANSCRIPT_OPEN_STEPS.clear();
+  TRANSCRIPT_CLOSED_STEPS.clear();
+  RUN_HISTORY_ERROR='';
+  RUN_HISTORY_RENDER_KEY=null;
+}
+function taskHasExecutionHistory(task){
+  return !!(task&&(Object.keys(task.step_results||{}).length||
+    (task.review_log||[]).length||(task.changelog||[]).length||task.scratchpad||
+    (task.decisions||[]).length||task.claimed_by||task.claimed_at));
+}
+function historyTaskId(){
+  return (BOARD.run&&BOARD.run.task_id) ||
+    (RUN_HISTORY_MODE==='execution'&&LAST_RUN_TASK) || flowSelectedTaskId();
+}
+async function openRunHistory(){
+  const taskId=historyTaskId();
+  RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false;
+  if(RUN_TRANSCRIPT.taskId!==taskId){
+    RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
+    TRANSCRIPT_OPEN_STEPS.clear();
+    TRANSCRIPT_CLOSED_STEPS.clear();
+  }
+  if(BOARD.run&&BOARD.run.task_id===taskId) RUN_HISTORY_MODE='execution';
+  if(RUN_HISTORY_MODE==='preview'){
+    RUN_HISTORY_PLAN={taskId,nodes:S.workflow.nodes||[]};
+  }else if(taskId && (!RUN_HISTORY_PLAN || RUN_HISTORY_PLAN.taskId!==taskId)){
+    // An active/stopped execution reads its immutable task snapshot.
+    // Open immediately, but never borrow nodes from the open canvas: the
+    // selected task can use a different preset or a frozen per-task plan.
+    RUN_HISTORY_PLAN={taskId, nodes:null};
+    renderRunHistory();
+    try{
+      const p=await (await fetch(api('/api/task_plan?task='+encodeURIComponent(taskId)))).json();
+      RUN_HISTORY_PLAN={taskId, nodes:(p&&p.plan&&p.plan.nodes)||[]};
+    }catch(e){ RUN_HISTORY_PLAN={taskId, nodes:[]}; }
+  }
+  await pollRunTranscript();
+  renderRunHistory();
+}
+async function pollRunTranscript(){
+  const taskId=historyTaskId();
+  if(!RUN_HISTORY_OPEN||!taskId)return;
+  if(RUN_TRANSCRIPT.taskId!==taskId) RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
+  try{
+    const path='/api/tasks/transcript?task='+encodeURIComponent(taskId)+
+      '&after='+encodeURIComponent(RUN_TRANSCRIPT.cursor||0);
+    const r=await (await fetch(api(path))).json();
+    if(!r.ok)return;
+    const seen=new Set(RUN_TRANSCRIPT.entries.map(e=>e.seq));
+    (r.entries||[]).forEach(e=>{ if(!seen.has(e.seq)){RUN_TRANSCRIPT.entries.push(e);seen.add(e.seq);} });
+    RUN_TRANSCRIPT.entries.sort((a,b)=>(a.seq||0)-(b.seq||0));
+    RUN_TRANSCRIPT.cursor=Math.max(RUN_TRANSCRIPT.cursor||0,r.cursor||0);
+  }catch(e){}
+}
+function rememberTranscriptOpen(stepId,details){
+  if(details.open){
+    TRANSCRIPT_OPEN_STEPS.add(stepId); TRANSCRIPT_CLOSED_STEPS.delete(stepId);
+  }else{
+    TRANSCRIPT_OPEN_STEPS.delete(stepId); TRANSCRIPT_CLOSED_STEPS.add(stepId);
+  }
+}
+function transcriptEntryHtml(e,settled){
+  const icon={message:'●',status:'◌',command:'›_',tool:'⚙',skill:'◆',file_change:'±',error:'!'}[e.kind]||'·';
+  const live=!settled&&(e.phase==='started'||e.phase==='updated');
+  const clock=fmtClock(e.ts);
+  return `<div class="transcript-entry ${esc(e.kind)} ${live?'live':''}" data-seq="${esc(e.seq)}">`+
+    `<div class="transcript-entry-head">`+(clock?`<span class="mut">${esc(clock)}</span>`:'')+
+    `<span>${icon}</span><b>${esc(e.title||e.kind)}</b>`+
+    `<span>${esc(e.phase||'')}</span></div>`+
+    (e.text?`<pre data-run-scroll="${esc(e.seq)}">${esc(e.text)}</pre>`:'')+`</div>`;
+}
+function transcriptEntriesHtml(entries){
+  return entries.map((entry,index)=>{
+    const settled=(entry.phase==='started'||entry.phase==='updated')&&entries.slice(index+1).some(later=>
+      later.attempt===entry.attempt&&later.kind===entry.kind&&later.title===entry.title&&
+      (!entry.item_id||later.item_id===entry.item_id)&&['completed','failed'].includes(later.phase));
+    return transcriptEntryHtml(entry,settled);
+  }).join('');
+}
+function stepTranscriptHtml(stepId,legacyOutput){
+  if(RUN_HISTORY_MODE==='preview')return '<div class="transcript-empty">Starts when this flow runs.</div>';
+  let entries=(RUN_TRANSCRIPT.taskId===historyTaskId()?RUN_TRANSCRIPT.entries:[])
+    .filter(e=>e.step_id===stepId);
+  if(!entries.length&&legacyOutput){
+    entries=[{seq:'legacy',attempt:1,kind:'message',phase:'completed',title:'Step result',text:legacyOutput}];
+  }
+  if(!entries.length)return '<div class="transcript-empty">Waiting for agent output…</div>';
+  const attempts=[...new Set(entries.map(e=>Number(e.attempt)||1))].sort((a,b)=>a-b);
+  const latest=attempts[attempts.length-1];
+  const current=transcriptEntriesHtml(entries.filter(e=>(Number(e.attempt)||1)===latest));
+  const prior=attempts.slice(0,-1).map(attempt=>
+    `<details class="prior-attempts"><summary>Attempt ${attempt}</summary><div class="transcript-feed">`+
+    transcriptEntriesHtml(entries.filter(e=>(Number(e.attempt)||1)===attempt))+
+    `</div></details>`).join('');
+  return `${prior}<div class="transcript-feed">${current}</div>`;
+}
+function runtimeStepStatus(stepId,ledgerStatus){
+  const live=(PROG.stages||{})[stepId];
+  if(BOARD.run&&live){
+    if(live.status==='active')return 'running';
+    if(live.status==='complete'||live.status==='done')return 'complete';
+  }
+  return ledgerStatus==='active'?'running':(ledgerStatus||'pending');
+}
+function executionPlanGroups(steps){
+  const groups=[];
+  for(let i=0;i<steps.length;){
+    const id=(steps[i].parallel||'').trim();
+    let j=i+1;
+    while(id&&j<steps.length&&(steps[j].parallel||'').trim()===id)j++;
+    if(id&&j-i>1) groups.push({kind:'wave',id,steps:steps.slice(i,j)});
+    else groups.push({kind:'step',steps:[steps[i]]});
+    i=(id&&j-i>1)?j:i+1;
+  }
+  return groups;
+}
+function runHistoryRenderKey(){
+  const taskId=historyTaskId();
+  const task=(BOARD.tasks||[]).find(x=>x.id===taskId)||null;
+  return JSON.stringify({taskId,task,plan:RUN_HISTORY_PLAN,mode:RUN_HISTORY_MODE,
+    error:RUN_HISTORY_ERROR,progress:PROG,transcript:RUN_TRANSCRIPT,
+    open:[...TRANSCRIPT_OPEN_STEPS],closed:[...TRANSCRIPT_CLOSED_STEPS]});
+}
+function renderRunHistoryIfChanged(){
+  if(!pollingCanReplace($('#insp')))return;
+  if(runHistoryRenderKey()===RUN_HISTORY_RENDER_KEY)return;
+  renderRunHistory();
+}
+function renderRunHistory(){
+  const taskId=historyTaskId();
+  if(!taskId){ $('#insp').innerHTML='<div class="empty">No run to show yet — launch a task.</div>'; return; }
+  const panel=$('#insp'); const previousScroll=panel.scrollTop;
+  const nestedScroll=new Map();
+  panel.querySelectorAll('[data-run-scroll]').forEach(el=>nestedScroll.set(el.dataset.runScroll,el.scrollTop));
+  panel.querySelectorAll('details[data-step-transcript]').forEach(d=>{
+    if(d.open)TRANSCRIPT_OPEN_STEPS.add(d.dataset.stepTranscript);
+  });
+  const task=(BOARD.tasks||[]).find(x=>x.id===taskId);
+  const results=RUN_HISTORY_MODE==='preview'?{}:((task&&task.step_results)||{});
+  // Prefer the selected task's plan. While it loads, show no speculative
+  // canvas steps; that would display the wrong workflow for this task.
+  const planNodes=RUN_HISTORY_MODE==='preview' ? S.workflow.nodes :
+    ((RUN_HISTORY_PLAN&&RUN_HISTORY_PLAN.taskId===taskId) ? RUN_HISTORY_PLAN.nodes : undefined);
+  const loadingPlan=planNodes===null;
+  let steps=Array.isArray(planNodes)
+    ? planNodes.filter(n=>n.kind==='step'&&n.enabled!==false)
+    : Object.keys(results).map(id=>({id, title:id}));
+  const normalized=s=>s==='active'?'running':(s||'pending');
+  const usagePill=(kind,name,tier)=>{
+    const visualState=(tier||'pending').replaceAll('_','-');
+    return `<span class="usage-pill ${kind} usage-${esc(visualState)}">${esc(name)}</span>`;
+  };
+  const complete=steps.filter(n=>['ok','complete','done'].includes(normalized((results[n.id]||{}).status))).length;
+  const failed=steps.filter(n=>['failed','blocked'].includes(normalized((results[n.id]||{}).status))).length;
+  const pct=steps.length?Math.round((complete/steps.length)*100):0;
+  const renderRunStep=(n)=>{
+    const index=steps.indexOf(n);
+    const r=results[n.id]||{};
+    const status=runtimeStepStatus(n.id,normalized(r.status));
+    const usage=r.usage||{};
+    const skillNames=[...new Set([...(n.required||[]),...(n.skills_recommended||[]),...Object.keys(usage.skills||{})])];
+    const toolNames=[...new Set([...(n.tools||[]),...(n.tools_recommended||[]),...Object.keys(usage.tools||{})])];
+    const pills=skillNames.map(name=>usagePill('skill',name,(usage.skills||{})[name]))
+      .concat(toolNames.map(name=>usagePill('tool',name,(usage.tools||{})[name]))).join('');
+    const out=(r.output!=null&&r.output!=='')?r.output:'';
+    const metric=r.tokens?`${r.tokens} tok`:'';
+    const transcriptCount=(RUN_HISTORY_MODE==='execution'&&RUN_TRANSCRIPT.taskId===taskId?RUN_TRANSCRIPT.entries:[])
+      .filter(e=>e.step_id===n.id).length;
+    const transcriptOpen=status==='running'||status==='failed'||status==='blocked'||
+      TRANSCRIPT_OPEN_STEPS.has(n.id)||((transcriptCount||out)&&!TRANSCRIPT_CLOSED_STEPS.has(n.id));
+    return `<div class="run-step ${status}">`+
+      `<div class="run-step-top"><span class="run-step-num">${index+1}</span>`+
+      `<span class="run-step-name">${esc(n.title||n.id)}</span>`+
+      `<span class="run-step-state">${esc(status)}${metric?' · '+esc(metric):''}</span></div>`+
+      (pills?`<div class="run-step-usage">${pills}</div>`:'')+
+      (status==='blocked'?`<div class="step-output"><button class="ghost" onclick="rerunSidebarWorkflow()">↻ Restart flow from scratch</button></div>`:'')+
+      `<details class="step-transcript" data-step-transcript="${esc(n.id)}" `+
+        `ontoggle="rememberTranscriptOpen('${esc(n.id)}',this)" ${transcriptOpen?'open':''}>`+
+        `<summary>Agent activity${transcriptCount?' · '+transcriptCount:''}</summary>`+
+        `${stepTranscriptHtml(n.id,out)}</details></div>`;
+  };
+  const rows=executionPlanGroups(steps).map(group=>group.kind==='wave'
+    ? `<div class="run-wave"><div class="run-wave-label">∥ parallel · ${esc(group.id)}</div>`+
+      group.steps.map(renderRunStep).join('')+`</div>`
+    : group.steps.map(renderRunStep).join('')).join('');
+  const activeForTask=BOARD.run&&BOARD.run.task_id===taskId;
+  const action=activeForTask
+    ? `<button class="ghost" onclick="stopRun()">■ Stop</button>`
+    : RUN_HISTORY_MODE==='preview'
+      ? `<button class="primary" onclick="launchCurrentFlow()">▶ Run flow</button>`
+      : `<button class="primary" onclick="resumeFrozenFlow()">▶ Resume</button>`;
+  const rerun=task&&(task.baseline_ref||(task.task_patch_refs||[]).length)&&!activeForTask
+    ? `<button class="ghost" onclick="rerunSidebarWorkflow()">↻ Rerun from scratch</button>`:'';
+  panel.innerHTML=`<div class="run-progress"><div class="run-progress-head">`+
+    `<div class="run-progress-title"><strong>Run progress</strong>`+
+    `<button class="icon-btn" onclick="closeRunHistory()" title="Close">✕</button></div>`+
+    `<div class="run-progress-meta">${esc(taskId)} · ${complete}/${steps.length} complete${failed?' · '+failed+' need attention':''}</div>`+
+    `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`+
+    `<div class="row" style="margin-top:10px">${action}${rerun}</div>`+
+    `${RUN_HISTORY_ERROR?`<div class="mut" style="color:var(--danger);margin-top:7px">${esc(RUN_HISTORY_ERROR)}</div>`:''}</div>`+
+    `<div class="progress-rail">${rows||(loadingPlan
+      ?'<div class="empty">Loading this task\'s workflow…</div>'
+      :'<div class="empty">Waiting for the first step…</div>')}</div></div>`;
+  panel.scrollTop=previousScroll;
+  panel.querySelectorAll('[data-run-scroll]').forEach(el=>{
+    if(nestedScroll.has(el.dataset.runScroll))el.scrollTop=nestedScroll.get(el.dataset.runScroll);
+  });
+  RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();
+}
+function closeRunHistory(){ RUN_HISTORY_OPEN=false; renderInsp(); }
 function renderFlowTerminal(el){
   const runningWhole=BOARD.run&&!BOARD.run.stage;
   const runningStage=BOARD.run&&BOARD.run.stage;
@@ -2336,7 +2948,7 @@ function renderFlowTerminal(el){
             .filter(Boolean).join('  ·  ')
         : 'unlimited';
     }catch(e){}
-    el.innerHTML=`<div class="ttl"><span>▶ RUNNING WORKFLOW</span></div>
+    el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUNNING WORKFLOW</span></div>
       <div class="kv"><span>task</span><b>${esc(BOARD.run.task_id)}</b></div>
       ${runningTask?`<div class="kv"><span>title</span><b style="font-weight:400;font-family:inherit">${esc(runningTask.title)}</b></div>`:''}
       <div class="kv"><span>stage</span><b>${stage}</b></div>
@@ -2344,20 +2956,23 @@ function renderFlowTerminal(el){
       <div class="kv"><span>tokens</span><b>${tok}</b></div>
       <div class="kv"><span>cost</span><b>${cost}</b></div>
       <div class="kv"><span>budget</span><b id="runBudget" class="mut">${esc(budget)}</b></div>
+      <button class="ghost" onclick="openRunHistory()">▤ Steps &amp; results</button>
       <button class="ghost" onclick="toggleRunLog()">▤ View log</button>
       <button class="ghost" onclick="stopRun()">■ Stop</button>`;
     if(VIEWING_RUN_LOG) renderRunLogPanel();
+    else if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
     return;
   }
   if(runningStage){
     const runningTask=(BOARD.tasks||[]).find(x=>x.id===BOARD.run.task_id);
-    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
+    el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUN WORKFLOW</span></div>
       <div class="mut" style="font-size:11.5px">A single step is running${BOARD.run.rerun?' (rerun)':''}: `+
       `<b>${esc(BOARD.run.stage)}</b> for <b>${esc(BOARD.run.task_id)}</b>`+
       `${runningTask?' — '+esc(runningTask.title):''}.</div>
       <button class="ghost" onclick="toggleRunLog()">▤ View log</button>
       <button class="ghost" onclick="stopRun()">■ Stop</button>`;
     if(VIEWING_RUN_LOG) renderRunLogPanel();
+    else if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
     return;
   }
   const all=flowAllTasks();
@@ -2369,7 +2984,7 @@ function renderFlowTerminal(el){
     const msg=all.length
       ? 'No runnable task — every task is in review or done. Move one back to <b>To do</b> on the Board, or use <b>↻ Rerun from scratch</b> on a finished task, to launch it here.'
       : 'No tasks yet — create one, then come back here to launch it.';
-    el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>`+
+    el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUN WORKFLOW</span></div>`+
       `<div class="mut" style="font-size:11.5px">${msg}</div>`;
     return;
   }
@@ -2381,26 +2996,67 @@ function renderFlowTerminal(el){
   FLOW_SEL_TASK_ID=selId;
   const opts=runnable.map(x=>`<option value="${esc(x.id)}" ${x.id===selId?'selected':''}>${esc(x.id)}: ${esc(x.title)} (${esc(x.status)})</option>`).join('');
   const task=runnable.find(t=>t.id===selId);
-  const hasBaseline=task&&task.baseline_ref;
-  el.innerHTML=`<div class="ttl"><span>▶ RUN WORKFLOW</span></div>
+  const hasBaseline=task&&(task.baseline_ref||(task.task_patch_refs||[]).length);
+  // Offer the last finished run's per-step results even after it left the
+  // picker (moved to review/done), so you can inspect what the agents did.
+  const lastFinished=LAST_RUN_TASK&&(BOARD.tasks||[]).find(t=>t.id===LAST_RUN_TASK&&t.step_results&&Object.keys(t.step_results).length);
+  el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUN WORKFLOW</span></div>
     <div class="mut" style="font-size:11px">Runs the active workflow (<b>${esc(S.active||'default')}</b>) end-to-end against the task you pick.</div>
     <select id="flowTaskSel" onchange="FLOW_SEL_TASK_ID=this.value;renderFlow()">${opts}</select>
-    <button class="primary" onclick="runWholeWorkflow()">▶ Run</button>
-    ${hasBaseline?`<button class="ghost" onclick="rerunWholeWorkflow()" title="Restore to before this task's very first attempt and reopen it, then run it again">↻ Rerun from scratch</button>`:''}`;
+    <button class="primary" onclick="launchCurrentFlow()">▶ Run</button>
+    ${hasBaseline?`<button class="ghost" onclick="rerunWholeWorkflow()" title="Restore to before this task's very first attempt and reopen it, then run it again">↻ Rerun from scratch</button>`:''}
+    ${lastFinished?`<button class="ghost" onclick="openRunHistory()" title="See what each step of the last run produced">▤ Last run: steps &amp; results</button>`:''}`;
+  if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
 }
-async function runWholeWorkflow(){
+async function launchCurrentFlow(){
   const taskId=flowSelectedTaskId(); if(!taskId)return;
   const activeName=S.active||'default';
-  if(!confirm('Run '+taskId+' under workflow "'+activeName+'" now? An agent will '+
-    'start making changes in the background.'))return;
-  const task=(BOARD.tasks||[]).find(x=>x.id===taskId);
-  if(task && (task.workflow||'default')!==activeName){
-    await post_('/api/tasks/workflow',
-      {task_id:taskId, workflow:activeName==='default'?'':activeName});
+  const task=(BOARD.tasks||[]).find(t=>t.id===taskId);
+  const restarting=taskHasExecutionHistory(task);
+  if(restarting&&!confirm(
+    'Restart '+taskId+' from scratch? Git will restore project files to the task baseline.\n\n'+
+    'All saved execution context, prior errors, attempts, transcripts, scratchpad, and decisions will be permanently lost.'
+  ))return;
+  if(dirty) await saveFlow();
+  if(restarting){
+    task.step_results={}; task.review_log=[]; task.changelog=[];
+    task.scratchpad=''; task.decisions=[]; task.context_reads=[];
+    resetRunClientState(taskId);
   }
-  const r=await post_('/api/tasks/launch',{task_id:taskId,auto:false});
-  if(!r.ok){ alert(r.error||'launch failed'); return; }
+  RUN_HISTORY_OPEN=true; RUN_HISTORY_MODE='execution'; RUN_HISTORY_ERROR='';
+  LAST_RUN_TASK=taskId;
+  RUN_HISTORY_PLAN={taskId,nodes:(S.workflow.nodes||[]).map(n=>({...n}))};
+  RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
+  renderRunHistory();
+  const r=await post_('/api/tasks/launch_workflow',{
+    task_id:taskId,workflow:activeName==='default'?'':activeName,
+    plan:{preamble:S.workflow.preamble||'',nodes:S.workflow.nodes||[]},auto:false});
+  if(!r.ok){
+    await pollBoard();
+    RUN_HISTORY_MODE='preview';RUN_HISTORY_ERROR=r.error||'launch failed';renderRunHistory();return;
+  }
+  // The 1.5s poll can race with server-side rollback and re-add old rows to
+  // this append-only client buffer. Clear again only after restart succeeds.
+  if(restarting) resetRunClientState(taskId);
+  RUN_HISTORY_PLAN={taskId,nodes:(r.plan&&r.plan.nodes)||S.workflow.nodes||[]};
   await pollBoard(); renderFlow();
+}
+async function runWholeWorkflow(){ return launchCurrentFlow(); }
+async function resumeFrozenFlow(){
+  const taskId=historyTaskId(); if(!taskId)return;
+  RUN_HISTORY_ERROR='';
+  const r=await post_('/api/tasks/launch',{task_id:taskId,auto:false});
+  if(!r.ok){RUN_HISTORY_ERROR=r.error||'resume failed';renderRunHistory();return;}
+  await pollBoard();renderFlow();
+}
+async function rerunSidebarWorkflow(){
+  const taskId=historyTaskId();if(!taskId)return;
+  if(!confirm('Rerun '+taskId+' FROM SCRATCH? Git restores the task baseline.\n\n'+
+    'Old attempts, errors, transcript, and saved execution context will be deleted.'))return;
+  const r=await post_('/api/tasks/rerun_workflow',{task_id:taskId});
+  if(!r.ok){RUN_HISTORY_ERROR=r.error||'rerun failed';renderRunHistory();return;}
+  resetRunClientState(taskId);
+  RUN_HISTORY_MODE='execution';LAST_RUN_TASK=taskId;await pollBoard();renderFlow();
 }
 async function rerunWholeWorkflow(){
   const taskId=flowSelectedTaskId(); if(!taskId)return;
@@ -2409,6 +3065,7 @@ async function rerunWholeWorkflow(){
     'starts the whole workflow again.'))return;
   const r=await post_('/api/tasks/rerun_workflow',{task_id:taskId});
   if(!r.ok){ alert(r.error||'rerun failed'); return; }
+  resetRunClientState(taskId);
   await pollBoard(); renderFlow();
 }
 
@@ -2436,6 +3093,12 @@ async function rerunStep(stepId){
   // that's never allowed to happen silently, so surface it here.
   if(r.note){ alert(r.note); }
   await pollBoard(); renderFlow();
+}
+async function retryBlockedStep(stepId){
+  const taskId=historyTaskId(); if(!taskId) return;
+  const r=await post_('/api/tasks/reset_step_attempts',{task_id:taskId,step_id:stepId});
+  if(!r.ok){ alert(r.error||'could not reset retry limit'); return; }
+  await pollBoard(); await runStep(stepId);
 }
 /* ---------- preview/export a step's exact prompt (no side effects) ---------- */
 async function viewFullContext(stepId){
@@ -2531,7 +3194,7 @@ function renderFlow(){
   renderLanes();
   fitSurface(); redrawEdges();
   applyProgress();
-  renderInsp();
+  if(RUN_HISTORY_OPEN) renderRunHistory(); else renderInsp();
   renderPlanBanner();
 }
 /* ---------- Phase 3: parallel-wave grouping (gesture -> field bridge) ---------- */
@@ -2669,10 +3332,10 @@ $('#surface').addEventListener('pointerdown',e=>{
   if(node&&node.classList.contains('terminal')) return;   // not a workflow step — never draggable/selectable
   if(node){
     // Clicking a step means "I want THIS step's settings" — leave the run-log
-    // view so the 1.5s poll's renderFlowTerminal() stops overwriting the
-    // inspector with the log every tick (that overwrite was the bug where a
+    // and steps-&-results views so the 1.5s poll's renderFlowTerminal() stops
+    // overwriting the inspector every tick (that overwrite was the bug where a
     // step click still showed the run log instead of the step editor).
-    VIEWING_RUN_LOG=false;
+    VIEWING_RUN_LOG=false; RUN_HISTORY_OPEN=false;
     const i=+node.dataset.i; selNode=S.workflow.nodes[i]; bodyMode='preview'; highlight(); renderInsp();
     drag={el:node,title:selNode.title,sx:e.clientX,sy:e.clientY,
           ox:node.offsetLeft,oy:node.offsetTop,moved:false};
@@ -2790,18 +3453,33 @@ function renderInsp(){
     return `<span class="tog ${on?'on':''} ${on?usageBadgeClass(n.id,'skills',name):''}" onclick="toggleReq('${esc(name)}')">${esc(name)}</span>`;
   }).join('');
   const reqLinks=(n.required||[]).map(name=>`<a class="link" onclick="editSkill('${esc(name)}')">edit ${esc(name)} »</a>`).join(' · ');
+  // Each tool cycles through 3 states by click (see cycleTool): off ->
+  // recommended (tools_recommended, optional) -> required (tools, MUST be
+  // used) -> off. "Tool mode" below decides whether this step's MCP session
+  // sees the full catalog ("auto", today's default/only behavior) or ONLY
+  // the tools marked here at all ("scoped" -- required + recommended,
+  // nothing else, not even other built-ins).
   const toolTogs=allTools().map(t=>{
-    const on=(n.tools||[]).includes(t);
-    return `<span class="tog ${on?'on':''} ${on?usageBadgeClass(n.id,'tools',t):''}" title="${esc(toolDoc(t))}" onclick="toggleTool('${esc(t)}')">${esc(t)}</span>`;
+    const required=(n.tools||[]).includes(t), recommended=(n.tools_recommended||[]).includes(t);
+    const cls=required?'on':(recommended?'rec':'');
+    const state=required?'required':(recommended?'recommended (optional)':'not used');
+    return `<span class="tog ${cls} ${required||recommended?usageBadgeClass(n.id,'tools',t):''}" `+
+      `title="${esc(toolDoc(t))} — ${state}. Click to cycle: off → recommended → required." `+
+      `onclick="cycleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
-  // Recommended skills/tools (Task 1's `recommended:` tier) have no editing UI
-  // yet — surfaced here read-only, purely so their usage badge (Task 7) is
+  // Recommended skills (Task 1's `recommended:` tier) have no editing UI yet
+  // — surfaced here read-only, purely so their usage badge (Task 7) is
   // visible somewhere; toggling them on/off is a separate, not-yet-built
   // feature and out of this task's additive scope.
   const recSkillChips=(n.skills_recommended||[]).map(name=>
     `<span class="chip rec ${usageBadgeClass(n.id,'skills',name)}" title="recommended skill">${esc(name)}</span>`).join('');
-  const recToolChips=(n.tools_recommended||[]).map(t=>
-    `<span class="chip rec ${usageBadgeClass(n.id,'tools',t)}" title="recommended tool">${esc(t)}</span>`).join('');
+  const toolMode=(n.tool_mode||'auto');
+  const toolModeSelect=`<label>Tool mode</label>
+    <select onchange="setStepField('tool_mode',this.value==='auto'?'':this.value)">
+      <option value="auto" ${toolMode!=='scoped'?'selected':''}>Auto — this step's agent can use ANY registered tool</option>
+      <option value="scoped" ${toolMode==='scoped'?'selected':''}>Scoped — ONLY the required/recommended tools below (none if none marked)</option>
+    </select>
+    ${toolMode==='scoped'?'<div class="mut" style="font-size:11px;margin-top:4px">Scoped: only these tools are registered for this step — nothing else, not even other built-ins like board or submit_for_review.</div>':''}`;
   // Shown on EVERY step: pick the AGENT + MODEL this step runs with, and
   // Run/Rerun it in isolation — no more "which pipeline stage is this"
   // gating; any step can be run on its own via loop.run_step (by id).
@@ -2901,12 +3579,11 @@ function renderInsp(){
     <div style="margin-top:8px">${reqLinks}</div>
     ${recSkillChips?`<label>Recommended skills <span class="mut">(surfaced, not force-loaded)</span></label>
     <div class="skillgrid">${recSkillChips}</div>`:''}
-    <label>Tools at this step <span class="mut">(click to toggle · add below)</span></label>
+    <label>Tools at this step <span class="mut">(click to cycle: off → recommended → required · add below)</span></label>
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
-    ${recToolChips?`<label>Recommended tools</label>
-    <div class="skillgrid">${recToolChips}</div>`:''}
+    ${toolModeSelect}
     ${parallelNote}
     ${viewContextBtn}
     ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
@@ -2930,13 +3607,21 @@ function toggleReq(name){
   const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
   checkDirty(); renderFlow();
 }
-function toggleTool(name){
-  if(!selNode)return; selNode.tools=selNode.tools||[];
-  const k=selNode.tools.indexOf(name); if(k>=0)selNode.tools.splice(k,1); else selNode.tools.push(name);
+// Cycles one tool through 3 states: off -> recommended (tools_recommended,
+// optional) -> required (tools, MUST be used) -> off. Exactly one of the
+// two lists ever holds a given name at a time.
+function cycleTool(name){
+  if(!selNode)return;
+  selNode.tools=selNode.tools||[]; selNode.tools_recommended=selNode.tools_recommended||[];
+  const req=selNode.tools.indexOf(name), rec=selNode.tools_recommended.indexOf(name);
+  if(rec>=0){ selNode.tools_recommended.splice(rec,1); selNode.tools.push(name); }
+  else if(req>=0){ selNode.tools.splice(req,1); }
+  else{ selNode.tools_recommended.push(name); }
   checkDirty(); renderFlow();
 }
 function addTool(v){ v=(v||'').trim(); if(!v||!selNode)return;
-  selNode.tools=selNode.tools||[]; if(!selNode.tools.includes(v))selNode.tools.push(v);
+  selNode.tools=selNode.tools||[]; selNode.tools_recommended=selNode.tools_recommended||[];
+  if(!selNode.tools.includes(v)&&!selNode.tools_recommended.includes(v))selNode.tools_recommended.push(v);
   checkDirty(); renderFlow(); }
 async function saveFlow(){
   setStatus('saving…'); resortByPosition();
@@ -3047,6 +3732,14 @@ async function renderSettings(){
     </p>
     <h2 style="margin-top:26px">SETTINGS — loop &amp; safety</h2>
     <div id="loopSafetyFields"></div>
+    <h2 style="margin-top:26px">SETTINGS — decisions &amp; Telegram</h2>
+    <div id="hilFields"></div>
+    <h2 style="margin-top:26px">SETTINGS — extra pipeline stages</h2>
+    <p class="mut" style="font-size:11px;line-height:1.6;margin:2px 0 8px">
+      Run by <b>harn watch</b> AFTER a task's workflow finishes — they are NOT
+      steps in your workflow, so even a 1-step flow triggers them unless turned
+      off here. Turn these off for a fast, minimal run of exactly your workflow.</p>
+    <div id="pipelineFields"></div>
     <h2 style="margin-top:26px">SETTINGS — MCP</h2>
     <div id="mcpFields"></div>
   </div>`;
@@ -3059,6 +3752,23 @@ async function renderSettings(){
     numField('setTurnTimeout','Per-turn timeout (seconds)',LM_SETTINGS.turn_timeout_seconds,'(0 = adapter default 1800)')+
     numField('setMaxIters','Max iterations per run',LM_SETTINGS.max_iterations,'(0 = unlimited/off)')+
     `<button class="primary" onclick="saveLoopMcp()">Save loop &amp; MCP settings</button> <span id="lmStatus" class="status"></span>`;
+  $('#hilFields').innerHTML=
+    `<div class="field"><label>Autonomy <span class="mut">(100% = decide from project context and loaded skills)</span></label>`+
+    `<input type="range" id="setAutonomy" value="${LM_SETTINGS.autonomy_percent||0}" min="0" max="100" step="1" `+
+    `style="width:100%" oninput="$('#setAutonomyValue').textContent=this.value+'%'"/>`+
+    `<div class="mut" id="setAutonomyValue">${LM_SETTINGS.autonomy_percent||0}%</div></div>`+
+    numField('setChatGrace','Escalate unanswered questions after',LM_SETTINGS.chat_grace_minutes,'minutes (0 = immediately)')+
+    `<div class="field"><label>Telegram API key <span class="mut">${LM_SETTINGS.telegram_configured?'(configured; leave blank to keep)':'(BotFather token)'}</span></label>`+
+    `<input type="password" id="setTelegramApiKey" value="" autocomplete="new-password" placeholder="${LM_SETTINGS.telegram_configured?'••••••••':'123456:ABC…'}"/></div>`+
+    `<div class="field"><label>Telegram user ID</label>`+
+    `<input type="text" id="setTelegramUserId" value="${esc(LM_SETTINGS.telegram_user_id||'')}" inputmode="numeric"/></div>`+
+    `<div class="mut" style="font-size:11px;line-height:1.6">Questions appear in the Studio sidebar first. If unanswered, harn sends the same options and recommendation to this Telegram user.</div>`;
+  const chk=(id,label,val,hint)=>`<div class="field"><label><input type="checkbox" id="${id}" ${val?'checked':''}/> ${label}</label>`+
+    `<div class="mut" style="font-size:11px;margin-left:22px">${hint}</div></div>`;
+  $('#pipelineFields').innerHTML=
+    chk('setOracle','Oracle review',LM_SETTINGS.oracle,'An independent agent re-checks the finished work with fresh context. One extra agent turn (uses the [harn] default agent, not the step\'s model). Off = your workflow ends at review.')+
+    chk('setReconcile','Auto-reconcile',LM_SETTINGS.auto_reconcile,'A turn that captures learnings into skills/standards after review. One extra agent turn.')+
+    chk('setDesign','Design mockup',LM_SETTINGS.design,'For user-facing tasks, generate + confirm an HTML mockup before implementation.');
   $('#mcpFields').innerHTML=
     `<div class="field"><label><input type="checkbox" id="setSupervise" ${LM_SETTINGS.mcp_ui_supervise?'checked':''}/> harn ui supervises an MCP server</label></div>`+
     numField('setMcpPort','MCP port',LM_SETTINGS.mcp_ui_port,'(harn mcp --http)')+
@@ -3071,8 +3781,14 @@ async function saveLoopMcp(){
     const r=await post_('/api/settings',{
       max_cost_usd:num('setMaxCost'), max_tokens:num('setMaxTokens'),
       turn_timeout_seconds:num('setTurnTimeout'), max_iterations:num('setMaxIters'),
+      autonomy_percent:num('setAutonomy'), chat_grace_minutes:num('setChatGrace'),
+      telegram_api_key:$('#setTelegramApiKey')?$('#setTelegramApiKey').value.trim():'',
+      telegram_user_id:$('#setTelegramUserId')?$('#setTelegramUserId').value.trim():'',
       mcp_ui_supervise:$('#setSupervise')?$('#setSupervise').checked:false, mcp_ui_port:num('setMcpPort'),
-      mcp_tool_reload_seconds:num('setReload')});
+      mcp_tool_reload_seconds:num('setReload'),
+      oracle:$('#setOracle')?$('#setOracle').checked:false,
+      auto_reconcile:$('#setReconcile')?$('#setReconcile').checked:false,
+      design:$('#setDesign')?$('#setDesign').checked:false});
     if(st) st.textContent = r.ok ? 'saved ✓ (restart harn ui for MCP changes)' : (r.error||'save failed');
     if(r.ok) loadRunCaps();
   }catch(e){ if(st) st.textContent='save failed'; }
@@ -3124,7 +3840,7 @@ function editSkill(name){ showTab('skills'); skillSel=S.skills.findIndex(s=>s.na
   renderSkills(); renderSkillEditor(); }
 function goToNode(title){
   showTab('flow');
-  VIEWING_RUN_LOG=false;   // selecting a node → show its settings, not the log
+  VIEWING_RUN_LOG=false; RUN_HISTORY_OPEN=false;   // selecting a node → its settings
   selNode=S.workflow.nodes.find(n=>n.title===title)||selNode;
   highlight(); renderInsp();
   const el=document.querySelector('.node.sel');

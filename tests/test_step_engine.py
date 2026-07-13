@@ -73,6 +73,50 @@ def test_build_step_prompt_auto_mode_swaps_ask_for_decide(tmp_path):
     assert "AUTONOMOUS MODE" in p_auto and "AUTONOMOUS MODE" not in p_human
 
 
+def test_build_step_prompt_suppresses_lifecycle_note_for_parallel_steps(tmp_path):
+    """Reproduces a real, observed incident: a parallel-wave "Check weather"
+    step called get_next_task/board/submit_for_review/run_tests -- none of
+    which its own declared tools or body asked for -- then used `board` to
+    see the WHOLE project queue and started resuming an unrelated task
+    ("Resuming PRJ-030") mid-turn. Root cause: _LIFECYCLE_NOTE (added
+    whenever cfg.loop_aware is on) literally instructs "Use the harn MCP
+    tools (get_next_task, read_skill, run_tests, board, submit_for_review)"
+    -- correct framing for run()'s own top-level autonomous cycle, but wrong
+    for ONE step delegated out of a parallel wave, which must do only its own
+    declared work and stop. The lifecycle note must not reach a parallel
+    step's prompt."""
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    cfg = Config.load(env)
+    cfg.loop_aware = True
+    step = _step()
+    non_parallel = loop._build_step_prompt(env, cfg, t, step)
+    parallel = loop._build_step_prompt(env, cfg, t, step,
+                                       parallel_note=loop._PARALLEL_NOTE)
+    assert "you are one turn of a loop" in non_parallel   # full-loop framing intact
+    assert "you are one turn of a loop" not in parallel   # suppressed for a wave member
+
+
+def test_build_step_prompt_suppresses_lifecycle_note_for_scoped_steps(tmp_path):
+    """A `tool_mode: "scoped"` step (Studio's per-step tool restriction) does
+    not have get_next_task/run_tests/board/submit_for_review registered on
+    its MCP session at all -- telling it to use them is actively misleading,
+    not just off-scope, so the lifecycle note must be suppressed the same
+    way it already is for a parallel-wave member."""
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*.json"):
+        p.unlink()
+    t = make_task(env, "PRJ-001", title="Feat")
+    cfg = Config.load(env)
+    cfg.loop_aware = True
+    prompt = loop._build_step_prompt(env, cfg, t, _step(tool_mode="scoped"))
+    assert "you are one turn of a loop" not in prompt
+
+
 def test_build_step_prompt_parallel_note_does_not_contradict_itself(tmp_path):
     """Reproduces a real, observed bug: a step running inside a parallel wave
     got `parallel_note=_PARALLEL_NOTE` ("other steps in this wave are running
