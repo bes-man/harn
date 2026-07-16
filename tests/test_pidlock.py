@@ -59,3 +59,44 @@ def test_release_removes_the_file(tmp_path):
 
 def test_release_is_a_noop_if_already_gone(tmp_path):
     pidlock.release(tmp_path / "nope.pid")  # must not raise
+
+
+def test_read_alive_json_none_when_file_missing(tmp_path):
+    assert pidlock.read_alive_json(tmp_path / "nope.json") is None
+
+
+def test_read_alive_json_returns_data_for_a_live_process(tmp_path):
+    import json
+    p = tmp_path / "x.json"
+    p.write_text(json.dumps({"pid": os.getpid(), "port": 9999}))
+    assert pidlock.read_alive_json(p) == {"pid": os.getpid(), "port": 9999}
+
+
+def test_read_alive_json_cleans_up_a_dead_pid(tmp_path):
+    import json
+    p = tmp_path / "x.json"
+    p.write_text(json.dumps({"pid": 999999999, "port": 9999}))
+    assert pidlock.read_alive_json(p) is None
+    assert not p.exists()
+
+
+def test_read_alive_json_cleans_up_corrupt_json(tmp_path):
+    p = tmp_path / "x.json"
+    p.write_text("not json")
+    assert pidlock.read_alive_json(p) is None
+    assert not p.exists()
+
+
+def test_read_alive_json_cleans_up_missing_pid_key(tmp_path):
+    import json
+    p = tmp_path / "x.json"
+    p.write_text(json.dumps({"port": 9999}))
+    assert pidlock.read_alive_json(p) is None
+    assert not p.exists()
+
+
+def test_claim_json_writes_the_given_data(tmp_path):
+    p = tmp_path / "sub" / "x.json"
+    pidlock.claim_json(p, {"pid": 4242, "port": 9999})
+    import json
+    assert json.loads(p.read_text()) == {"pid": 4242, "port": 9999}

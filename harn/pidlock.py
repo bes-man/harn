@@ -18,8 +18,36 @@ with the auto-start path instead of leaving it as an MCP-only safeguard.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+
+
+def read_alive_json(marker_file: Path) -> dict | None:
+    """Like `read_alive_pid`, but for a JSON marker carrying extra fields
+    (e.g. host/port) alongside a `"pid"` key -- used where a caller needs to
+    know not just THAT another instance is running, but where to reach it.
+
+    Returns the parsed dict if `data["pid"]` is alive, else None (cleaning
+    up the file)."""
+    if not marker_file.exists():
+        return None
+    try:
+        data = json.loads(marker_file.read_text(encoding="utf-8"))
+        os.kill(int(data["pid"]), 0)   # raises if dead
+        return data
+    except (ProcessLookupError, ValueError, OSError, KeyError, TypeError,
+            json.JSONDecodeError):
+        marker_file.unlink(missing_ok=True)
+        return None
+
+
+def claim_json(marker_file: Path, data: dict) -> None:
+    """Write `data` (must include a `"pid"` key) to `marker_file`, claiming
+    it for the calling process. Caller must have already confirmed via
+    `read_alive_json()` that nothing else currently holds it."""
+    marker_file.parent.mkdir(parents=True, exist_ok=True)
+    marker_file.write_text(json.dumps(data), encoding="utf-8")
 
 
 def read_alive_pid(pid_file: Path) -> int | None:

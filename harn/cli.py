@@ -377,32 +377,46 @@ def cmd_board(args) -> int:
     return 0
 
 
+def _global_ui_marker() -> Path:
+    """One studio HTTP server already serves every project via `?env=<path>`
+    -- this is the machine-wide (not per-project) marker for "an instance is
+    already up, and here's how to reach it", so a second `harn ui` for ANY
+    project can reuse it instead of racing a bind() against the first."""
+    return Path.home() / ".harn" / "ui.json"
+
+
 def cmd_ui(args) -> int:
+    import os
+    import webbrowser
+    from urllib.parse import quote
     from . import pidlock, studio
     env_dir = _env_dir(Path(args.path).resolve())
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
-    # Nothing previously stopped a second `harn ui` for the same project from
-    # starting (a different --port even lets two bind at once) -- duplicates
-    # accumulated for real across restarts and stray verify/test runs, each
-    # left running indefinitely with nothing ever pointed at them again.
-    pid_file = env_dir / "state" / "ui.pid"
-    already = pidlock.read_alive_pid(pid_file)
-    if already is not None:
-        print(f"[harn] studio already running for this project (pid {already}) "
-              "-- stop it first.", file=sys.stderr)
-        return 1
-    pidlock.claim(pid_file)
+    # Before this, a second `harn ui` invocation -- for this project OR a
+    # different one -- either raced a bind() against an already-running
+    # instance (a raw OSError traceback surfacing the FIRST time a real user
+    # hit this) or silently ran a redundant, untracked process. Since studio
+    # is multi-project by design (?env=), the right outcome is to open the
+    # ALREADY running instance at this project instead of starting another.
+    marker = _global_ui_marker()
+    running = pidlock.read_alive_json(marker)
+    if running is not None:
+        url = f"http://{running['host']}:{running['port']}/?env={quote(str(env_dir))}"
+        print(f"[harn] studio already running (pid {running['pid']}) -- {url}")
+        if not args.no_open:
+            webbrowser.open(url)
+        return 0
+    pidlock.claim_json(marker, {"pid": os.getpid(), "host": args.host,
+                                "port": args.port})
     try:
         studio.serve(env_dir, host=args.host, port=args.port,
                      open_browser=not args.no_open)
     except OSError as exc:
-        # The pidfile check above only catches a SECOND `harn ui` for the
-        # SAME project -- it can't see a DIFFERENT project's `harn ui` (or
-        # anything else) already holding this exact port, which surfaces
-        # here as a raw bind() OSError (errno 48/EADDRINUSE on macOS,
-        # errno 98 on Linux) instead of a clean refusal.
+        # A port collision NOT tracked by our own marker at all (something
+        # else entirely bound it) still surfaces as a raw bind() OSError
+        # (errno 48/EADDRINUSE on macOS, errno 98 on Linux/EADDRINUSE).
         if exc.errno in (48, 98):
             print(f"[harn] port {args.port} is already in use by another "
                   "process -- pass --port to use a different one.",
@@ -410,7 +424,7 @@ def cmd_ui(args) -> int:
             return 1
         raise
     finally:
-        pidlock.release(pid_file)
+        pidlock.release(marker)
     return 0
 
 
