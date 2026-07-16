@@ -397,6 +397,18 @@ def cmd_ui(args) -> int:
     try:
         studio.serve(env_dir, host=args.host, port=args.port,
                      open_browser=not args.no_open)
+    except OSError as exc:
+        # The pidfile check above only catches a SECOND `harn ui` for the
+        # SAME project -- it can't see a DIFFERENT project's `harn ui` (or
+        # anything else) already holding this exact port, which surfaces
+        # here as a raw bind() OSError (errno 48/EADDRINUSE on macOS,
+        # errno 98 on Linux) instead of a clean refusal.
+        if exc.errno in (48, 98):
+            print(f"[harn] port {args.port} is already in use by another "
+                  "process -- pass --port to use a different one.",
+                  file=sys.stderr)
+            return 1
+        raise
     finally:
         pidlock.release(pid_file)
     return 0

@@ -92,5 +92,25 @@ def test_cmd_ui_starts_and_releases_pidfile_after_clean_exit(tmp_path):
     assert not (env / "state" / "ui.pid").exists()
 
 
+def test_cmd_ui_reports_a_friendly_error_when_the_port_is_taken(tmp_path, capsys):
+    """Reproduces a real traceback: the pidfile check only catches a SECOND
+    `harn ui` for the SAME project -- it says nothing about a DIFFERENT
+    project's `harn ui` already holding the same (default) port. That case
+    must exit(1) with a clear message pointing at --port, not crash with a
+    raw OSError traceback."""
+    scaffold.setup(tmp_path)
+    env = _env_dir_of(tmp_path)
+
+    with patch("harn.studio.serve",
+               side_effect=OSError(48, "Address already in use")):
+        rc = cli.cmd_ui(_args(tmp_path))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "already in use" in err
+    assert "--port" in err
+    assert not (env / "state" / "ui.pid").exists()  # released, not left dangling
+
+
 def _env_dir_of(project_root: Path) -> Path:
     return project_root / ENV_DIRNAME
