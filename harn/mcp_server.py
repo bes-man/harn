@@ -22,6 +22,7 @@ from . import codebase as codebase_mod
 from . import design as design_mod
 from . import events as events_mod
 from . import guidance as guidance_mod
+from . import pidlock
 from . import prd as prd_mod
 from . import progress as progress_mod
 from . import skills as skills_mod
@@ -102,17 +103,9 @@ def _ensure_watch_running(env_dir: Path) -> None:
     """
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
-    state_dir = env_dir / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    pid_file = state_dir / "watch.pid"
-
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)   # raises if dead
-            return             # already running
-        except (ProcessLookupError, ValueError, OSError):
-            pid_file.unlink(missing_ok=True)
+    pid_file = env_dir / "state" / "watch.pid"
+    if pidlock.read_alive_pid(pid_file) is not None:
+        return   # already running -- same pidfile `harn watch` itself checks
 
     try:
         proc = subprocess.Popen(
@@ -121,7 +114,7 @@ def _ensure_watch_running(env_dir: Path) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pid_file.write_text(str(proc.pid))
+        pidlock.claim(pid_file, proc.pid)
     except Exception:
         pass  # watch is optional — never block the MCP server
 

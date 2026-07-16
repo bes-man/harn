@@ -325,16 +325,31 @@ def cmd_rollback(args) -> int:
 
 
 def cmd_watch(args) -> int:
-    from . import loop
+    from . import loop, pidlock
     root = Path(args.path).resolve()
     env_dir = _env_dir(root)
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
+    # Same pidfile _ensure_watch_running (the MCP auto-start path) already
+    # uses -- a manually-run `harn watch` and an auto-started one now share
+    # ONE coordination point, so neither can race a duplicate poller against
+    # this project. Before this check, nothing stopped two `harn watch`
+    # processes from independently dispatching the same tasks; duplicates
+    # accumulated for real across restarts and manual runs.
+    pid_file = env_dir / "state" / "watch.pid"
+    already = pidlock.read_alive_pid(pid_file)
+    if already is not None:
+        print(f"[harn] watch already running for this project (pid {already}) "
+              "-- stop it first.", file=sys.stderr)
+        return 1
+    pidlock.claim(pid_file)
     try:
         loop.watch(env_dir, root, poll_s=args.poll)
     except KeyboardInterrupt:
         print("\n[harn] watch stopped.")
+    finally:
+        pidlock.release(pid_file)
     return 0
 
 
@@ -363,13 +378,27 @@ def cmd_board(args) -> int:
 
 
 def cmd_ui(args) -> int:
-    from . import studio
+    from . import pidlock, studio
     env_dir = _env_dir(Path(args.path).resolve())
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
-    studio.serve(env_dir, host=args.host, port=args.port,
-                 open_browser=not args.no_open)
+    # Nothing previously stopped a second `harn ui` for the same project from
+    # starting (a different --port even lets two bind at once) -- duplicates
+    # accumulated for real across restarts and stray verify/test runs, each
+    # left running indefinitely with nothing ever pointed at them again.
+    pid_file = env_dir / "state" / "ui.pid"
+    already = pidlock.read_alive_pid(pid_file)
+    if already is not None:
+        print(f"[harn] studio already running for this project (pid {already}) "
+              "-- stop it first.", file=sys.stderr)
+        return 1
+    pidlock.claim(pid_file)
+    try:
+        studio.serve(env_dir, host=args.host, port=args.port,
+                     open_browser=not args.no_open)
+    finally:
+        pidlock.release(pid_file)
     return 0
 
 
