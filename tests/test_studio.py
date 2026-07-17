@@ -469,6 +469,22 @@ def test_studio_step_editor_has_tool_mode_selector_and_cycle_tool():
     assert 'value="auto"' in html
 
 
+def test_studio_step_editor_has_new_session_and_use_task_context_toggles():
+    """Studio's per-step new_session/use_task_context toggles (spec C) — same
+    off-by-default pattern as tool_mode: new_session is shown on every step,
+    use_task_context only shown/active once new_session is on for that step."""
+    html = studio._HTML
+    assert "function setNewSession(on)" in html
+    assert "function setUseTaskContext(on)" in html
+    assert "onchange=\"setNewSession(this.checked)\"" in html
+    assert "onchange=\"setUseTaskContext(this.checked)\"" in html
+    assert "New session" in html
+    assert "Use task context" in html
+    # use_task_context checkbox markup only appears inside the newSessionOn
+    # branch — i.e. it's conditionally rendered, not always shown.
+    assert "newSessionOn?`" in html
+
+
 def test_studio_review_log_preserves_scroll_across_required_render():
     html = studio._HTML
     assert 'id="reviewLog"' in html

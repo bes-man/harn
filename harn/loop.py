@@ -507,10 +507,73 @@ def _adapter_for_step(cfg: Config, step: dict, default: Adapter) -> Adapter:
         return default
 
 
+_COMPACTION_INSTRUCTIONS = (
+    "Summarize the following captured task context into a concise, faithful "
+    "digest a future step can rely on INSTEAD OF the raw log below. Preserve "
+    "concrete facts, decisions, file paths, and open issues; drop noise and "
+    "duplication. Reply with ONLY the summary text — no preamble, no "
+    "headings, no meta-commentary about this being a summary."
+)
+
+
+def _build_compaction_prompt(raw_text: str, step_ids: list[str]) -> str:
+    ids = ", ".join(step_ids) if step_ids else "(unlabeled)"
+    return (f"## Context compaction\n{_COMPACTION_INSTRUCTIONS}\n\n"
+           f"## Raw task context to summarize (steps: {ids})\n{raw_text}")
+
+
+def _compact_step_context(env_dir: Path, cfg: Config, task: tasks.Task,
+                          step: dict, step_adapter: Adapter) -> str:
+    """Best-effort context-compaction boundary for a `new_session` step (spec
+    C). Before the step runs, summarize the task's `## Context` span since
+    the last compaction marker using THIS STEP's own agent/model resolution
+    (`_adapter_for_step`/`_step_overrides` — the same one the step itself
+    runs with), then rewrite `<task_id>.md` in place via
+    `tasks.compact_context`.
+
+    Never raises — mirrors the oracle/reconcile "never crash the turn"
+    convention elsewhere in this module (see `oracle_review`,
+    `reconcile_headless`): a failed summarization call just means the step
+    runs without the compacted context, not a blocked/crashed run.
+
+    Returns the text to inject into THIS step's own prompt — only when
+    `use_task_context` is also set on the step (default True) — else "".
+    A step with `new_session=False` (the default) is untouched: returns ""
+    immediately without reading or writing anything.
+    """
+    if not step.get("new_session"):
+        return ""
+
+    def _summarize(raw_text: str, step_ids: list[str]) -> str:
+        res = step_adapter.run_turn(_build_compaction_prompt(raw_text, step_ids),
+                                    env_dir.parent, **_step_overrides(cfg, step))
+        return (res.text or "").strip()
+
+    stage = f"compact:{step.get('id') or ''}"
+    events.emit(env_dir, "stage_start", task_id=task.id, stage=stage,
+                agent=step_adapter.name)
+    t0 = time.time()
+    try:
+        entry = tasks.compact_context(env_dir, task.id, summarize=_summarize)
+    except Exception as e:  # never let compaction crash the step
+        progress.log(env_dir, f"{task.id}: context compaction error: {e}",
+                     agent=step_adapter.name)
+        events.emit(env_dir, "error", task_id=task.id, stage=stage,
+                    detail=str(e)[:300])
+        return ""
+    events.emit(env_dir, "stage_end", task_id=task.id, stage=stage,
+                agent=step_adapter.name, ok=entry is not None,
+                dur_ms=int((time.time() - t0) * 1000))
+    if not entry or not step.get("use_task_context", True):
+        return ""
+    return "## Context from earlier in this task\n" + entry
+
+
 def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
                        auto: bool = False, onfail_context: str = "",
-                       parallel_note: str = "", tool_results: str = "") -> str:
+                       parallel_note: str = "", tool_results: str = "",
+                       context_injection: str = "") -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
     stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
@@ -554,6 +617,8 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
         parts.append(skills_block)
     parts.append(f"## Current task — {task.id} (status: {task.status})\n"
                  + _task_spec(task))
+    if context_injection:
+        parts.append(context_injection)
     tools = [t for t in (step.get("tools") or []) if t]
     tools_rec = [t for t in (step.get("tools_recommended") or []) if t]
     tools_lines = ""
@@ -1564,6 +1629,7 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         _block_tool_failure(env_dir, task, step, tool_error, prior_attempts)
         return {"ok": False, "step_id": step_id, "title": title,
                 "text": "", "error": tool_error}
+    context_injection = _compact_step_context(env_dir, cfg, task, step, step_adapter)
     for offset in range(1, 3):
         attempt = prior_attempts + offset
         started = tasks._now_iso()
@@ -1572,7 +1638,8 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         tasks._save(task)
         result = _run_turn(
             step_adapter, env_dir, _build_step_prompt(
-                env_dir, cfg, task, step, tool_results=tool_results),
+                env_dir, cfg, task, step, tool_results=tool_results,
+                context_injection=context_injection),
             project_root, task_id=task_id, stage=step_id, step_title=title,
             overrides=_step_overrides(cfg, step), tok_totals=tok_totals,
             tok_costs=tok_costs, cfg=cfg, attempt=attempt)
@@ -2368,10 +2435,13 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 st.save(state_dir)
                 _block_tool_failure(env_dir, task, step, tool_error, prior_attempts)
                 return _run_end(env_dir, state.State.load(state_dir))
+            context_injection = _compact_step_context(env_dir, cfg, task, step,
+                                                      step_adapter)
             result = _run_turn(
                 step_adapter, env_dir,
                 _build_step_prompt(env_dir, cfg, task, step, feedback_tail,
-                                   auto=auto, tool_results=tool_results),
+                                   auto=auto, tool_results=tool_results,
+                                   context_injection=context_injection),
                 project_root, task_id=task.id, stage=sid, step_title=title,
                 overrides=_step_overrides(cfg, step),
                 tok_totals=tok_totals, tok_costs=tok_costs, cfg=cfg,

@@ -22,7 +22,11 @@ sections in order: Description, Result, Decisions, Review log, Changelog,
 Context. ``## Context`` is always LAST and append-only for the task's
 lifetime — every streamed tool_result/message the agent's turn produced,
 appended via a true ``open(path, "a")`` (O(1), independent of file size) —
-capped per entry (~4000 chars) so a noisy tool can't flood it.
+capped per entry (~4000 chars) so a noisy tool can't flood it. The one
+exception is ``compact_context`` (spec C): a workflow step opted into
+``new_session`` may summarize-and-replace the not-yet-compacted raw span with
+one ``### [compacted @ ...]`` entry — a full-file rewrite, acceptable because
+those steps are opt-in and infrequent, unlike the append path above.
 
 ``<id>.state.json`` — engine bookkeeping the human never needs to read:
 step_results (per-step usage tracking), stage_checkpoints/task_patch_refs
@@ -643,6 +647,99 @@ def append_context(env_dir: Path, task_id: str, *, step_id: str,
     entry = f"\n{heading}\n{cap_text(text)}\n"
     with open(path, "a", encoding="utf-8") as f:
         f.write(entry)
+
+
+# ---------------------------------------------------------------------------
+# per-step new_session compaction (spec C) — a deliberate context-compaction
+# boundary a workflow step can opt into. Unlike `append_context` above (a
+# high-frequency O(1) append), this REWRITES the file: it replaces the raw
+# span of `## Context` since the last compaction marker with one summarized
+# entry. Acceptable because `new_session` steps are opt-in and infrequent.
+# ---------------------------------------------------------------------------
+_COMPACTED_PREFIX = "### [compacted @ "
+_HEADING_RE = re.compile(r"^### .*$", re.MULTILINE)
+_RAW_HEADING_ID_RE = re.compile(r"^### (\S+)")
+
+
+def _last_compacted_end(context_body: str) -> int:
+    """Index right after the LAST `### [compacted @ ...]` entry's full text
+    (heading + summary, up to the next `### ` heading or end of string), or
+    0 if there is no compacted entry yet — i.e. where the not-yet-compacted
+    raw span begins."""
+    end = 0
+    headings = list(_HEADING_RE.finditer(context_body))
+    for i, m in enumerate(headings):
+        if not context_body[m.start():].startswith(_COMPACTED_PREFIX):
+            continue
+        end = headings[i + 1].start() if i + 1 < len(headings) else len(context_body)
+    return end
+
+
+def _entry_step_ids(raw_span: str) -> list[str]:
+    """The distinct step ids of every RAW (non-compacted) entry heading in
+    `raw_span`, in first-seen order — used to label a new compacted entry's
+    "covers steps <ids>" line."""
+    ids: list[str] = []
+    for m in _HEADING_RE.finditer(raw_span):
+        line = m.group(0)
+        if line.startswith(_COMPACTED_PREFIX):
+            continue
+        idm = _RAW_HEADING_ID_RE.match(line)
+        if idm and idm.group(1) not in ids:
+            ids.append(idm.group(1))
+    return ids
+
+
+def compact_context(env_dir: Path, task_id: str, *, summarize) -> str | None:
+    """Summarize the not-yet-compacted span of `<task_id>.md`'s `## Context`
+    section and rewrite it in place as one compacted entry (spec C's
+    `new_session` steps).
+
+    `summarize(raw_text, step_ids) -> str` is caller-supplied (loop.py
+    dispatches the actual LLM turn — this module only owns the file
+    mechanics). Its exceptions are NOT caught here — a best-effort wrapper at
+    the call site (mirroring the oracle/reconcile "never crash the turn"
+    convention) is the caller's job, exactly like `oracle_review` catches
+    around its own `adapter.run_turn` call.
+
+    Only the span since the last `### [compacted @ ...]` marker (or from the
+    very start of `## Context`, if none exists yet) is summarized — earlier
+    compacted spans are left untouched, so repeated calls stay incremental
+    rather than re-summarizing the whole history every time.
+
+    Returns the newly written entry (`### [compacted @ <ts>] covers steps
+    <ids>` + the summary) so the caller can inject it into a step's own
+    prompt, or `None` if there was nothing new to compact (an empty raw
+    span, e.g. a `new_session` step that ran before any other step captured
+    context) — the file is left untouched in that case.
+    """
+    path = env_dir / "tasks" / f"{task_id}.md"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    idx = text.find(_CONTEXT_MARKER_LINE)
+    if idx == -1:
+        return None
+    head = text[:idx + len(_CONTEXT_MARKER_LINE)]
+    context_body = text[idx + len(_CONTEXT_MARKER_LINE):]
+    span_start = _last_compacted_end(context_body)
+    raw_span = context_body[span_start:]
+    if not raw_span.strip():
+        return None
+    step_ids = _entry_step_ids(raw_span)
+    summary = (summarize(raw_span, step_ids) or "").strip()
+    if not summary:
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ids_label = ", ".join(step_ids) if step_ids else "(none)"
+    heading = f"{_COMPACTED_PREFIX}{ts}] covers steps {ids_label}"
+    entry = f"\n{heading}\n{summary}\n"
+    new_context_body = context_body[:span_start] + entry
+    path.write_text(head + new_context_body, encoding="utf-8")
+    return entry.strip("\n")
 
 
 def _load_or_migrate(json_path: Path) -> None:

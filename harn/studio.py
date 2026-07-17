@@ -3483,6 +3483,18 @@ function renderInsp(){
       <option value="scoped" ${toolMode==='scoped'?'selected':''}>Scoped — ONLY the required/recommended tools below (none if none marked)</option>
     </select>
     ${toolMode==='scoped'?'<div class="mut" style="font-size:11px;margin-top:4px">Scoped: only these tools are registered for this step — nothing else, not even other built-ins like board or submit_for_review.</div>':''}`;
+  // new_session: off-by-default toggle that compacts the task's growing
+  // ## Context section (a fresh summary replaces the raw span since the last
+  // compaction) right before this step runs. use_task_context (default ON,
+  // only shown/relevant once new_session is on) decides whether THIS step's
+  // own prompt then gets that just-written summary injected.
+  const newSessionOn=!!n.new_session;
+  const useTaskContextOn=(n.use_task_context!==false);
+  const newSessionToggle=`
+    <label><input type="checkbox" ${newSessionOn?'checked':''} onchange="setNewSession(this.checked)"/>
+      New session <span class="mut">(compact this task's context into a fresh summary before this step runs)</span></label>
+    ${newSessionOn?`<label style="margin-top:4px"><input type="checkbox" ${useTaskContextOn?'checked':''} onchange="setUseTaskContext(this.checked)"/>
+      Use task context <span class="mut">(inject the compacted summary into this step's own prompt)</span></label>`:''}`;
   // Shown on EVERY step: pick the AGENT + MODEL this step runs with, and
   // Run/Rerun it in isolation — no more "which pipeline stage is this"
   // gating; any step can be run on its own via loop.run_step (by id).
@@ -3587,6 +3599,7 @@ function renderInsp(){
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
       onkeydown="if(event.key==='Enter'){addTool(this.value);this.value='';}"/>
     ${toolModeSelect}
+    ${newSessionToggle}
     ${parallelNote}
     ${viewContextBtn}
     ${typeToggle}${stepType==='agent'?modelSection:commandSection}`:''}
@@ -3605,6 +3618,11 @@ function upd(k,v){
   }
 }
 function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); renderFlow(); }
+// new_session off -> use_task_context reverts to its default (true) so
+// turning the boundary back on later doesn't surface a stale unchecked box.
+function setNewSession(on){ if(!selNode)return; selNode.new_session=on;
+  if(!on) selNode.use_task_context=true; checkDirty(); renderInsp(); }
+function setUseTaskContext(on){ if(!selNode)return; selNode.use_task_context=on; checkDirty(); renderInsp(); }
 function toggleReq(name){
   if(!selNode)return; selNode.required=selNode.required||[];
   const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
