@@ -624,6 +624,22 @@ def test_run_history_renders_before_waiting_for_task_plan():
     assert "retryBlockedStep" in html
 
 
+def test_finished_task_gets_execution_mode_not_preview():
+    # A task that already ran to completion (no active BOARD.run) must still
+    # show its real transcript, not the "Starts when this flow runs" preview
+    # placeholder — so the execution-mode check must also look at the
+    # selected task's own historical fields, not only the live BOARD.run.
+    html = studio._HTML
+    fn = html[html.index("async function openRunHistory()"):
+              html.index("function renderRunHistory()")]
+    assert "taskHasRunHistory" in fn
+    assert "historyTask.step_results" in fn
+    assert "historyTask.baseline_ref" in fn
+    assert "historyTask.task_patch_refs" in fn
+    assert "(BOARD.run&&BOARD.run.task_id===taskId)||taskHasRunHistory" in fn
+    assert fn.index("taskHasRunHistory") < fn.index("if(RUN_HISTORY_MODE==='preview')")
+
+
 def test_clicking_run_workflow_heading_opens_progress_sidebar():
     html = studio._HTML
     assert 'class="ttl run-launch" onclick="openRunHistory()"' in html

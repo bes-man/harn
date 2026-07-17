@@ -2743,7 +2743,10 @@ async function openRunHistory(){
     TRANSCRIPT_OPEN_STEPS.clear();
     TRANSCRIPT_CLOSED_STEPS.clear();
   }
-  if(BOARD.run&&BOARD.run.task_id===taskId) RUN_HISTORY_MODE='execution';
+  const historyTask=(BOARD.tasks||[]).find(x=>x.id===taskId)||null;
+  const taskHasRunHistory=!!(historyTask&&(Object.keys(historyTask.step_results||{}).length||
+    historyTask.baseline_ref||(historyTask.task_patch_refs||[]).length));
+  if((BOARD.run&&BOARD.run.task_id===taskId)||taskHasRunHistory) RUN_HISTORY_MODE='execution';
   if(RUN_HISTORY_MODE==='preview'){
     RUN_HISTORY_PLAN={taskId,nodes:S.workflow.nodes||[]};
   }else if(taskId && (!RUN_HISTORY_PLAN || RUN_HISTORY_PLAN.taskId!==taskId)){
