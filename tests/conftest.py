@@ -1,7 +1,6 @@
-"""Shared helpers for tests that need a minimal harn_env with JSON tasks."""
+"""Shared helpers for tests that need a minimal harn_env with task files."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from harn import tasks
@@ -18,21 +17,13 @@ def make_task(
     skills: list[str] | None = None,
     description: str = "## What\nTest.\n\n## Done when\n- works",
 ) -> tasks.Task:
-    """Write a minimal JSON task file and return the Task object."""
+    """Write a minimal task (`<id>.md` + `<id>.state.json`) and return the Task."""
     (env_dir / "tasks").mkdir(parents=True, exist_ok=True)
-    path = env_dir / "tasks" / f"{task_id}.json"
-    d = {
-        "id": task_id,
-        "title": title,
-        "status": status,
-        "priority": priority,
-        "prds": prds or [],
-        "epic": None,
-        "user_story": None,
-        "skills": skills or [],
-        "subtasks": [],
-        "description": description,
-        "review_log": [],
-    }
-    path.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    return tasks._load(path)
+    task = tasks.create_task(
+        env_dir, title, description=description, prds=prds, priority=priority,
+        skills=skills, task_id=task_id,
+    )
+    if status != tasks.TODO:
+        task.status = tasks._normalize_status(status)
+        tasks._save(task)
+    return tasks._load_full(task.path)

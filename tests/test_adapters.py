@@ -191,3 +191,110 @@ def test_exec_uses_absolute_path_when_off_path(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", fake_run)
     get_adapter("claude").run_turn("PROMPT", Path("."))
     assert captured["argv"][0] == str(fake)
+
+
+# ---------------------------------------------------------------------------
+# ClaudeAdapter._normalize_event — the tool_result capture extension (task
+# context markdown + real capture design, spec B): a `type: "user"` stream
+# record carries the actual RETURN VALUE of a tool call, correlated back to
+# the tool's name via the id a preceding `type: "assistant"` tool_use event
+# registered in the shared `name_by_id` map.
+# ---------------------------------------------------------------------------
+from harn.adapters.claude import ClaudeAdapter
+
+
+def test_assistant_tool_use_registers_id_to_name():
+    name_by_id: dict = {}
+    events = ClaudeAdapter._normalize_event({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "read_skill"},
+        ]},
+    }, name_by_id)
+    assert name_by_id == {"toolu_1": "read_skill"}
+    assert events == [{"kind": "tool", "phase": "started",
+                       "title": "read_skill", "text": ""}]
+
+
+def test_user_tool_result_resolves_name_via_id_correlation():
+    name_by_id = {"toolu_1": "read_skill"}
+    events = ClaudeAdapter._normalize_event({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1",
+             "content": [{"type": "text", "text": "skill body here"}]},
+        ]},
+    }, name_by_id)
+    assert len(events) == 1
+    assert events[0]["kind"] == "tool_result"
+    assert events[0]["title"] == "read_skill"
+    assert events[0]["text"] == "skill body here"
+
+
+def test_tool_result_unknown_id_falls_back_to_generic_name():
+    events = ClaudeAdapter._normalize_event({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_missing",
+             "content": "plain string result"},
+        ]},
+    }, {})
+    assert events[0]["title"] == "Tool"
+    assert events[0]["text"] == "plain string result"
+
+
+def test_tool_result_over_cap_is_truncated_with_marker():
+    huge = "x" * 5000
+    events = ClaudeAdapter._normalize_event({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": huge},
+        ]},
+    }, {"toolu_1": "run_tests"})
+    text = events[0]["text"]
+    assert len(text) < 5000
+    assert text.endswith("(truncated)")
+    assert text.startswith("x" * 100)
+
+
+def test_tool_result_under_cap_is_untouched():
+    events = ClaudeAdapter._normalize_event({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "short"},
+        ]},
+    }, {"toolu_1": "run_tests"})
+    assert events[0]["text"] == "short"
+    assert "truncated" not in events[0]["text"]
+
+
+def test_assistant_text_and_tool_use_full_turn_sequence():
+    """A realistic mini turn: text, then a tool call, then its result — the
+    id→name map built up across the whole sequence, as loop._run_turn's
+    on_event would see it record-by-record."""
+    name_by_id: dict = {}
+    all_events = []
+    all_events += ClaudeAdapter._normalize_event({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "Let me check that."}]},
+    }, name_by_id)
+    all_events += ClaudeAdapter._normalize_event({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "id": "toolu_9", "name": "read_service"}]},
+    }, name_by_id)
+    all_events += ClaudeAdapter._normalize_event({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_9",
+             "content": [{"type": "text", "text": "service body"}]}]},
+    }, name_by_id)
+    kinds = [e["kind"] for e in all_events]
+    assert kinds == ["message", "tool", "tool_result"]
+    assert all_events[2]["title"] == "read_service"
+    assert all_events[2]["text"] == "service body"
+
+
+def test_non_assistant_non_user_record_yields_no_events():
+    assert ClaudeAdapter._normalize_event({"type": "result"}, {}) == []
+    assert ClaudeAdapter._normalize_event({"type": "system"}, {}) == []
