@@ -5,6 +5,18 @@ from pathlib import Path
 
 from .base import Adapter, AgentResult
 
+# Matches the existing step_results.output truncation convention
+# ((result.text or "")[-4000:] in loop.py) — capped so a noisy tool (e.g. a
+# full test-suite dump) can't flood a captured tool_result; the marker keeps
+# the truncation visible rather than silent.
+_TOOL_RESULT_CAP = 4000
+
+
+def _cap(text: str, limit: int = _TOOL_RESULT_CAP) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated)"
+
 
 class ClaudeAdapter(Adapter):
     """Drives Claude Code in headless mode via `claude -p`.
@@ -57,6 +69,84 @@ class ClaudeAdapter(Adapter):
         if r.timed_out:
             return AgentResult(ok=False, text=r.stderr)
         return self._parse(r.ok, r.stdout, r.stderr)
+
+    @staticmethod
+    def _normalize_event(data: dict, name_by_id: dict[str, str]) -> list[dict]:
+        """Map a Claude Code `stream-json` print-mode record to the common
+        transcript UI's event shape.
+
+        `type: "assistant"` records carry the model's text and tool-call
+        *names* (already handled). `type: "user"` records carry `tool_result`
+        blocks — the actual RETURN VALUE of every tool call (a skill body, a
+        weather JSON, anything) — previously dropped entirely, so the task's
+        Context capture could only ever say a tool was called, never show
+        what it returned. `name_by_id` is a small id→name map the caller keeps
+        across one turn's events: assistant `tool_use` items register their
+        id/name here as they're seen, so the later `tool_result` (which only
+        carries `tool_use_id`) can resolve back to the tool that produced it.
+        """
+        t = data.get("type")
+        if t == "assistant":
+            return ClaudeAdapter._normalize_assistant(data, name_by_id)
+        if t == "user":
+            return ClaudeAdapter._normalize_tool_result(data, name_by_id)
+        return []
+
+    @staticmethod
+    def _normalize_assistant(data: dict, name_by_id: dict[str, str]) -> list[dict]:
+        message = data.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            return []
+        events: list[dict] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and item.get("text"):
+                events.append({"kind": "message", "phase": "updated",
+                               "title": "Claude", "text": str(item["text"])})
+            elif item.get("type") == "tool_use":
+                name = str(item.get("name") or "Tool")
+                tool_id = item.get("id")
+                if tool_id:
+                    name_by_id[str(tool_id)] = name
+                events.append({"kind": "tool", "phase": "started",
+                               "title": name, "text": ""})
+        return events
+
+    @staticmethod
+    def _normalize_tool_result(data: dict, name_by_id: dict[str, str]) -> list[dict]:
+        message = data.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            return []
+        events: list[dict] = []
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            text = ClaudeAdapter._tool_result_text(item)
+            if not text:
+                continue
+            tool_id = str(item.get("tool_use_id") or "")
+            name = name_by_id.get(tool_id, "Tool")
+            events.append({"kind": "tool_result", "phase": "completed",
+                           "title": name, "text": _cap(text)})
+        return events
+
+    @staticmethod
+    def _tool_result_text(item: dict) -> str:
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    parts.append(str(c.get("text") or ""))
+                elif isinstance(c, str):
+                    parts.append(c)
+            return "\n".join(parts)
+        return ""
 
     @staticmethod
     def _parse(ok: bool, stdout: str, stderr: str) -> AgentResult:

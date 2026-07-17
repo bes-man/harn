@@ -1084,14 +1084,22 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
             return
         kind = str(event.get("kind") or "status")
         phase = str(event.get("phase") or "updated")
+        text = str(event.get("text") or "")
         visible = transcript.append(
             env_dir, task_id=task_id, step_id=stage,
             run_id=events.current_run(env_dir), attempt=attempt or 1,
             kind=kind, phase=phase, title=str(event.get("title") or ""),
-            text=str(event.get("text") or ""),
+            text=text,
             item_id=str(event.get("item_id") or ""),
         )
         emitted.append(visible)
+        # The actual captured content (model text, tool_result bodies) — not
+        # just "a tool was called" — so the task's own record shows what was
+        # really held, not merely what was available. Capped inside
+        # `append_context`; see tasks.py module docstring.
+        if kind in ("message", "tool_result") and text.strip():
+            tasks.append_context(env_dir, task_id, step_id=stage,
+                                 step_title=step_title or stage, text=text)
 
     t0 = time.time()
     try:

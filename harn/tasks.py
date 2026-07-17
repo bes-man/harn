@@ -1,10 +1,10 @@
-"""Task backlog — every task is a JSON file in ``harn_env/tasks/``.
+"""Task backlog — every task is a pair of files in ``harn_env/tasks/``.
 
 File-naming convention
 ----------------------
 * **With Jira** (or another tracker): use the tracker key as the filename,
-  e.g. ``AUTH-42.json``.  The key is stored as the task ``id``.
-* **Without a tracker**: ``PRJ-001.json``, ``PRJ-002.json`` …  The prefix
+  e.g. ``AUTH-42.md``. The key is stored as the task ``id``.
+* **Without a tracker**: ``PRJ-001.md``, ``PRJ-002.md`` …  The prefix
   (``[harn] project`` in ``harn.toml``, default ``PRJ``) is upper-cased; the
   counter increments automatically via ``next_id()``.
 
@@ -12,37 +12,32 @@ Lifecycle
 ---------
     todo → in_progress → review ⇄ changes_requested → done
 
-JSON schema (all fields)
-------------------------
-{
-  "id":          "PRJ-001",          # = filename stem; unique across the project
-  "title":       "Add JWT auth",
-  "status":      "todo",
-  "priority":    1,                  # lower = sooner
+File shape
+----------
+``<id>.md`` — the human-facing record (what a person, or a future GitHub-issue
+sync, would want to read): a YAML-ish frontmatter block (id/title/status/
+priority/workflow/prds/depends_on — the ONLY thing `board()` parses, so a huge
+accumulated Context section never slows it down), then fixed markdown
+sections in order: Description, Result, Decisions, Review log, Changelog,
+Context. ``## Context`` is always LAST and append-only for the task's
+lifetime — every streamed tool_result/message the agent's turn produced,
+appended via a true ``open(path, "a")`` (O(1), independent of file size) —
+capped per entry (~4000 chars) so a noisy tool can't flood it.
 
-  "prds":        ["auth"],           # parent PRD slugs (≥1; tasks can span PRDs)
-  "epic":        null,               # optional: Jira/tracker Epic key
-  "user_story":  null,               # optional: parent Story key
+``<id>.state.json`` — engine bookkeeping the human never needs to read:
+step_results (per-step usage tracking), stage_checkpoints/task_patch_refs
+(git rollback refs), claimed_by/claimed_at (parallel-worker claim lock),
+spec_locked, subtasks, epic, user_story, skills, scratchpad,
+workflow_confirmed, baseline_ref. Exactly the role ``<id>.workflow.json``
+(unchanged, stays separate — it's a structured node array edited by Studio's
+visual canvas, not prose) already plays today.
 
-  "skills":      ["security"],       # hint for the executor: which skills to load
-
-  "subtasks": [
-    {"id": "PRJ-001-1", "title": "POST /login endpoint", "status": "done"},
-    {"id": "PRJ-001-2", "title": "Add /refresh endpoint", "status": "todo"}
-  ],
-
-  "description": "## What\\n...\\n\\n## Done when\\n- criterion",
-
-  "review_log": [
-    {"ts": "2026-06-01T09:14Z", "agent": "claude", "event": "started"},
-    {"ts": "2026-06-01T09:31Z", "agent": "claude", "event": "submitted_for_review",
-     "summary": "implemented /login + middleware", "tokens": "4200 (~$0.04)"},
-    {"ts": "2026-06-01T10:02Z", "event": "changes_requested",
-     "by": "user", "comment": "make expiry 15m"},
-    {"ts": "2026-06-01T11:12Z", "event": "accepted",
-     "by": "user", "notes": "Access tokens 15m…"}
-  ]
-}
+Migration
+---------
+Old-format ``<id>.json`` files (the single-JSON-blob shape this module used
+before) are upgraded lazily the first time ``load_tasks()``/``find()`` sees
+them: split into the ``.md`` + ``.state.json`` pair, old file removed. No
+separate migration command.
 """
 from __future__ import annotations
 
@@ -68,10 +63,25 @@ _NEEDS_AGENT = {TODO, IN_PROGRESS, CHANGES_REQUESTED}
 _PICK_RANK   = {IN_PROGRESS: 0, CHANGES_REQUESTED: 1, TODO: 2}
 _DONE_ALIASES = {"done", "complete", "completed", "accepted"}
 
+# Cap per Context entry (matches the existing step_results.output truncation
+# convention — see loop.py's `(result.text or "")[-4000:]`). A capped entry
+# gets a visible marker rather than silently losing the tail of a noisy tool
+# (e.g. a full test-suite dump).
+CONTEXT_CAP = 4000
+
 
 def _normalize_status(raw: str) -> str:
     s = raw.strip().lower().replace("-", "_").replace(" ", "_")
     return DONE if s in _DONE_ALIASES else (s if s in LIFECYCLE else TODO)
+
+
+def cap_text(text: str, limit: int = CONTEXT_CAP) -> str:
+    """Truncate `text` to `limit` chars with a visible "(truncated)" marker —
+    silent truncation would hide the fact that data was dropped."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(truncated)"
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +148,7 @@ class ChangeEntry:
 @dataclass
 class Task:
     id:          str
-    path:        Path
+    path:        Path          # the <id>.md file
     title:       str
     status:      str
     priority:    int = 100
@@ -148,8 +158,15 @@ class Task:
     skills:      list[str] = field(default_factory=list)
     subtasks:    list[Subtask] = field(default_factory=list)
     description: str = ""
+    # Free-text outcome summary — rendered as the markdown "## Result" section;
+    # populated from `submit_for_review`/`mark_done`'s summary.
+    result:      str = ""
     # Lightweight continuity (variant 2): a short free-form note the agent
     # carries to its next iteration, plus the structured decisions it has made.
+    # Kept as a real field (persisted in the state.json sidecar — see module
+    # docstring) rather than removed: loop.py's prompt assembly, the
+    # `set_scratchpad` MCP tool and several existing tests depend on it as
+    # working continuity, independent of the new Context capture.
     scratchpad:  str = ""
     decisions:   list[Decision] = field(default_factory=list)
     # Release-notes-style log of significant changes (see ChangeEntry). Governed
@@ -159,6 +176,11 @@ class Task:
     # working tree to this point to redo the task from scratch.
     baseline_ref: str = ""
     review_log:  list[ReviewEntry] = field(default_factory=list)
+    # Raw text of the markdown "## Context" section (append-only capture of
+    # streamed tool_result/message content — see `append_context`). Populated
+    # only by a full load (`load_tasks`/`find`); empty for the lightweight
+    # frontmatter-only load `board()`/`by_status()` use.
+    context:     str = ""
     # Parallelism: ids this task waits on (only runnable once all are `done`),
     # and the worker that currently owns it (set on atomic claim).
     depends_on:  list[str] = field(default_factory=list)
@@ -207,7 +229,8 @@ class Task:
 
 
 # ---------------------------------------------------------------------------
-# serialisation
+# legacy (pre-refactor) single-JSON-blob parsing — used only by the migration
+# path (`_load_or_migrate`) to read an old <id>.json file once.
 # ---------------------------------------------------------------------------
 def _from_dict(path: Path, d: dict) -> Task:
     subtasks = [
@@ -263,6 +286,7 @@ def _from_dict(path: Path, d: dict) -> Task:
         skills=list(d.get("skills") or []),
         subtasks=subtasks,
         description=d.get("description") or "",
+        result=d.get("result") or "",
         scratchpad=d.get("scratchpad") or "",
         decisions=decisions,
         changelog=changelog,
@@ -280,7 +304,13 @@ def _from_dict(path: Path, d: dict) -> Task:
     )
 
 
-def _to_dict(task: Task) -> dict:
+def to_dict(task: Task) -> dict:
+    """The full task as a JSON-safe dict (status, workflow, scratchpad, decisions,
+    review_log, …) — how the studio UI's board renders task detail without
+    re-deriving the shape here. (Deliberately omits the raw `context` blob —
+    it can grow unboundedly, and dumping it into every board-payload response
+    would reintroduce the exact cost problem this module's file split fixes;
+    a scoped Context viewer is a follow-up once Studio's UI wants it.)"""
     return {
         "id":          task.id,
         "title":       task.title,
@@ -293,6 +323,7 @@ def _to_dict(task: Task) -> dict:
         "subtasks":    [{"id": s.id, "title": s.title, "status": s.status}
                         for s in task.subtasks],
         "description": task.description,
+        "result":      task.result,
         "scratchpad":  task.scratchpad,
         "decisions":   [x.to_dict() for x in task.decisions],
         "changelog":   [c.to_dict() for c in task.changelog],
@@ -310,18 +341,246 @@ def _to_dict(task: Task) -> dict:
     }
 
 
-def to_dict(task: Task) -> dict:
-    """The full task as a JSON-safe dict (status, workflow, scratchpad, decisions,
-    review_log, …) — how the studio UI's board renders task detail without
-    re-deriving the shape `_to_dict` already owns."""
-    return _to_dict(task)
+# ---------------------------------------------------------------------------
+# markdown + sidecar serialisation
+# ---------------------------------------------------------------------------
+_CONTEXT_MARKER = "## Context"
+_CONTEXT_MARKER_LINE = f"\n{_CONTEXT_MARKER}\n"
+_FRONTMATTER_FIELDS = ("id", "title", "status", "priority", "workflow",
+                       "prds", "depends_on")
 
 
-def _save(task: Task) -> None:
-    task.path.write_text(
-        json.dumps(_to_dict(task), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+def _state_path(md_path: Path) -> Path:
+    return md_path.parent / f"{md_path.stem}.state.json"
+
+
+def _state_dict(task: Task) -> dict:
+    return {
+        "epic":        task.epic,
+        "user_story":  task.user_story,
+        "skills":      task.skills,
+        "subtasks":    [{"id": s.id, "title": s.title, "status": s.status}
+                        for s in task.subtasks],
+        "scratchpad":  task.scratchpad,
+        "claimed_by":  task.claimed_by,
+        "claimed_at":  task.claimed_at,
+        "spec_locked": task.spec_locked,
+        "workflow_confirmed": task.workflow_confirmed,
+        "baseline_ref": task.baseline_ref,
+        "stage_checkpoints": task.stage_checkpoints,
+        "task_patch_refs": task.task_patch_refs,
+        "step_results": task.step_results,
+    }
+
+
+def _render_frontmatter(task: Task) -> str:
+    values = {
+        "id": task.id, "title": task.title, "status": task.status,
+        "priority": task.priority, "workflow": task.workflow,
+        "prds": task.prds, "depends_on": task.depends_on,
+    }
+    lines = ["---"]
+    for k in _FRONTMATTER_FIELDS:
+        lines.append(f"{k}: {json.dumps(values[k], ensure_ascii=False)}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def _parse_frontmatter_line(line: str) -> tuple[str, object] | None:
+    if ":" not in line:
+        return None
+    k, _, v = line.partition(":")
+    k = k.strip()
+    v = v.strip()
+    if not k:
+        return None
+    try:
+        return k, json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return k, v
+
+
+def _read_frontmatter(path: Path) -> dict:
+    """Bounded read: only the lines between the two `---` markers. Never
+    touches the rest of the file — the point is that a huge accumulated
+    `## Context` section costs nothing here (see module docstring)."""
+    fm: dict = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            first = f.readline()
+            if first.strip() != "---":
+                return fm
+            for line in f:
+                if line.strip() == "---":
+                    break
+                parsed = _parse_frontmatter_line(line)
+                if parsed:
+                    fm[parsed[0]] = parsed[1]
+    except OSError:
+        pass
+    return fm
+
+
+def _split_frontmatter(text: str) -> tuple[dict, str]:
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    fm: dict = {}
+    i = 1
+    while i < len(lines) and lines[i].strip() != "---":
+        parsed = _parse_frontmatter_line(lines[i])
+        if parsed:
+            fm[parsed[0]] = parsed[1]
+        i += 1
+    body = "\n".join(lines[i + 1:]) if i < len(lines) else ""
+    return fm, body.lstrip("\n")
+
+
+_KNOWN_SECTIONS = ("Description", "Result", "Decisions", "Review log", "Changelog")
+_SECTION_HEADER_SET = {f"## {h}" for h in _KNOWN_SECTIONS}
+
+
+def _split_body(body: str) -> tuple[dict[str, str], str]:
+    """Split into named sections + the raw Context blob.
+
+    Sections are matched on an EXACT heading line (e.g. "## Description"), not
+    a generic "any '## ...' line" regex — the Description/Result content
+    itself routinely contains its own "## What" / "## Done when" sub-headings
+    (see `_DESCRIPTION_TEMPLATE`, `lock_spec`), which would otherwise be
+    mistaken for new top-level sections and corrupt the round-trip.
+
+    Once the (always-last) "## Context" heading is seen, EVERYTHING after it
+    is the raw context blob, unconditionally — no further header matching —
+    so a captured tool_result that happens to contain a line looking like a
+    section heading can never re-split the file.
+    """
+    lines = body.split("\n")
+    context_idx = next((i for i, ln in enumerate(lines) if ln == _CONTEXT_MARKER), None)
+    if context_idx is None:
+        head_lines, context_lines = lines, []
+    else:
+        head_lines, context_lines = lines[:context_idx], lines[context_idx + 1:]
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in head_lines:
+        if line in _SECTION_HEADER_SET:
+            current = line[3:]
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(line)
+    out = {k: "\n".join(v).strip("\n") for k, v in sections.items()}
+    context_body = "\n".join(context_lines)
+    if context_body.startswith("\n"):
+        context_body = context_body[1:]
+    return out, context_body
+
+
+def _bullets(text: str) -> list[str]:
+    return [ln[2:].strip() if ln.startswith("- ") else ln.strip()
+            for ln in text.splitlines() if ln.strip()]
+
+
+def _render_bullets(entries: list) -> str:
+    return "\n".join(f"- {json.dumps(e.to_dict(), ensure_ascii=False)}"
+                     for e in entries)
+
+
+def _render_header(task: Task) -> str:
+    """Everything except the (preserved-verbatim) Context body: frontmatter +
+    Description + Result + Decisions + Review log + Changelog + the bare
+    `## Context` heading."""
+    parts = [_render_frontmatter(task), "", "## Description",
+             task.description.strip(), "", "## Result", task.result.strip(),
+             "", "## Decisions", _render_bullets(task.decisions),
+             "", "## Review log", _render_bullets(task.review_log),
+             "", "## Changelog", _render_bullets(task.changelog),
+             "", _CONTEXT_MARKER]
+    return "\n".join(parts) + "\n"
+
+
+def _existing_context_body(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    idx = text.find(_CONTEXT_MARKER_LINE)
+    if idx == -1:
+        return ""
+    return text[idx + len(_CONTEXT_MARKER_LINE):]
+
+
+def _build_task(path: Path, fm: dict, sections: dict, context_body: str,
+                state: dict) -> Task:
+    decisions = [Decision(**json.loads(ln)) for ln in _bullets(sections.get("Decisions", ""))]
+    review_log = [ReviewEntry(**json.loads(ln)) for ln in _bullets(sections.get("Review log", ""))]
+    changelog = [ChangeEntry(**json.loads(ln)) for ln in _bullets(sections.get("Changelog", ""))]
+    subtasks = [
+        Subtask(id=s.get("id", ""), title=s.get("title", ""),
+                status=_normalize_status(s.get("status", TODO)))
+        for s in (state.get("subtasks") or [])
+    ]
+    return Task(
+        id=fm.get("id") or path.stem,
+        path=path,
+        title=fm.get("title") or path.stem,
+        status=_normalize_status(fm.get("status", TODO)),
+        priority=int(fm.get("priority") or 100),
+        prds=list(fm.get("prds") or []),
+        depends_on=list(fm.get("depends_on") or []),
+        workflow=fm.get("workflow") or None,
+        description=sections.get("Description", "").strip(),
+        result=sections.get("Result", "").strip(),
+        decisions=decisions,
+        review_log=review_log,
+        changelog=changelog,
+        context=context_body,
+        epic=state.get("epic"),
+        user_story=state.get("user_story"),
+        skills=list(state.get("skills") or []),
+        subtasks=subtasks,
+        scratchpad=state.get("scratchpad") or "",
+        claimed_by=state.get("claimed_by"),
+        claimed_at=state.get("claimed_at") or "",
+        spec_locked=bool(state.get("spec_locked", False)),
+        workflow_confirmed=bool(state.get("workflow_confirmed", False)),
+        baseline_ref=state.get("baseline_ref") or "",
+        stage_checkpoints=dict(state.get("stage_checkpoints") or {}),
+        task_patch_refs=list(state.get("task_patch_refs") or []),
+        step_results=dict(state.get("step_results") or {}),
     )
+
+
+def _read_state(md_path: Path) -> dict:
+    try:
+        return json.loads(_state_path(md_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_full(path: Path) -> Task:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    fm, body = _split_frontmatter(text)
+    sections, context_body = _split_body(body)
+    return _build_task(path, fm, sections, context_body, _read_state(path))
+
+
+def _load_light(path: Path) -> Task:
+    """Frontmatter + the (small, bounded) state.json sidecar only — no body
+    sections, no Context. Used by `board()`/`by_status()` so an
+    ever-growing Context section never shows up in, or slows down, the
+    glanceable board view."""
+    return _build_task(path, _read_frontmatter(path), {}, "", _read_state(path))
+
+
+# Backward-compat alias: a couple of call sites (and tests/conftest.make_task)
+# load a single task file directly by path.
+_load = _load_full
 
 
 import contextlib
@@ -353,12 +612,63 @@ def _claim_lock(env_dir: Path):
         fh.close()
 
 
-def _load(path: Path) -> Task:
+def _save(task: Task) -> None:
+    task.path.parent.mkdir(parents=True, exist_ok=True)
+    existing_context = _existing_context_body(task.path)
+    task.path.write_text(_render_header(task) + existing_context, encoding="utf-8")
+    _state_path(task.path).write_text(
+        json.dumps(_state_dict(task), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def append_context(env_dir: Path, task_id: str, *, step_id: str,
+                   step_title: str = "", text: str) -> None:
+    """Append one captured entry to `<task_id>.md`'s `## Context` section.
+
+    A true `open(path, "a")` — O(1) regardless of how large the file has
+    grown — because this is called far more often (every streamed
+    tool_result/message within a turn) than the header-rewriting mutators
+    above (a few times per step). Capped at `CONTEXT_CAP` chars with a visible
+    "(truncated)" marker so a noisy tool can't flood the file silently.
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+    path = env_dir / "tasks" / f"{task_id}.md"
+    if not path.exists():
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    heading = f"### {step_id} — {step_title} ({ts})" if step_title else f"### {step_id} ({ts})"
+    entry = f"\n{heading}\n{cap_text(text)}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+
+def _load_or_migrate(json_path: Path) -> None:
+    """Old single-JSON-blob task file → the new `.md` + `.state.json` pair,
+    old file removed. See module docstring."""
     try:
-        d = json.loads(path.read_text(encoding="utf-8"))
+        d = json.loads(json_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         d = {}
-    return _from_dict(path, d)
+    task = _from_dict(json_path, d)
+    task.path = json_path.parent / f"{json_path.stem}.md"
+    _save(task)
+    try:
+        json_path.unlink()
+    except OSError:
+        pass
+
+
+def _migrate_legacy(env_dir: Path) -> None:
+    tasks_dir = env_dir / "tasks"
+    if not tasks_dir.exists():
+        return
+    for p in sorted(tasks_dir.glob("*.json")):
+        if p.name.endswith(".workflow.json") or p.name.endswith(".state.json"):
+            continue
+        _load_or_migrate(p)
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +678,16 @@ def load_tasks(env_dir: Path) -> list[Task]:
     tasks_dir = env_dir / "tasks"
     if not tasks_dir.exists():
         return []
-    return [_load(p) for p in sorted(tasks_dir.glob("*.json"))
-            if not p.name.endswith(".workflow.json")]
+    _migrate_legacy(env_dir)
+    return [_load_full(p) for p in sorted(tasks_dir.glob("*.md"))]
+
+
+def _load_tasks_light(env_dir: Path) -> list[Task]:
+    tasks_dir = env_dir / "tasks"
+    if not tasks_dir.exists():
+        return []
+    _migrate_legacy(env_dir)
+    return [_load_light(p) for p in sorted(tasks_dir.glob("*.md"))]
 
 
 def find(env_dir: Path, task_id: str) -> Task | None:
@@ -484,7 +802,7 @@ def tasks_in_review(env_dir: Path) -> list[Task]:
 
 def by_status(env_dir: Path) -> dict[str, list[Task]]:
     out: dict[str, list[Task]] = {s: [] for s in LIFECYCLE}
-    for t in sorted(load_tasks(env_dir), key=lambda t: (t.priority, t.id)):
+    for t in sorted(_load_tasks_light(env_dir), key=lambda t: (t.priority, t.id)):
         out.setdefault(t.status, []).append(t)
     return out
 
@@ -532,11 +850,11 @@ def create_task(
     depends_on: list[str] | None = None,
     workflow: str | None = None,
 ) -> Task:
-    """Create a new task JSON file and return the Task object."""
+    """Create a new task (`<id>.md` + `<id>.state.json`) and return the Task."""
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "tasks").mkdir(exist_ok=True)
     tid = task_id or next_id(env_dir, id_prefix)
-    path = env_dir / "tasks" / f"{tid}.json"
+    path = env_dir / "tasks" / f"{tid}.md"
     task = Task(
         id=tid,
         path=path,
@@ -570,6 +888,8 @@ def set_status(task: Task, status: str) -> None:
 
 
 def submit_for_review(task: Task, agent: str, summary: str = "", tokens: str = "") -> None:
+    if summary:
+        task.result = summary
     task.review_log.append(ReviewEntry(
         ts=_now_iso(), event="submitted_for_review", agent=agent,
         summary=summary or None, tokens=tokens or None,
@@ -594,6 +914,7 @@ def accept(task: Task, notes: str = "", by: str = "user") -> None:
 
 def mark_done(task: Task, summary: str = "") -> None:
     if summary:
+        task.result = summary
         task.review_log.append(ReviewEntry(
             ts=_now_iso(), event="done", summary=summary,
         ))
@@ -642,7 +963,7 @@ def set_scratchpad(task: Task, notes: str) -> None:
     text = notes.strip()
     env_dir = task.path.parent.parent
     with _claim_lock(env_dir):
-        fresh = _load(task.path)
+        fresh = _load_full(task.path)
         fresh.scratchpad = text
         _save(fresh)
         task.scratchpad = text
@@ -667,7 +988,7 @@ def record_decision(task: Task, decision: str, rationale: str = "",
     )
     env_dir = task.path.parent.parent
     with _claim_lock(env_dir):
-        fresh = _load(task.path)
+        fresh = _load_full(task.path)
         fresh.decisions.append(entry)
         _save(fresh)
         task.decisions = fresh.decisions
@@ -692,7 +1013,7 @@ def record_change(task: Task, summary: str, detail: str = "",
     )
     env_dir = task.path.parent.parent
     with _claim_lock(env_dir):
-        fresh = _load(task.path)
+        fresh = _load_full(task.path)
         fresh.changelog.append(entry)
         _save(fresh)
         task.changelog = fresh.changelog
@@ -725,17 +1046,22 @@ _STATUS_LABEL = {
 
 
 def board(env_dir: Path) -> str:
-    """Glanceable view of every task on the track."""
+    """Glanceable view of every task on the track.
+
+    Reads only each task's frontmatter + its small state.json sidecar (see
+    `_load_tasks_light`) — an accumulated `## Context` section of any size
+    never appears in, or slows down, this view.
+    """
     groups = by_status(env_dir)
     if not any(groups.values()):
         return "(no tasks)"
     lines: list[str] = []
+    by_id = {x.id: x for x in _load_tasks_light(env_dir)}
     for status in LIFECYCLE:
         items = groups.get(status) or []
         if not items:
             continue
         lines.append(_STATUS_LABEL[status])
-        by_id = {x.id: x for x in load_tasks(env_dir)}
         for t in items:
             prds = f" · {', '.join(t.prds)}" if t.prds else ""
             subs = f" [{sum(1 for s in t.subtasks if s.status == DONE)}/{len(t.subtasks)} subtasks]" if t.subtasks else ""
