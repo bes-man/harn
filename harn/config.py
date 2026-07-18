@@ -108,6 +108,7 @@ DEFAULTS: dict = {
     # (todo/in_progress/review/changes_requested/done), unchanged. See
     # `_parse_board_statuses` for the two accepted TOML shapes.
     "board": {},
+    "git": {"pr_base": "", "branch_prefix": "harn/", "push_remote": "origin"},
 }
 
 
@@ -224,6 +225,9 @@ class Config:
     # Launch as an explicit action in the task modal? Default false — a
     # drag should not have a launch side effect unless a project opts in.
     launch_on_drag_in_progress: bool = False
+    git_pr_base: str = ""
+    git_branch_prefix: str = "harn/"
+    git_push_remote: str = "origin"
     raw: dict = field(default_factory=dict)
 
     @property
@@ -294,5 +298,8 @@ class Config:
             mcp_ui_supervise=bool(data["mcp"].get("ui_supervise", True)),
             mcp_ui_port=_nonneg_int(data["mcp"].get("ui_port", 8765)),
             mcp_tool_reload_seconds=_nonneg_int(data["mcp"].get("tool_reload_seconds", 2)),
+            git_pr_base=str((data.get("git", {}) or {}).get("pr_base", "") or "").strip(),
+            git_branch_prefix=str((data.get("git", {}) or {}).get("branch_prefix", "harn/") or "harn/").strip(),
+            git_push_remote=str((data.get("git", {}) or {}).get("push_remote", "origin") or "origin").strip(),
             raw=data,
         )
