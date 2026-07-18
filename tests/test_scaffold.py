@@ -34,6 +34,23 @@ def test_setup_cursor_agent_writes_cursor_config(tmp_path: Path):
     assert not (tmp_path / ".mcp.json").exists()   # claude not in chain
 
 
+def test_setup_codex_agent_writes_project_mcp_config_without_clobbering_user_config(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    env.mkdir()
+    (env / "harn.toml").write_text('[harn]\nagent = "codex"\n')
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text('model = "user-choice"\n')
+
+    scaffold.setup(tmp_path)
+
+    text = config.read_text()
+    assert 'model = "user-choice"' in text
+    assert "[mcp_servers.harn]" in text
+    assert 'HARN_ENV_DIR = "harn_env"' in text
+    assert ".codex/config.toml" in (tmp_path / ".gitignore").read_text()
+
+
 def test_teardown_removes_root_connectors(tmp_path: Path):
     scaffold.setup(tmp_path)
     assert (tmp_path / ".mcp.json").exists()

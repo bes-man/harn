@@ -1,6 +1,8 @@
 from pathlib import Path
+import stat
 from harn import studio
 from harn.config import Config
+from harn.telegram import TelegramHIL
 
 def _env(tmp_path):
     env = tmp_path / "harn_env"; env.mkdir(); return env
@@ -22,6 +24,74 @@ def test_roundtrip_writes_and_reads(tmp_path):
     assert cfg.mcp_tool_reload_seconds == 3
     got = studio.settings_payload(env)
     assert got["max_cost_usd"] == 5.5 and got["mcp_ui_port"] == 8770
+
+def test_pipeline_stage_toggles_roundtrip(tmp_path):
+    # oracle/auto_reconcile/design run OUTSIDE the workflow's steps (via harn
+    # watch), so a minimal 1-step workflow still triggers them unless the user
+    # turns them off. They must be settable from the studio like any other knob.
+    env = _env(tmp_path)
+    r = studio.save_loop_mcp_settings(env, {
+        "oracle": False, "auto_reconcile": False, "design": True})
+    assert r["ok"] is True
+    cfg = Config.load(env)
+    assert cfg.oracle is False
+    assert cfg.auto_reconcile is False
+    assert cfg.design is True
+    got = studio.settings_payload(env)
+    assert got["oracle"] is False and got["auto_reconcile"] is False
+    assert got["design"] is True
+    # a string "false" (e.g. a curl payload) must also read as False, not True
+    r2 = studio.save_loop_mcp_settings(env, {"oracle": "false"})
+    assert Config.load(env).oracle is False
+
+
+def test_autonomy_and_hil_settings_roundtrip(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    monkeypatch.delenv("HARN_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HARN_TELEGRAM_CHAT_ID", raising=False)
+
+    result = studio.save_loop_mcp_settings(env, {
+        "autonomy_percent": 100,
+        "chat_grace_minutes": 2,
+        "telegram_api_key": "123:secret",
+        "telegram_user_id": "987654321",
+    })
+
+    assert result["ok"] is True
+    cfg = Config.load(env)
+    assert cfg.autonomy == 1.0
+    assert cfg.chat_grace_minutes == 2
+    hil = TelegramHIL.from_env(env)
+    assert hil is not None
+    assert hil.token == "123:secret"
+    assert hil.chat_id == "987654321"
+    credentials = env / "state" / "telegram_credentials.json"
+    assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
+    assert "harn_env/state/telegram_credentials.json" in (tmp_path / ".gitignore").read_text()
+
+    payload = studio.settings_payload(env)
+    assert payload["autonomy_percent"] == 100
+    assert payload["chat_grace_minutes"] == 2
+    assert payload["telegram_configured"] is True
+    assert payload["telegram_user_id"] == "987654321"
+    assert "telegram_api_key" not in payload
+
+
+def test_blank_telegram_api_key_keeps_existing_secret(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    monkeypatch.delenv("HARN_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HARN_TELEGRAM_CHAT_ID", raising=False)
+    studio.save_loop_mcp_settings(env, {
+        "telegram_api_key": "123:secret", "telegram_user_id": "42"})
+
+    studio.save_loop_mcp_settings(env, {
+        "telegram_api_key": "", "telegram_user_id": "43"})
+
+    hil = TelegramHIL.from_env(env)
+    assert hil is not None
+    assert hil.token == "123:secret"
+    assert hil.chat_id == "43"
+
 
 def test_blank_disables_and_negatives_rejected(tmp_path):
     env = _env(tmp_path)
