@@ -2569,7 +2569,8 @@ function renderTaskDetail(){
         <button class="icon-btn" onclick="closeTaskModal()" title="Close">✕</button>
       </div>
     </div>
-    <div class="taskTitle">${esc(t.title)}</div>
+    <input type="text" id="taskTitleInput" class="taskTitle" value="${esc(t.title)}"
+      onblur="saveTaskField('${esc(t.id)}','title',this.value)"/>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
     <div class="row" style="margin-top:8px">
@@ -2583,7 +2584,14 @@ function renderTaskDetail(){
            <button onclick="launchTask('${esc(t.id)}',true)" ${busy?'disabled':''} title="Autonomous: no human-in-the-loop, harn_env .md files untouched">▶ Launch (auto)</button>`}
     </div>
     <label style="margin-top:14px">Description</label>
-    <div class="toolDoc">${esc(t.description||'(none)')}</div>
+    <textarea id="taskDescInput" rows="4" class="toolDoc"
+      onblur="saveTaskField('${esc(t.id)}','description',this.value)">${esc(t.description||'')}</textarea>
+    <label>Priority</label>
+    <input type="number" id="taskPriorityInput" value="${t.priority}"
+      onblur="saveTaskField('${esc(t.id)}','priority',this.value)"/>
+    <label>Labels <span class="mut">(comma-separated)</span></label>
+    <input type="text" id="taskLabelsInput" value="${esc((t.labels||[]).join(', '))}"
+      onblur="saveTaskLabels('${esc(t.id)}',this.value)"/>
     <label style="display:flex;justify-content:space-between;align-items:center">
       <span>Attachments <span class="mut">(design references, screenshots — visible to the agent too)</span></span>
       <button class="ghost" onclick="pickAttachment('${esc(t.id)}')" style="padding:3px 9px;font-size:11px">＋ Upload</button>
@@ -2613,6 +2621,18 @@ function renderTaskDetail(){
 async function assignWorkflow(taskId,name){
   await fetch(api('/api/tasks/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({task_id:taskId,workflow:name==='default'?'':name})});
+  await pollBoard();
+}
+async function saveTaskField(taskId,field,value){
+  const body={task_id:taskId}; body[field]=value;
+  const r=await post_('/api/tasks/update',body);
+  if(!r.ok){ alert(r.error||'update failed'); }
+  await pollBoard();
+}
+async function saveTaskLabels(taskId,csv){
+  const labels=csv.split(',').map(s=>s.trim()).filter(Boolean);
+  const r=await post_('/api/tasks/update',{task_id:taskId,labels});
+  if(!r.ok){ alert(r.error||'update failed'); }
   await pollBoard();
 }
 async function changeTaskStatus(taskId,status){
