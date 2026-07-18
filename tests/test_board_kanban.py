@@ -154,3 +154,26 @@ def test_update_task_payload_combines_workflow_with_other_fields(tmp_path):
     reloaded = tasks.find(env, t.id)
     assert reloaded.title == "New Title"
     assert reloaded.workflow == "qa"
+
+
+def test_add_comment_payload_posts_a_comment(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    r = studio.add_comment_payload(env, {"task_id": t.id, "text": "looks good"})
+    assert r["ok"] is True
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.comments[0].text == "looks good"
+    assert reloaded.comments[0].kind == "human"
+
+
+def test_add_comment_payload_rejects_empty_text(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    r = studio.add_comment_payload(env, {"task_id": t.id, "text": "  "})
+    assert r["ok"] is False
+
+
+def test_add_comment_payload_unknown_task(tmp_path):
+    env = _env(tmp_path)
+    r = studio.add_comment_payload(env, {"task_id": "NOPE", "text": "hi"})
+    assert r["ok"] is False

@@ -845,6 +845,18 @@ def update_task_payload(env_dir: Path, payload: dict) -> dict:
     return {"ok": True, "task_id": task_id}
 
 
+def add_comment_payload(env_dir: Path, payload: dict) -> dict:
+    task_id = (payload.get("task_id") or "").strip()
+    text = (payload.get("text") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if not text:
+        return {"ok": False, "error": "comment text cannot be empty"}
+    tasks_mod.add_comment(env_dir, task, text, author="user", kind="human")
+    return {"ok": True, "task_id": task_id}
+
+
 def create_task_payload(env_dir: Path, payload: dict) -> dict:
     """Create a new `todo` task from the board's "New task" form."""
     title = (payload.get("title") or "").strip()
@@ -1357,6 +1369,10 @@ def _make_handler(default_env: Path):
                 self._json(set_task_status_payload(env, body))
             elif route == "/api/tasks/workflow":
                 self._json(set_task_workflow(env, body))
+            elif route == "/api/tasks/update":
+                self._json(update_task_payload(env, body))
+            elif route == "/api/tasks/comment":
+                self._json(add_comment_payload(env, body))
             elif route == "/api/tasks/launch":
                 self._json(launch_task(env, body))
             elif route == "/api/agents/run":
