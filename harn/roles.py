@@ -123,3 +123,45 @@ def find(env_dir: Path, name: str) -> Role | None:
         if r.name == name or r.command == name:
             return r
     return None
+
+
+def _safe_name(name: str) -> str:
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9._-]", "-", name.strip()) or "agent"
+
+
+_ROLE_FM_FIELDS = ("name", "command", "status", "trigger", "next_status",
+                   "workflow", "oracle", "secrets", "isolation", "agent", "model")
+
+
+def _render_role(data: dict) -> str:
+    def fmt(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, list):
+            return "[" + ", ".join(str(x) for x in v) + "]"
+        return str(v)
+    lines = ["---"]
+    for k in _ROLE_FM_FIELDS:
+        if k in data and data[k] not in (None, ""):
+            lines.append(f"{k}: {fmt(data[k])}")
+    lines.append("---")
+    body = (data.get("body") or "").strip()
+    return "\n".join(lines) + "\n\n" + body + "\n"
+
+
+def save(env_dir: Path, data: dict) -> Path:
+    name = _safe_name(str(data.get("name") or ""))
+    d = env_dir / "agents"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{name}.md"
+    path.write_text(_render_role({**data, "name": name}), encoding="utf-8")
+    return path
+
+
+def delete(env_dir: Path, name: str) -> bool:
+    path = env_dir / "agents" / f"{_safe_name(name)}.md"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
