@@ -3968,7 +3968,7 @@ function showTab(t){
   if(t==='flow')renderFlow();
   else if(t==='skills')renderSkills();
   else if(t==='tools')renderTools();
-  else if(t==='agents')renderAgents();
+  else if(t==='agents')loadAndRenderAgents();
   else if(t==='settings')renderSettings();
   else{ pollBoard(); }
 }
@@ -4387,8 +4387,8 @@ async function loadAgentsData(){
     AGENT_SKILLS=r.skills||[]; AGENT_TOOLS=r.tools||[];
   }catch(e){}
 }
-async function renderAgents(){
-  await loadAgentsData();
+async function loadAndRenderAgents(){ await loadAgentsData(); renderAgents(); }
+function renderAgents(){
   const v=$('#listView');
   const rows=AGENTS.map((a,i)=>`<div class="skillrow${agentSel===i?' sel':''}" onclick="selectAgent(${i})">`+
     `<div style="width:100%"><div class="nm">${esc(a.name)}</div>`+
@@ -4521,7 +4521,7 @@ async function saveAgent(i){
     AGENT_DRAFT=null;
   }
   if(st) st.textContent='saved ✓';
-  await renderAgents();
+  await loadAndRenderAgents();
 }
 async function saveAgentWorkflow(name, workflow){
   const st=$('#agentSt');
@@ -4556,8 +4556,8 @@ async function saveAgentWorkflow(name, workflow){
 async function deleteAgent(i){
   const a=AGENTS[i]; if(!a || !confirm('Delete agent "'+a.name+'"?')) return;
   await post_('/api/agents/delete',{name:a.name});
-  AGENTS.splice(i,1); agentSel=-1; AGENT_DRAFT=null;
-  renderAgents();
+  agentSel=-1; AGENT_DRAFT=null;
+  await loadAndRenderAgents();
 }
 
 /* ---------- resizable inspector ---------- */
