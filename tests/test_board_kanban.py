@@ -101,3 +101,45 @@ def test_launch_on_drag_in_progress_true_from_toml(tmp_path):
         "[board]\nlaunch_on_drag_in_progress = true\n", encoding="utf-8")
     cfg = config_mod.Config.load(env)
     assert cfg.launch_on_drag_in_progress is True
+
+
+def test_update_task_payload_changes_only_submitted_fields(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Original title", description="orig desc", priority=10)
+    r = studio.update_task_payload(env, {"task_id": t.id, "title": "New title"})
+    assert r["ok"] is True
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.title == "New title"
+    assert reloaded.description == "orig desc"   # untouched
+    assert reloaded.priority == 10                # untouched
+
+
+def test_update_task_payload_sets_labels(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    r = studio.update_task_payload(env, {"task_id": t.id, "labels": ["bug", "urgent"]})
+    assert r["ok"] is True
+    assert tasks.find(env, t.id).labels == ["bug", "urgent"]
+
+
+def test_update_task_payload_rejects_status_field(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    r = studio.update_task_payload(env, {"task_id": t.id, "status": "review"})
+    assert r["ok"] is False
+    assert "status" in r["error"].lower()
+    assert tasks.find(env, t.id).status == tasks.TODO
+
+
+def test_update_task_payload_unknown_task(tmp_path):
+    env = _env(tmp_path)
+    r = studio.update_task_payload(env, {"task_id": "NOPE", "title": "x"})
+    assert r["ok"] is False
+
+
+def test_update_task_payload_priority_coerced_to_int(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    r = studio.update_task_payload(env, {"task_id": t.id, "priority": "5"})
+    assert r["ok"] is True
+    assert tasks.find(env, t.id).priority == 5

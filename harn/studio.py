@@ -808,6 +808,41 @@ def set_task_workflow(env_dir: Path, payload: dict) -> dict:
     return {"ok": True, "task_id": t.id, "workflow": t.workflow}
 
 
+def update_task_payload(env_dir: Path, payload: dict) -> dict:
+    """Partial task update — title/description/priority/workflow/labels.
+    Deliberately does NOT accept `status`: status changes (including drag)
+    stay on set_task_status_payload/`/api/tasks/status` so exactly one code
+    path ever mutates it."""
+    task_id = (payload.get("task_id") or "").strip()
+    task = tasks_mod.find(env_dir, task_id)
+    if task is None:
+        return {"ok": False, "error": f"no task {task_id}"}
+    if "status" in payload:
+        return {"ok": False, "error": "status is not editable here — use /api/tasks/status"}
+    if "title" in payload:
+        title = (payload.get("title") or "").strip()
+        if not title:
+            return {"ok": False, "error": "title cannot be empty"}
+        task.title = title
+    if "description" in payload:
+        task.description = payload.get("description") or ""
+    if "priority" in payload:
+        try:
+            task.priority = int(payload.get("priority"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "priority must be a number"}
+    if "labels" in payload:
+        raw = payload.get("labels") or []
+        task.labels = [str(x).strip() for x in raw if str(x).strip()]
+    if "workflow" in payload:
+        wf_result = set_task_workflow(env_dir, {"task_id": task_id, "workflow": payload.get("workflow") or ""})
+        if not wf_result.get("ok"):
+            return wf_result
+        task = tasks_mod.find(env_dir, task_id)   # set_task_workflow already saved
+    tasks_mod._save(task)
+    return {"ok": True, "task_id": task_id}
+
+
 def create_task_payload(env_dir: Path, payload: dict) -> dict:
     """Create a new `todo` task from the board's "New task" form."""
     title = (payload.get("title") or "").strip()
