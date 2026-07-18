@@ -4524,21 +4524,32 @@ async function saveAgent(i){
   await renderAgents();
 }
 async function saveAgentWorkflow(name, workflow){
+  const st=$('#agentSt');
   const exists=(S.workflows||[]).some(w=>w.name===name);
   if(!exists){
-    await fetch(api('/api/workflows/create'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name, title:name, description:'Generated for agent '+name, version:'1'})});
+    const rc=await post_('/api/workflows/create',
+      {name, title:name, description:'Generated for agent '+name, version:'1'});
+    // Abort on failure (e.g. name slugifies to a reserved preset like "default")
+    // — proceeding would activate() an unknown name, which silently falls back
+    // to whatever preset IS active, and the unconditional save below would then
+    // overwrite that preset's real step definitions.
+    if(!rc.ok){ if(st) st.textContent=rc.error||'workflow create failed'; return; }
   }
   const wasActive=S.active||'default';
-  if(wasActive!==name){
-    await fetch(api('/api/workflows/activate'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})});
-  }
-  await fetch(api('/api/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({preamble:'', nodes:workflow.nodes||[]})});
-  if(wasActive!==name){
-    await fetch(api('/api/workflows/activate'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:wasActive})});
+  try{
+    if(wasActive!==name){
+      const ra=await post_('/api/workflows/activate',{name});
+      if(!ra.ok){ if(st) st.textContent=ra.error||'workflow activate failed'; return; }
+    }
+    const rs=await post_('/api/workflow',{preamble:'', nodes:workflow.nodes||[]});
+    if(!rs.ok){ if(st) st.textContent=rs.error||'workflow save failed'; return; }
+  } finally {
+    // Always restore whichever preset was active before this call, even if a
+    // fetch above threw — never leave the backend silently switched over to
+    // the agent's workflow.
+    if(wasActive!==name){
+      await post_('/api/workflows/activate',{name:wasActive});
+    }
   }
   await load();   // refresh S.workflows/S.active/S.workflow after the round trip
 }

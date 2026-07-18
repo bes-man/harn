@@ -222,3 +222,20 @@ def test_studio_html_has_agents_tab():
     assert "showTab('agents')" in studio._HTML
     assert "/api/agents/generate" in studio._HTML
     assert "/api/agents/save" in studio._HTML
+
+
+def test_save_agent_workflow_guards_each_step_and_restores_active():
+    # Regression: saveAgentWorkflow() used to fire its create/activate/save
+    # round-trip with no failure checks, so a rejected create (e.g. name
+    # slugifies to "default") silently fell through to activate()'s
+    # fallback-to-default behavior and overwrote the real active preset.
+    # It also had no try/finally, so a mid-call network error left the
+    # backend switched to the agent's workflow. Assert the guards exist
+    # without pinning exact wording.
+    from harn import studio
+    src = studio._HTML
+    start = src.index("async function saveAgentWorkflow(")
+    end = src.index("\nasync function deleteAgent(", start)
+    fn = src[start:end]
+    assert "rc.ok" in fn  # create failure aborts before activate/save
+    assert "try{" in fn and "finally {" in fn  # wasActive always restored
