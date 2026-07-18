@@ -184,3 +184,9 @@ def test_studio_html_renders_kanban_columns_unconditionally():
     assert "data-status=" in studio._HTML
     # The old early-return-on-empty-column guard must be gone.
     assert "if(!list.length) return;" not in studio._HTML
+
+
+def test_studio_html_has_dragging_guard_in_poll_board():
+    assert "let DRAGGING" in studio._HTML or "var DRAGGING" in studio._HTML
+    assert "onColDrop" in studio._HTML
+    assert "/api/tasks/status" in studio._HTML   # drop still uses the existing route

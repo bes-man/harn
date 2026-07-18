@@ -2312,7 +2312,7 @@ async function pollBoard(){
   // before the user has focused a field in it) or a half-typed value inside
   // it — same guard pattern as the inspector re-render below.
   const listChanged=boardListRenderKey()!==BOARD_LIST_RENDER_KEY;
-  if(listChanged && !NEW_TASK_OPEN && pollingCanReplace($('#listView'))) renderBoard();
+  if(listChanged && !NEW_TASK_OPEN && !DRAGGING && pollingCanReplace($('#listView'))) renderBoard();
   if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
     // Don't rebuild the inspector out from under an open <select> or a focused
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
@@ -2383,6 +2383,7 @@ function selectTask(id){
 // SELECT focused, so panelIsEditing() alone can't stop the 1.5s poll from wiping the
 // form back to hidden the instant the user opens it before typing anything.
 let NEW_TASK_OPEN=false;
+let DRAGGING=false, DRAG_TASK_ID=null;
 function renderBoard(){
   const v=$('#listView');
   const groups={}; (BOARD.tasks||[]).forEach(t=>(groups[t.status]=groups[t.status]||[]).push(t));
@@ -2419,10 +2420,34 @@ function renderBoard(){
   v.innerHTML=html;
   BOARD_LIST_RENDER_KEY=boardListRenderKey();
 }
-function onColDragOver(e){ e.preventDefault(); }
-function onCardDragStart(e,id){}
-function onCardDragEnd(e){}
-function onColDrop(e,status){ e.preventDefault(); }
+function onColDragOver(e){ e.preventDefault(); e.dataTransfer.dropEffect='move'; }
+function onCardDragStart(e,id){
+  DRAGGING=true; DRAG_TASK_ID=id;
+  e.dataTransfer.effectAllowed='move';
+  e.dataTransfer.setData('text/plain',id);
+}
+function onCardDragEnd(e){
+  DRAGGING=false; DRAG_TASK_ID=null;
+}
+async function onColDrop(e,status){
+  e.preventDefault();
+  const taskId=DRAG_TASK_ID || e.dataTransfer.getData('text/plain');
+  DRAGGING=false; DRAG_TASK_ID=null;
+  if(!taskId) return;
+  const t=(BOARD.tasks||[]).find(x=>x.id===taskId);
+  if(!t || t.status===status) return;
+  const priorStatus=t.status;
+  t.status=status;             // optimistic move
+  renderBoard();
+  const r=await post_('/api/tasks/status',{task_id:taskId,status});
+  if(!r.ok){
+    t.status=priorStatus;      // roll back
+    renderBoard();
+    alert(r.error||'status change failed');
+    return;
+  }
+  await pollBoard();
+}
 function openTaskModal(id){ selectTask(id); }   // Task 9 replaces this with a real modal
 function showNewTaskForm(){
   NEW_TASK_OPEN=true;
