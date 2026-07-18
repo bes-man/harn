@@ -224,8 +224,8 @@ sure a genuinely ambiguous or high-stakes decision actually reaches the \
 human, across chat AND headless runs, instead of the agent silently \
 guessing or stalling with no visible signal.
 When to use it: For anything BOTH ambiguous AND significant or hard to \
-undo — write the question EXPANDED (context, 2-3 options with trade-offs, \
-your recommendation). Surface it in your client's native UI FIRST (e.g. \
+undo — write the question EXPANDED (context, 2-3 options formatted as \
+`A) ...` / `B) ...` with trade-offs, one marked `(Recommended)`). Surface it in your client's native UI FIRST (e.g. \
 AskUserQuestion), then call this tool in the same turn, then stop.""",
 
 "answer_question": """\

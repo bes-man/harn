@@ -83,7 +83,7 @@ Don't shell out to `harn run` from chat (that nests a second agent).
 ambiguous message ('ok', 'continue'), call `check_pending_answer()` before
 `answer_question` — the reply may have come via Telegram while you were stopped.
 `harn watch` auto-starts and handles Telegram escalation (after
-`chat_grace_minutes`, default 5 min) and idle-silence notifications.
+`chat_grace_minutes`, default 2 min) and idle-silence notifications.
 
 ## Guidance index — read on demand (`read_guidance("<topic>")`)
 

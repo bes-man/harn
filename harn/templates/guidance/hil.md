@@ -45,6 +45,6 @@ detection in the background. Headless (`harn run`): if unsure, `ask_user` (or
 write `harn_env/state/BLOCKED.md`) and harn relays it to the human.
 
 **Idle notification:** if the agent is silent (no PROGRESS updates) for longer
-than `chat_grace_minutes` (default 5 min), `harn watch` sends a Telegram nudge
+than `chat_grace_minutes` (default 2 min), `harn watch` sends a Telegram nudge
 to the developer. This is informational — not an error. No action needed unless
 the task has actually stalled.

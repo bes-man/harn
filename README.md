@@ -666,7 +666,7 @@ Read `harn_env/AGENTS.md` for the full protocol.
 A blocking question (`ask_user`) is routed by `[notify] channel`:
 
 - **`both`** (default): wait for your answer **in the chat** first; if none comes
-  within `[notify] chat_grace_minutes` (default 5, or `HARN_CHAT_GRACE_MINUTES`),
+  within `[notify] chat_grace_minutes` (default 2, or `HARN_CHAT_GRACE_MINUTES`),
   **escalate to Telegram**. Answer in *either* place and both resolve — if you
   answer in the chat after the Telegram card was posted, harn edits the card to
   "answered in chat".
@@ -968,7 +968,7 @@ subprocess, каждый параметр `shlex`-квотируется пер�
 
 **Куда идёт вопрос — `[notify] channel`:**
 - **`both`** (по умолчанию): сначала ждём ответа **в чате**; если за
-  `chat_grace_minutes` (по умолчанию 5; env `HARN_CHAT_GRACE_MINUTES`) ответа нет
+  `chat_grace_minutes` (по умолчанию 2; env `HARN_CHAT_GRACE_MINUTES`) ответа нет
   — **эскалация в Telegram**. Ответить можно где угодно: ответ в чате после
   отправки в Telegram отредактирует карточку на «отвечено в чате».
 - **`telegram`**: сразу в Telegram (без грации чата).
