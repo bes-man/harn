@@ -127,7 +127,7 @@ def test_loop_review_via_telegram(tmp_path, monkeypatch):
         def wait_for_reply(self, text, *, state_dir, timeout_s, remind_every_s):
             return next(replies)
 
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
 
     phase = loop.run(tmp_path, env)
     assert phase == state.DONE

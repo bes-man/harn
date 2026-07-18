@@ -39,6 +39,15 @@ def test_autonomy_note_varies_by_level():
     assert "95%" in high and "DECISIVE" in high
 
 
+def test_full_autonomy_uses_context_and_skills_without_permission_waits():
+    note = loop._autonomy_note(1.0)
+    assert "100%" in note
+    assert "project context" in note
+    assert "loaded skills" in note
+    assert "permission" in note
+    assert "do not wait" in note.lower()
+
+
 def test_autonomy_note_injected_into_prompt(tmp_path):
     from tests.conftest import make_task
     env = tmp_path / "harn_env"; env.mkdir()
@@ -110,9 +119,8 @@ def test_handle_block_delegates_on_auto(monkeypatch, tmp_path):
     assert "Decide for me" in answers
 
 
-def test_low_autonomy_get_next_task_writes_block(tmp_path, monkeypatch):
-    """get_next_task at autonomy ≤ 30% must write BLOCKED.md so harn watch can
-    escalate to Telegram — MCP enforces confirmation regardless of Auto Mode."""
+def test_low_autonomy_get_next_task_does_not_request_permission(tmp_path, monkeypatch):
+    """Low autonomy may ask product questions but never gates routine work."""
     import asyncio
     from harn import scaffold, tasks, state, ENV_DIRNAME
     import harn.mcp_server as ms
@@ -132,12 +140,8 @@ def test_low_autonomy_get_next_task_writes_block(tmp_path, monkeypatch):
     result = str(asyncio.new_event_loop().run_until_complete(
         srv.call_tool("get_next_task", {})))
 
-    # MCP must have written BLOCKED.md
     state_dir = env / "state"
     q = state.read_block_question(state_dir)
-    assert q is not None, "BLOCKED.md should be written when autonomy ≤ 30%"
-    assert "PRJ-001" in q
-    # Response must tell the agent to show the question and not proceed
-    assert "CONFIRMATION REQUIRED" in result
-    assert "AskUserQuestion" in result
-    assert "answer_question" in result
+    assert q is None
+    assert "CONFIRMATION REQUIRED" not in result
+    assert "Do not request permission" in result

@@ -12,7 +12,7 @@ def test_await_disabled_returns_empty(tmp_path):
 
 def test_await_unconfigured_returns_empty(monkeypatch, tmp_path):
     cfg = Config(wait_for_reply=True)
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: None))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: None))
     assert loop._await_answer(tmp_path, cfg, "task1", "q?") == (None, "")
 
 
@@ -20,7 +20,7 @@ def test_await_chat_channel_skips_telegram(monkeypatch, tmp_path):
     cfg = Config(wait_for_reply=True, hil_channel="chat")
     # Even if Telegram is configured, the chat-only channel never posts.
     monkeypatch.setattr(loop.TelegramHIL, "from_env",
-                        staticmethod(lambda: object()))
+                        staticmethod(lambda *_: object()))
     assert loop._await_answer(tmp_path, cfg, "task1", "q?") == (None, "")
 
 
@@ -38,7 +38,7 @@ def test_await_both_passes_chat_grace_and_local_check(monkeypatch, tmp_path):
                             local_check=local_check)
             return ("use sqlite", "telegram")
 
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
     reply, source = loop._await_answer(tmp_path, cfg, "task1", "which db?")
     assert (reply, source) == ("use sqlite", "telegram")
     assert captured["question"] == "which db?"
@@ -59,6 +59,6 @@ def test_await_telegram_channel_has_no_grace(monkeypatch, tmp_path):
             captured["pre_grace_s"] = pre_grace_s
             return (None, "")
 
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
     loop._await_answer(tmp_path, cfg, "task1", "q?")
     assert captured["pre_grace_s"] == 0  # telegram channel escalates immediately

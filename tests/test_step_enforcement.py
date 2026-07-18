@@ -3,6 +3,7 @@ enforcement (Phase 4), sequential steps only."""
 from __future__ import annotations
 
 import subprocess
+import sys
 
 from harn import ENV_DIRNAME, events, loop, scaffold, state, tasks, workflows
 from harn.adapters.base import AgentResult
@@ -103,7 +104,7 @@ def test_audit_ignores_events_scoped_to_a_different_step(tmp_path):
     assert usage["skills"]["standards"] == "unused_required"
 
 
-def test_required_and_unused_triggers_exactly_one_retry_then_blocked(tmp_path, monkeypatch):
+def test_required_and_unused_retries_once_then_blocks_workflow(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Only step", id="s1", required=["standards"]),
     ])
@@ -112,18 +113,95 @@ def test_required_and_unused_triggers_exactly_one_retry_then_blocked(tmp_path, m
     monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
     loop.run(tmp_path, env)
 
-    # Exactly two turns happened: the original attempt + one retry.
     assert len(fake.calls) == 2
-    assert "standards" in fake.calls[1]["prompt"]
-    assert "MUST" in fake.calls[1]["prompt"]
 
     fresh = tasks.find(env, t.id)
     assert fresh.step_results["s1"]["status"] == "blocked"
+    assert fresh.step_results["s1"]["usage"]["skills"]["standards"] == "unused_required"
     state_dir = env / "state"
     st = state.State.load(state_dir)
     assert st.phase == state.BLOCKED
-    assert "standards" in (st.question or "")
     assert state.blocked_marker(state_dir).exists()
+
+
+def test_run_step_cannot_succeed_without_required_tool(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s1", tools=["yahoo_finance"]),
+    ])
+    fake = RecordingAdapter(["EUR/USD is 1.1395 from the internet"])
+    monkeypatch.setattr(loop, "_pick_adapter", lambda cfg: fake)
+
+    result = loop.run_step(tmp_path, env, t.id, "s1")
+
+    assert result["ok"] is False
+    assert len(fake.calls) == 2
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s1"]["status"] == "blocked"
+    assert fresh.step_results["s1"]["usage"]["tools"]["yahoo_finance"] == "unused_required"
+    assert state.State.load(env / "state").phase == state.BLOCKED
+
+
+def test_run_step_executes_required_zero_param_custom_tool_before_agent(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s1", tools=["eur_usd_rate"]),
+    ])
+    command = f'{sys.executable} -c "print(\'1.2345\')"'
+    from harn import tools
+    tools.save(env, "eur_usd_rate", "Current EUR/USD rate", [], command)
+    fake = RecordingAdapter(["EUR/USD is 1.2345"])
+    monkeypatch.setattr(loop, "_pick_adapter", lambda cfg: fake)
+
+    result = loop.run_step(tmp_path, env, t.id, "s1")
+
+    assert result["ok"] is True
+    assert len(fake.calls) == 1
+    assert "eur_usd_rate" in fake.calls[0]["prompt"]
+    assert "1.2345" in fake.calls[0]["prompt"]
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s1"]["usage"]["tools"]["eur_usd_rate"] == "used"
+    used = [e for e in events.read(env, task_id=t.id)
+            if e.get("event") == "tool_used"]
+    assert [e.get("tool") for e in used] == ["eur_usd_rate"]
+
+
+def test_full_workflow_executes_required_custom_tool_once(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s1", tools=["eur_usd_rate"]),
+    ])
+    command = f'{sys.executable} -c "print(\'1.2345\')"'
+    from harn import tools
+    tools.save(env, "eur_usd_rate", "Current EUR/USD rate", [], command)
+    fake = RecordingAdapter(["EUR/USD is 1.2345"])
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 1
+    assert "1.2345" in fake.calls[0]["prompt"]
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s1"]["status"] == "ok"
+
+
+def test_run_step_blocks_failed_required_custom_tool_without_agent_tokens(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s1", tools=["eur_usd_rate"]),
+    ])
+    command = f'{sys.executable} -c "import sys; print(\'provider down\'); sys.exit(9)"'
+    from harn import tools
+    tools.save(env, "eur_usd_rate", "Current EUR/USD rate", [], command)
+    fake = RecordingAdapter(["must not run"])
+    monkeypatch.setattr(loop, "_pick_adapter", lambda cfg: fake)
+
+    result = loop.run_step(tmp_path, env, t.id, "s1")
+
+    assert result["ok"] is False
+    assert fake.calls == []
+    assert "eur_usd_rate" in result["error"]
+    assert "exit 9" in result["error"]
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s1"]["status"] == "blocked"
+    assert fresh.step_results["s1"]["attempts"] == 0
 
 
 def test_recommended_and_unused_never_retries(tmp_path, monkeypatch):

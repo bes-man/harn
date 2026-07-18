@@ -2,7 +2,8 @@
 arbitrary step count, per-step agent/model, resume, checkpoints."""
 from __future__ import annotations
 
-from harn import loop, tasks, workflows, scaffold, gitutil, ENV_DIRNAME
+from harn import loop, tasks, workflows, scaffold, gitutil, events, transcript, ENV_DIRNAME
+from harn.config import Config
 from harn.adapters.base import AgentResult
 from .conftest import make_task
 import subprocess
@@ -110,3 +111,36 @@ def test_checkpoint_per_step_id(tmp_path, monkeypatch):
     loop.run(tmp_path, env)
     fresh = tasks.find(env, t.id)
     assert set(fresh.stage_checkpoints) == {"step-000001", "step-000002"}
+
+
+def test_run_turn_persists_stream_events_with_step_attempt_and_run(tmp_path):
+    env, task = _project(tmp_path, n_steps=1)
+
+    class StreamingAdapter:
+        name = "streaming"
+
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                     temperature=None, on_event=None):
+            on_event({"kind": "tool", "phase": "started", "title": "board",
+                      "text": "Reading task", "item_id": "tool-1"})
+            on_event({"kind": "message", "phase": "completed", "title": "Agent",
+                      "text": "Visible result", "item_id": "msg-1"})
+            return AgentResult(ok=True, text="Visible result")
+
+    rid = events.new_run(env, kind="test")
+    current = tasks.find(env, task.id)
+    current.step_results["step-000001"] = {"status": "running", "attempts": 2}
+    tasks._save(current)
+    result = loop._run_turn(
+        StreamingAdapter(), env, "prompt", tmp_path, task_id=task.id,
+        stage="step-000001", step_title="Step 1", tok_totals={}, tok_costs={},
+        cfg=Config.load(env), attempt=2,
+    )
+
+    assert result.ok is True
+    rows = transcript.read(env, task_id=task.id)["entries"]
+    assert [(r["kind"], r["text"]) for r in rows] == [
+        ("tool", "Reading task"), ("message", "Visible result")]
+    assert {r["step_id"] for r in rows} == {"step-000001"}
+    assert {r["attempt"] for r in rows} == {2}
+    assert {r["run_id"] for r in rows} == {rid}

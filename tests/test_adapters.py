@@ -6,7 +6,9 @@ the CLI is missing or times out. No real agent CLI is invoked.
 """
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -69,12 +71,42 @@ def test_run_turn_builds_expected_argv(monkeypatch, agent):
         return P()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    if agent in ("codex", "claude"):
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["cwd"] = kwargs.get("cwd")
+
+            if agent == "claude":
+                output = [json.dumps({"type": "result", "result": "ok"}) + "\n"]
+            else:
+                output = [
+                    json.dumps({"type": "item.completed", "item": {
+                        "id": "m1", "type": "agent_message", "text": "ok"}}) + "\n",
+                    json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
+                ]
+
+            class P:
+                returncode = 0
+                stdout = iter(output)
+                stderr = iter(())
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            return P()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
     adapter = get_adapter(agent)
     result = adapter.run_turn("PROMPT", Path("/tmp/proj"))
 
     assert result.ok is True
     assert result.text == "ok"
-    assert captured["argv"][: len(EXPECTED_ARGV[agent])] == EXPECTED_ARGV[agent]
+    expected = EXPECTED_ARGV[agent]
+    assert captured["argv"][1: len(expected)] == expected[1:]
+    assert captured["argv"][0].endswith(expected[0])
     assert "PROMPT" in captured["argv"]
     assert captured["cwd"] == "/tmp/proj"
 
@@ -84,6 +116,67 @@ def test_claude_headless_bypasses_permissions_so_tools_can_run(monkeypatch):
     # to approve it, so a task needing MCP/Bash/Edit tools produced ZERO
     # tool_used events and burned its whole budget saying "I need permission".
     # The adapter must pass --permission-mode bypassPermissions.
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/" + _b)
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+
+        class P:
+            returncode = 0
+            stdout = iter([json.dumps({"type": "result", "result": "ok"}) + "\n"])
+            stderr = iter(())
+            def wait(self, timeout=None): return 0
+            def kill(self): self.returncode = -9
+        return P()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    get_adapter("claude").run_turn("PROMPT", Path("/tmp/proj"))
+    argv = captured["argv"]
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_claude_streams_agent_activity_before_the_final_result(monkeypatch):
+    """Claude's normal json mode buffers everything until completion.  Harn
+    must request stream-json so the sidebar receives live activity."""
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/claude")
+    captured = {}
+
+    class P:
+        returncode = 0
+        stdout = iter([
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Checking the source…"},
+                {"type": "tool_use", "name": "city_weather"},
+            ]}}) + "\n",
+            json.dumps({"type": "result", "result": "Done", "usage": {
+                "input_tokens": 3, "output_tokens": 2}}) + "\n",
+        ])
+        stderr = iter(())
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return P()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    seen = []
+    result = get_adapter("claude").run_turn("PROMPT", Path("/tmp/proj"), on_event=seen.append)
+
+    assert result.ok is True and result.text == "Done"
+    assert captured["argv"][captured["argv"].index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in captured["argv"]
+    assert any(e["kind"] == "message" and "Checking" in e["text"] for e in seen)
+    assert any(e["kind"] == "tool" and e["title"] == "city_weather" for e in seen)
+
+
+def test_cursor_headless_trusts_harn_workspace_without_prompting(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/" + _b)
     captured = {}
 
@@ -97,10 +190,10 @@ def test_claude_headless_bypasses_permissions_so_tools_can_run(monkeypatch):
         return P()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    get_adapter("claude").run_turn("PROMPT", Path("/tmp/proj"))
+    get_adapter("cursor").run_turn("PROMPT", Path("/tmp/harn-wave/step-1"))
     argv = captured["argv"]
-    assert "--permission-mode" in argv
-    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "--trust" in argv
+    assert argv.index("--trust") < argv.index("PROMPT")
 
 
 def test_claude_reports_cache_read_tokens_separately(monkeypatch):
@@ -108,20 +201,23 @@ def test_claude_reports_cache_read_tokens_separately(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/" + _b)
     import json as _json
 
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         class P:
             returncode = 0
-            stdout = _json.dumps({
+            stdout = iter([_json.dumps({
+                "type": "result",
                 "result": "done",
                 "usage": {"input_tokens": 100, "output_tokens": 20,
                           "cache_creation_input_tokens": 5000,
                           "cache_read_input_tokens": 400000},
                 "total_cost_usd": 0.12,
-            })
-            stderr = ""
+            }) + "\n"])
+            stderr = iter(())
+            def wait(self, timeout=None): return 0
+            def kill(self): self.returncode = -9
         return P()
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     res = get_adapter("claude").run_turn("PROMPT", Path("/tmp/proj"))
     # input_tokens folds all three (display continuity); cache_read is ALSO
     # surfaced on its own so the budget can subtract it.
@@ -138,8 +234,29 @@ def test_timeout_is_reported(monkeypatch, agent):
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 0))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    timeout = 1
+    if agent in ("codex", "claude"):
+        class SlowOutput:
+            def __iter__(self):
+                time.sleep(0.05)
+                return
+                yield  # pragma: no cover
+
+        class P:
+            returncode = None
+            stdout = SlowOutput()
+            stderr = iter(())
+
+            def wait(self, timeout=None):
+                return self.returncode or -9
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: P())
+        timeout = 0.01
     adapter = get_adapter(agent)
-    result = adapter.run_turn("PROMPT", Path("."), timeout=1)
+    result = adapter.run_turn("PROMPT", Path("."), timeout=timeout)
     assert result.ok is False
     assert "timed out" in result.text.lower()
 
@@ -178,17 +295,19 @@ def test_exec_uses_absolute_path_when_off_path(monkeypatch, tmp_path):
     monkeypatch.setattr("harn.adapters.base._EXTRA_BIN_DIRS", (str(tmp_path),))
     captured = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_popen(argv, **kwargs):
         captured["argv"] = argv
 
         class P:
             returncode = 0
-            stdout = "ok"
-            stderr = ""
+            stdout = iter([json.dumps({"type": "result", "result": "ok"}) + "\n"])
+            stderr = iter(())
+            def wait(self, timeout=None): return 0
+            def kill(self): self.returncode = -9
 
         return P()
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     get_adapter("claude").run_turn("PROMPT", Path("."))
     assert captured["argv"][0] == str(fake)
 

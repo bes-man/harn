@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from harn import events, loop, tasks, workflows, scaffold, gitutil, ENV_DIRNAME
@@ -94,6 +95,46 @@ def test_two_parallel_steps_run_concurrently_and_both_merge(tmp_path, monkeypatc
     assert fresh.step_results["s-fe"]["status"] == "ok"
 
 
+def test_parallel_members_cannot_succeed_without_required_tools(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s-rate", parallel="wave-1", tools=["yahoo_finance"]),
+        _step("Weather", id="s-weather", parallel="wave-1", tools=["city_weather"]),
+    ])
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    fresh = tasks.find(env, t.id)
+    assert len(fake.calls) == 4
+    assert fresh.step_results["s-rate"]["status"] == "blocked"
+    assert fresh.step_results["s-weather"]["status"] == "blocked"
+    assert fresh.step_results["s-rate"]["usage"]["tools"]["yahoo_finance"] == "unused_required"
+
+
+def test_parallel_member_executes_required_custom_tool_without_retry(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s-rate", parallel="wave-1", tools=["eur_usd_rate"]),
+        _step("Other", id="s-other", parallel="wave-1"),
+    ])
+    from harn import tools
+    command = f'{sys.executable} -c "print(\'1.2345\')"'
+    tools.save(env, "eur_usd_rate", "Current EUR/USD rate", [], command)
+    fake = WritingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    assert len(fake.calls) == 2
+    rate_prompt = next(c["prompt"] for c in fake.calls if "1.2345" in c["prompt"])
+    assert "eur_usd_rate" in rate_prompt
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results["s-rate"]["status"] == "ok"
+    assert fresh.step_results["s-rate"]["usage"]["tools"]["eur_usd_rate"] == "used"
+
+
 def test_current_step_never_set_for_a_wave_member(tmp_path, monkeypatch):
     """Phase 4 Non-goal: `state.State.current_step` scopes a SEQUENTIAL step's
     turn only. A parallel wave runs N steps concurrently sharing ONE on-disk
@@ -144,8 +185,7 @@ def test_connectors_replicated_into_each_worktree_with_absolute_env_dir(tmp_path
     class CapturingAdapter(WritingAdapter):
         def run_turn(self, prompt, cwd, **kw):
             mcp_json = json.loads((Path(cwd) / ".mcp.json").read_text())
-            checked.append(
-                mcp_json["mcpServers"]["harn"]["env"]["HARN_ENV_DIR"])
+            checked.append(mcp_json["mcpServers"]["harn"]["env"])
             return super().run_turn(prompt, cwd, **kw)
     fake = CapturingAdapter()
     monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
@@ -153,8 +193,37 @@ def test_connectors_replicated_into_each_worktree_with_absolute_env_dir(tmp_path
     loop.run(tmp_path, env)
 
     assert len(checked) == 2
-    for env_dir_seen in checked:
-        assert env_dir_seen == str(env.resolve())
+    for connector_env in checked:
+        assert connector_env["HARN_ENV_DIR"] == str(env.resolve())
+        assert connector_env["HARN_TASK_ID"] == t.id
+        assert connector_env["HARN_STEP_ID"] in {"s-be", "s-fe"}
+
+
+def test_codex_connector_is_replicated_into_parallel_worktree(tmp_path, monkeypatch):
+    env, t = _project(tmp_path, [
+        _step("Rate", id="s-rate", parallel="wave-1"),
+        _step("Weather", id="s-weather", parallel="wave-1"),
+    ])
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '# >>> harn generated mcp\n[mcp_servers.harn]\ncommand = "python"\n'
+        '[mcp_servers.harn.env]\nHARN_ENV_DIR = "harn_env"\n# <<< harn generated mcp\n')
+    seen = []
+    class CapturingAdapter(WritingAdapter):
+        def run_turn(self, prompt, cwd, **kw):
+            seen.append((Path(cwd) / ".codex" / "config.toml").read_text())
+            return super().run_turn(prompt, cwd, **kw)
+    fake = CapturingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+
+    assert len(seen) == 2
+    assert all(f'HARN_ENV_DIR = "{env.resolve()}"' in text for text in seen)
+    assert any('HARN_STEP_ID = "s-rate"' in text for text in seen)
+    assert any('HARN_STEP_ID = "s-weather"' in text for text in seen)
+    assert all(f'HARN_TASK_ID = "{t.id}"' in text for text in seen)
 
 
 def test_wave_of_one_runs_the_normal_single_step_path(tmp_path, monkeypatch):
@@ -436,7 +505,7 @@ def test_rollback_one_parallel_step_leaves_sibling_untouched(tmp_path, monkeypat
     assert (tmp_path / "output_s-fe.txt").exists()  # sibling untouched
 
 
-def test_rollback_falls_back_to_whole_wave_when_patch_no_longer_reverses(tmp_path, monkeypatch):
+def test_rollback_stops_safely_when_patch_no_longer_reverses(tmp_path, monkeypatch):
     env, t = _project(tmp_path, [
         _step("Backend", id="s-be", parallel="wave-1"),
         _step("Frontend", id="s-fe", parallel="wave-1"),
@@ -449,8 +518,10 @@ def test_rollback_falls_back_to_whole_wave_when_patch_no_longer_reverses(tmp_pat
     (tmp_path / "output_s-be.txt").write_text("edited again after merge, incompatible\n")
 
     r = loop.rollback_parallel_step(tmp_path, env, t.id, "s-be")
-    assert r["mode"] == "whole-wave-fallback"
+    assert r["ok"] is False
+    assert r["mode"] == "conflict"
     assert "note" in r and r["note"]
+    assert (tmp_path / "output_s-fe.txt").exists()
 
 
 def test_rollback_unknown_task_reports_error(tmp_path):

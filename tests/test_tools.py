@@ -1,5 +1,6 @@
 """Tests for harn/tools.py — custom-tool storage and execution."""
 import json
+import sys
 
 from harn import tools
 
@@ -74,6 +75,35 @@ def test_execute_substitutes_params_with_shlex_quote(tmp_path):
     tool = tools.read(env, "echo_it")
     out = tools.execute(tool, {"msg": "hello world"}, cwd=tmp_path)
     assert out.strip() == "hello world"
+
+
+def test_execute_checked_reports_nonzero_exit_without_hiding_output(tmp_path):
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    command = f'{sys.executable} -c "import sys; print(\'bad rate\'); sys.exit(7)"'
+    tools.save(env, "bad_rate", "fails clearly", [], command)
+
+    result = tools.execute_checked(tools.read(env, "bad_rate"), {}, cwd=tmp_path)
+
+    assert result.ok is False
+    assert result.returncode == 7
+    assert "bad rate" in result.output
+
+
+def test_execute_checked_rejects_shell_pipeline_instead_of_passing_it_to_curl(tmp_path):
+    """Custom tools deliberately run without a shell.  A pasted pipe must
+    fail with an actionable configuration error, never as a misleading curl
+    DNS/parse failure caused by treating ``|`` as an argument."""
+    env = tmp_path / "harn_env"
+    env.mkdir()
+    tools.save(env, "rate", "rate", [], "curl https://example.test | python3 -c 'print(1)'")
+
+    result = tools.execute_checked(tools.read(env, "rate"), {}, cwd=tmp_path)
+
+    assert result.ok is False
+    assert result.returncode is None
+    assert "shell operator" in result.output
+    assert "|" in result.output
 
 
 def test_execute_quotes_a_param_that_looks_like_a_second_command(tmp_path):

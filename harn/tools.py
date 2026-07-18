@@ -24,6 +24,15 @@ _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 # Matches studio._MAX_ATTACHMENT_BYTES; local single-user admin tool.
 _MAX_BUNDLE_BYTES = 25 * 1024 * 1024
 
+# Custom tools intentionally run with ``shell=False``. A terminal pipeline
+# pasted into a tool definition would otherwise be handed to its first program
+# as literal arguments (for example, curl reports exit 6 for a literal ``|``).
+_UNSUPPORTED_SHELL_OPERATORS = ("|", "&&", "||")
+
+
+def _unsupported_shell_operator(command: str) -> str | None:
+    return next((op for op in _UNSUPPORTED_SHELL_OPERATORS if op in command), None)
+
 
 def is_safe_param_name(name) -> bool:
     """True iff `name` is safe to splice into generated Python source as a
@@ -51,6 +60,13 @@ class CustomTool:
     command: str
     source: str
     path: Path
+
+
+@dataclass(frozen=True)
+class ToolExecution:
+    ok: bool
+    output: str
+    returncode: int | None
 
 
 def _tools_dir(env_dir: Path) -> Path:
@@ -142,9 +158,19 @@ def index(env_dir: Path) -> str:
     return "\n".join(lines) if lines else "(no custom tools installed)"
 
 
-def execute(tool: CustomTool, args: dict[str, str], cwd: Path,
-           timeout: int = 600) -> str:
+def execute_checked(tool: CustomTool, args: dict[str, str], cwd: Path,
+                    timeout: int = 600) -> ToolExecution:
+    """Execute a custom tool while preserving its actual success status."""
     cmd = tool.command
+    operator = _unsupported_shell_operator(cmd)
+    if operator:
+        return ToolExecution(
+            False,
+            f"unsupported shell operator {operator!r} in custom tool command; "
+            "custom tools run without a shell. Put the logic in a script and "
+            "invoke that script directly.",
+            None,
+        )
     for k, v in args.items():
         cmd = cmd.replace("{" + k + "}", shlex.quote(str(v)))
     try:
@@ -152,11 +178,18 @@ def execute(tool: CustomTool, args: dict[str, str], cwd: Path,
             shlex.split(cmd), cwd=str(cwd), capture_output=True, text=True,
             timeout=timeout,
         )
-        return (proc.stdout or "") + (proc.stderr or "")
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return ToolExecution(proc.returncode == 0, output, proc.returncode)
     except subprocess.TimeoutExpired:
-        return f"timeout after {timeout}s"
+        return ToolExecution(False, f"timeout after {timeout}s", None)
     except FileNotFoundError as exc:
-        return f"command not found: {exc}"
+        return ToolExecution(False, f"command not found: {exc}", None)
+
+
+def execute(tool: CustomTool, args: dict[str, str], cwd: Path,
+            timeout: int = 600) -> str:
+    """Backward-compatible string result used by the MCP wrapper."""
+    return execute_checked(tool, args, cwd, timeout=timeout).output
 
 
 def export_bundle(tool: CustomTool) -> bytes:

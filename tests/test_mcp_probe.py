@@ -50,6 +50,25 @@ def test_serve_keeps_start_watch_true_for_a_real_session(monkeypatch):
     assert calls == [True]
 
 
+def test_serve_does_not_open_a_chat_run_inside_a_workflow_worker(monkeypatch):
+    """The agent-owned MCP subprocess inherits the workflow run id.  It must
+    not replace the global pointer with a new chat run while that flow runs."""
+    monkeypatch.setenv("HARN_RUN_ID", "r-flow")
+    calls = []
+
+    class FakeMCP:
+        def run(self, **kw):
+            pass
+
+    def fake_build_server(start_watch=True, register_custom=True):
+        calls.append(start_watch)
+        return FakeMCP()
+
+    monkeypatch.setattr(mcp_server, "build_server", fake_build_server)
+    mcp_server.serve()
+    assert calls == [False]
+
+
 def test_healthcheck_marks_its_subprocess_as_a_probe(monkeypatch, tmp_path):
     captured = {}
 

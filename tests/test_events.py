@@ -54,6 +54,20 @@ def test_read_skips_malformed_lines(tmp_path):
     assert any(e["event"] == "run_start" for e in events.read(env))
 
 
+def test_clear_task_removes_only_that_tasks_runtime_events(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    events.new_run(env)
+    events.emit(env, "stage_start", task_id="PRJ-1", stage="step-a")
+    events.emit(env, "error", task_id="PRJ-1", stage="step-a", detail="old error")
+    events.emit(env, "context_read", task_id="PRJ-1", kind="skill", name="old")
+    events.emit(env, "stage_end", task_id="PRJ-2", stage="step-b")
+
+    assert events.clear_task(env, "PRJ-1") == 3
+    assert events.read(env, task_id="PRJ-1") == []
+    assert len(events.read(env, task_id="PRJ-2")) == 1
+    assert any(e["event"] == "run_start" for e in events.read(env))
+
+
 def test_emit_is_best_effort_no_crash(tmp_path, monkeypatch):
     env = tmp_path / ENV_DIRNAME
     # force the open to raise; emit must swallow it

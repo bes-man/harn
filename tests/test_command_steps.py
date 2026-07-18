@@ -274,7 +274,7 @@ def test_rework_clears_done_ids_so_command_step_rewalks(tmp_path, monkeypatch):
         def wait_for_reply(self, text, *, state_dir, timeout_s, remind_every_s):
             return next(replies)
 
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
 
     phase = loop.run(tmp_path, env)
     assert phase == state.DONE
@@ -324,7 +324,7 @@ def test_two_consecutive_rework_rounds_both_rewalk_command_step(tmp_path, monkey
         def wait_for_reply(self, text, *, state_dir, timeout_s, remind_every_s):
             return next(replies)
 
-    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda: FakeHIL()))
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
 
     phase = loop.run(tmp_path, env)
     assert phase == state.DONE

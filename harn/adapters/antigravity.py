@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import Adapter, AgentResult
+from .base import Adapter, AgentResult, EventCallback
 
 
 class AntigravityAdapter(Adapter):
@@ -27,8 +27,9 @@ class AntigravityAdapter(Adapter):
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,
-                temperature: str | None = None) -> AgentResult:
+                temperature: str | None = None,
+                on_event: EventCallback | None = None) -> AgentResult:
         # `antigravity exec` runs a single non-interactive turn and prints output.
         argv = ([self.binary, "exec", prompt]
                 + self._model_args(model, effort, temperature))
-        return self._run_cli(argv, cwd, timeout)
+        return self._run_cli(argv, cwd, timeout, on_event=on_event)

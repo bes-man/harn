@@ -30,12 +30,14 @@ Event vocabulary (the `event` field):
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 _FILE = "events.jsonl"
 _RUN_ID_FILE = ".run_id"
+_LOCK = threading.Lock()
 
 
 def _state_dir(env_dir: Path) -> Path:
@@ -118,6 +120,30 @@ def read(env_dir: Path, *, task_id: str | None = None,
             continue
         out.append(rec)
     return out
+
+
+def clear_task(env_dir: Path, task_id: str) -> int:
+    """Atomically remove runtime telemetry belonging to one task."""
+    with _LOCK:
+        path = _events_path(env_dir)
+        if not path.exists():
+            return 0
+        rows = read(env_dir)
+        kept = [row for row in rows if row.get("task_id") != task_id]
+        removed = len(rows) - len(kept)
+        if not removed:
+            return 0
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in kept),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            return 0
+        return removed
 
 
 def metrics(env_dir: Path, *, run_id: str | None = None) -> dict:

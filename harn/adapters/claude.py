@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import queue
+import subprocess
+import threading
+import time
 from pathlib import Path
 
-from .base import Adapter, AgentResult
+from . import base as base_mod
+from .base import Adapter, AgentResult, EventCallback
 
 # Matches the existing step_results.output truncation convention
 # ((result.text or "")[-4000:] in loop.py) — capped so a noisy tool (e.g. a
@@ -24,10 +29,9 @@ class ClaudeAdapter(Adapter):
     No hard dependency on the Agent SDK: harn just invokes the CLI the user
     already has installed, which keeps the harness agent-agnostic.
 
-    We request `--output-format json` so we can also report the turn's token
-    usage (input/output tokens + cost), which harn records on the task. If the
-    JSON can't be parsed for any reason, we fall back to the raw text and simply
-    report no usage — never failing the turn over telemetry.
+    We request Claude Code's documented ``stream-json`` print-mode format so
+    activity reaches the run sidebar while the agent is working, rather than
+    waiting for one buffered JSON record at turn completion.
     """
 
     name = "claude"
@@ -44,12 +48,18 @@ class ClaudeAdapter(Adapter):
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,
-                temperature: str | None = None) -> AgentResult:
-        if not self.available():
-            return AgentResult(
+                temperature: str | None = None,
+                on_event: EventCallback | None = None) -> AgentResult:
+        binary = base_mod.resolve_binary(self.binary)
+        if not binary:
+            result = AgentResult(
                 ok=False,
                 text="claude CLI not found on PATH. Install claude first.",
             )
+            if on_event:
+                on_event({"kind": "error", "phase": "failed",
+                          "title": self.name, "text": result.text})
+            return result
         # `--permission-mode bypassPermissions` is REQUIRED for headless
         # operation: in `-p` mode there is no human to approve a tool call, so
         # without this every MCP/Bash/Edit tool the agent tries to use is
@@ -62,13 +72,89 @@ class ClaudeAdapter(Adapter):
         # background" — so bypassing the interactive gate is the correct trust
         # model here, not a shortcut. (Per Claude Code docs this is the CLI
         # equivalent of the deprecated --dangerously-skip-permissions.)
-        argv = ([self.binary, "-p", prompt, "--output-format", "json",
-                 "--permission-mode", "bypassPermissions"]
+        argv = ([binary, "-p", prompt, "--output-format", "stream-json",
+                 "--verbose", "--permission-mode", "bypassPermissions"]
                 + self._model_args(model, effort, temperature))
-        r = self._exec(argv, cwd, timeout)
-        if r.timed_out:
-            return AgentResult(ok=False, text=r.stderr)
-        return self._parse(r.ok, r.stdout, r.stderr)
+        if on_event:
+            on_event({"kind": "status", "phase": "started",
+                      "title": self.name, "text": "Agent started"})
+        result = self._run_stream(argv, cwd, timeout, on_event)
+        if on_event and result.text.strip():
+            on_event({"kind": "message" if result.ok else "error",
+                      "phase": "completed" if result.ok else "failed",
+                      "title": self.name, "text": result.text.strip()})
+        return result
+
+    def _run_stream(self, argv: list[str], cwd: Path, timeout: int,
+                    on_event: EventCallback | None) -> AgentResult:
+        """Consume Claude's JSONL print stream without holding UI progress.
+
+        ``stream-json`` emits assistant/tool records before the terminal
+        ``result`` record. A pair of reader threads keeps stderr drained and
+        lets the timeout still fire when Claude produces no output.
+        """
+        try:
+            proc = subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as exc:
+            return AgentResult(False, str(exc))
+        lines: queue.Queue[str | None] = queue.Queue()
+        errors: list[str] = []
+
+        def read_stdout() -> None:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    lines.put(line)
+            lines.put(None)
+
+        def read_stderr() -> None:
+            if proc.stderr is not None:
+                errors.extend(proc.stderr)
+
+        threading.Thread(target=read_stdout, daemon=True).start()
+        threading.Thread(target=read_stderr, daemon=True).start()
+        deadline = time.monotonic() + timeout
+        final: dict = {}
+        raw: list[str] = []
+        timed_out = False
+        name_by_id: dict[str, str] = {}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                proc.kill()
+                break
+            try:
+                line = lines.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            raw.append(line)
+            try:
+                data = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if data.get("type") == "result":
+                final = data
+            for event in self._normalize_event(data, name_by_id):
+                if on_event:
+                    on_event(event)
+        try:
+            returncode = proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            returncode = -9
+            timed_out = True
+        stderr = "".join(errors).strip()
+        if timed_out:
+            return AgentResult(False, f"claude timed out after {timeout}s")
+        if final:
+            parsed = self._parse(True, json.dumps(final), stderr)
+            return AgentResult(returncode == 0 and parsed.ok, parsed.text,
+                               parsed.input_tokens, parsed.output_tokens,
+                               parsed.cost_usd, parsed.cache_read_tokens)
+        return AgentResult(returncode == 0, "".join(raw).strip() or stderr)
 
     @staticmethod
     def _normalize_event(data: dict, name_by_id: dict[str, str]) -> list[dict]:

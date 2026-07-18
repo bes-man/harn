@@ -7,6 +7,7 @@ save_models/values/stages (removed in Task 6)."""
 from __future__ import annotations
 
 from harn import studio, ENV_DIRNAME
+from harn.adapters.cursor import CursorAdapter
 
 
 def _env(tmp_path):
@@ -39,8 +40,33 @@ def test_models_payload_lists_all_agents_and_defaults(tmp_path):
     # every known agent is offered (not just the configured one)
     for a in ("claude", "codex", "cursor", "qwen", "antigravity"):
         assert a in p["agents"]
-    assert "composer-1" in p["agents"]["cursor"]["models"]
+    assert "auto" in p["agents"]["cursor"]["models"]
     assert "values" not in p and "stages" not in p
+
+
+def test_models_payload_refreshes_cursor_models_from_installed_cli(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    monkeypatch.setattr(CursorAdapter, "discover_models",
+                        lambda self: ("auto", "gpt-5.3-codex", "composer-2.5"))
+    payload = studio.models_payload(env)
+    assert payload["agents"]["cursor"]["models"] == [
+        "auto", "gpt-5.3-codex", "composer-2.5"]
+
+
+def test_codex_catalog_uses_account_available_model_slugs(tmp_path, monkeypatch):
+    from harn.adapters.codex import CodexAdapter
+    catalog = {"models": [
+        {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol"},
+        {"slug": "gpt-5.6-terra", "display_name": "GPT-5.6-Terra"},
+        {"slug": "gpt-5.6-luna", "display_name": "GPT-5.6-Luna"},
+    ]}
+    monkeypatch.setattr(CodexAdapter, "_exec", lambda *args, **kwargs: type("R", (), {
+        "ok": True, "stdout": __import__("json").dumps(catalog), "stderr": ""
+    })())
+    payload = studio.models_payload(_env(tmp_path))
+    models = payload["agents"]["codex"]["models"]
+    assert models == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    assert not any(model.endswith("-high") for model in models)
 
 
 def test_save_defaults_writes_harn_agent_and_model(tmp_path):

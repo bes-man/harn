@@ -81,3 +81,18 @@ def test_custom_tool_call_emits_tool_used_scoped_like_builtins(
     assert len(evs) == 1
     assert evs[0]["tool"] == "echo_it"
     assert evs[0]["step_id"] == "s1"
+
+
+def test_parallel_custom_tool_uses_connector_task_and_step_env(tmp_path, monkeypatch):
+    env = _env(tmp_path, monkeypatch)
+    task = tasks.create_task(env, "Parallel tool")
+    state.State().save(env / "state")  # parallel wave has no shared current_task
+    monkeypatch.setenv("HARN_TASK_ID", task.id)
+    monkeypatch.setenv("HARN_STEP_ID", "step-weather")
+    tools.save(env, "city_weather", "weather", ["city"], "echo {city}")
+
+    server = mcp_server.build_server(start_watch=False)
+    asyncio.run(server._tool_manager.get_tool("city_weather").run({"city": "Madrid"}))
+
+    evs = [e for e in events.read(env, task_id=task.id) if e["event"] == "tool_used"]
+    assert [(e["tool"], e["step_id"]) for e in evs] == [("city_weather", "step-weather")]

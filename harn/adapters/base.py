@@ -5,7 +5,10 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
+
+
+EventCallback = Callable[[dict], None]
 
 
 # Agent CLIs are routinely installed outside a minimal/GUI-launched process's
@@ -111,6 +114,15 @@ class Adapter:
         searching PATH plus common install dirs (see resolve_binary)."""
         return resolve_binary(self.binary) is not None
 
+    def discover_models(self) -> tuple[str, ...]:
+        """Return the current CLI model catalog when discoverable.
+
+        Most agent CLIs expose only stable aliases, so the safe default is the
+        adapter's curated fallback. Adapters with a real list command override
+        this method; Studio calls it on each fresh page/server session.
+        """
+        return tuple(self.MODELS)
+
     def _model_args(self, model: str | None = None, effort: str | None = None,
                     temperature: str | None = None) -> list[str]:
         """CLI args for this step's overrides (set per-step in the task's
@@ -127,7 +139,8 @@ class Adapter:
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,
-                temperature: str | None = None) -> AgentResult:
+                temperature: str | None = None,
+                on_event: EventCallback | None = None) -> AgentResult:
         """Run one non-interactive turn with `prompt` in working dir `cwd`.
         `model`/`effort`/`temperature` are this step's optional overrides
         (set per-step in the task's WORKFLOW.md plan)."""
@@ -158,7 +171,8 @@ class Adapter:
             return _Exec(False, "", f"{self.name} timed out after {timeout}s", True)
 
     def _run_cli(
-        self, argv: Sequence[str], cwd: Path, timeout: int = 1800
+        self, argv: Sequence[str], cwd: Path, timeout: int = 1800,
+        on_event: EventCallback | None = None,
     ) -> AgentResult:
         """Shared headless invocation: shell out to a CLI and capture output.
 
@@ -167,11 +181,24 @@ class Adapter:
         lives here once.
         """
         if not self.available():
-            return AgentResult(
+            result = AgentResult(
                 ok=False,
                 text=f"{self.binary} CLI not found on PATH. Install {self.name} first.",
             )
+            if on_event:
+                on_event({"kind": "error", "phase": "failed",
+                          "title": self.name, "text": result.text})
+            return result
+        if on_event:
+            on_event({"kind": "status", "phase": "started",
+                      "title": self.name, "text": "Agent started"})
         r = self._exec(argv, cwd, timeout)
         if r.timed_out:
-            return AgentResult(ok=False, text=r.stderr)
-        return AgentResult(ok=r.ok, text=r.stdout + r.stderr)
+            result = AgentResult(ok=False, text=r.stderr)
+        else:
+            result = AgentResult(ok=r.ok, text=r.stdout + r.stderr)
+        if on_event and result.text.strip():
+            on_event({"kind": "message" if result.ok else "error",
+                      "phase": "completed" if result.ok else "failed",
+                      "title": self.name, "text": result.text.strip()})
+        return result
