@@ -4,6 +4,7 @@ import subprocess
 from harn.config import Config
 from harn import ENV_DIRNAME
 from harn import gitutil
+from harn import prhost
 
 
 def _env(tmp_path):
@@ -103,3 +104,38 @@ def test_push_branch_non_repo_returns_false(tmp_path):
     d = tmp_path / "plain2"
     d.mkdir()
     assert gitutil.push_branch(d, "origin", "b") is False
+
+
+def test_gh_create_pr_builds_argv_and_parses_url(monkeypatch, tmp_path):
+    calls = {}
+    class R:
+        returncode = 0
+        stdout = "https://github.com/o/r/pull/42\n"
+        stderr = ""
+    def fake_run(argv, cwd=None, capture_output=True, text=True, timeout=None):
+        calls["argv"] = argv
+        return R()
+    monkeypatch.setattr(prhost.subprocess, "run", fake_run)
+    url = prhost.create_pr(tmp_path, base="dev", head="harn/PRJ-1",
+                           title="PRJ-1", body="did the thing")
+    assert url == "https://github.com/o/r/pull/42"
+    assert calls["argv"][:3] == ["gh", "pr", "create"]
+    assert "--base" in calls["argv"] and "dev" in calls["argv"]
+    assert "--head" in calls["argv"] and "harn/PRJ-1" in calls["argv"]
+
+
+def test_gh_create_pr_failure_returns_none(monkeypatch, tmp_path):
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: not authenticated"
+    monkeypatch.setattr(prhost.subprocess, "run",
+                        lambda *a, **k: R())
+    assert prhost.create_pr(tmp_path, base="main", head="h", title="t", body="b") is None
+
+
+def test_gh_create_pr_missing_binary_returns_none(monkeypatch, tmp_path):
+    def boom(*a, **k):
+        raise FileNotFoundError("gh")
+    monkeypatch.setattr(prhost.subprocess, "run", boom)
+    assert prhost.create_pr(tmp_path, base="main", head="h", title="t", body="b") is None
