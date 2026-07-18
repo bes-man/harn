@@ -819,6 +819,13 @@ def update_task_payload(env_dir: Path, payload: dict) -> dict:
         return {"ok": False, "error": f"no task {task_id}"}
     if "status" in payload:
         return {"ok": False, "error": "status is not editable here — use /api/tasks/status"}
+    if "workflow" in payload:
+        name = (payload.get("workflow") or "").strip()
+        slug = workflows_mod._slug(name) if name else None
+        if slug and not any(m["name"] == slug for m in workflows_mod.list_workflows(env_dir)):
+            return {"ok": False, "error": f"unknown workflow '{name}'"}
+        task.workflow = slug
+        task.workflow_confirmed = True
     if "title" in payload:
         title = (payload.get("title") or "").strip()
         if not title:
@@ -834,11 +841,6 @@ def update_task_payload(env_dir: Path, payload: dict) -> dict:
     if "labels" in payload:
         raw = payload.get("labels") or []
         task.labels = [str(x).strip() for x in raw if str(x).strip()]
-    if "workflow" in payload:
-        wf_result = set_task_workflow(env_dir, {"task_id": task_id, "workflow": payload.get("workflow") or ""})
-        if not wf_result.get("ok"):
-            return wf_result
-        task = tasks_mod.find(env_dir, task_id)   # set_task_workflow already saved
     tasks_mod._save(task)
     return {"ok": True, "task_id": task_id}
 

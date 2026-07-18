@@ -3,7 +3,7 @@ labels, comments, partial task updates, drag-triggered launch gating."""
 from __future__ import annotations
 
 from harn import config as config_mod
-from harn import studio, tasks, ENV_DIRNAME
+from harn import studio, tasks, workflows, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -143,3 +143,14 @@ def test_update_task_payload_priority_coerced_to_int(tmp_path):
     r = studio.update_task_payload(env, {"task_id": t.id, "priority": "5"})
     assert r["ok"] is True
     assert tasks.find(env, t.id).priority == 5
+
+
+def test_update_task_payload_combines_workflow_with_other_fields(tmp_path):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    workflows.create(env, name="qa", title="QA")
+    r = studio.update_task_payload(env, {"task_id": t.id, "title": "New Title", "workflow": "qa"})
+    assert r["ok"] is True
+    reloaded = tasks.find(env, t.id)
+    assert reloaded.title == "New Title"
+    assert reloaded.workflow == "qa"
