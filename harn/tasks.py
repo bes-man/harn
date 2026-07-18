@@ -169,6 +169,24 @@ class ChangeEntry:
 
 
 @dataclass
+class Comment:
+    """A human (or, later, tracker-sync-imported) comment on a task —
+    distinct from `ReviewEntry` (agent lifecycle events) and `Decision`
+    (agent claims). `kind` is one of human/hil/agent/external; `hil` is a
+    recorded human answer to a blocking question (see loop.answer), kept in
+    the same feed so the modal shows one merged conversation instead of
+    splitting it across the blocked-question banner and this section.
+    """
+    ts:     str
+    author: str
+    text:   str
+    kind:   str = "human"
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in vars(self).items() if v}
+
+
+@dataclass
 class Task:
     id:          str
     path:        Path          # the <id>.md file
@@ -199,6 +217,7 @@ class Task:
     # working tree to this point to redo the task from scratch.
     baseline_ref: str = ""
     review_log:  list[ReviewEntry] = field(default_factory=list)
+    comments:    list[Comment] = field(default_factory=list)
     # Raw text of the markdown "## Context" section (append-only capture of
     # streamed tool_result/message content — see `append_context`). Populated
     # only by a full load (`load_tasks`/`find`); empty for the lightweight
@@ -358,6 +377,7 @@ def to_dict(task: Task) -> dict:
         "changelog":   [c.to_dict() for c in task.changelog],
         "baseline_ref": task.baseline_ref,
         "review_log":  [e.to_dict() for e in task.review_log],
+        "comments":    [c.to_dict() for c in task.comments],
         "depends_on":  task.depends_on,
         "labels":      task.labels,
         "claimed_by":  task.claimed_by,
@@ -468,7 +488,7 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body.lstrip("\n")
 
 
-_KNOWN_SECTIONS = ("Description", "Result", "Decisions", "Review log", "Changelog")
+_KNOWN_SECTIONS = ("Description", "Result", "Decisions", "Review log", "Comments", "Changelog")
 _SECTION_HEADER_SET = {f"## {h}" for h in _KNOWN_SECTIONS}
 
 
@@ -520,12 +540,13 @@ def _render_bullets(entries: list) -> str:
 
 def _render_header(task: Task) -> str:
     """Everything except the (preserved-verbatim) Context body: frontmatter +
-    Description + Result + Decisions + Review log + Changelog + the bare
-    `## Context` heading."""
+    Description + Result + Decisions + Review log + Comments + Changelog +
+    the bare `## Context` heading."""
     parts = [_render_frontmatter(task), "", "## Description",
              task.description.strip(), "", "## Result", task.result.strip(),
              "", "## Decisions", _render_bullets(task.decisions),
              "", "## Review log", _render_bullets(task.review_log),
+             "", "## Comments", _render_bullets(task.comments),
              "", "## Changelog", _render_bullets(task.changelog),
              "", _CONTEXT_MARKER]
     return "\n".join(parts) + "\n"
@@ -548,6 +569,7 @@ def _build_task(path: Path, fm: dict, sections: dict, context_body: str,
                 state: dict) -> Task:
     decisions = [Decision(**json.loads(ln)) for ln in _bullets(sections.get("Decisions", ""))]
     review_log = [ReviewEntry(**json.loads(ln)) for ln in _bullets(sections.get("Review log", ""))]
+    comments = [Comment(**json.loads(ln)) for ln in _bullets(sections.get("Comments", ""))]
     changelog = [ChangeEntry(**json.loads(ln)) for ln in _bullets(sections.get("Changelog", ""))]
     subtasks = [
         Subtask(id=s.get("id", ""), title=s.get("title", ""),
@@ -569,6 +591,7 @@ def _build_task(path: Path, fm: dict, sections: dict, context_body: str,
         result=sections.get("Result", "").strip(),
         decisions=decisions,
         review_log=review_log,
+        comments=comments,
         changelog=changelog,
         context=context_body,
         epic=state.get("epic"),
@@ -1151,6 +1174,17 @@ def record_change(task: Task, summary: str, detail: str = "",
         fresh.changelog.append(entry)
         _save(fresh)
         task.changelog = fresh.changelog
+
+
+def add_comment(env_dir: Path, task: Task, text: str, *,
+                author: str = "user", kind: str = "human") -> None:
+    """Post a comment: append it to the task's `## Comments` section AND to
+    `## Context` (via `append_context`) so it's a real communication channel
+    — the next agent turn actually sees it, not just a UI log."""
+    task.comments.append(Comment(ts=_now_iso(), author=author, text=text, kind=kind))
+    _save(task)
+    append_context(env_dir, task.id, step_id="comment",
+                   text=f"[comment by {author}] {text}")
 
 
 def clear_scratchpad(task: Task) -> None:
