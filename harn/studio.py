@@ -1856,6 +1856,15 @@ _HTML = r"""<!DOCTYPE html>
   .insp{background:var(--panel);overflow:auto;padding:16px}
   .insp h2{font-size:13px;margin:0 0 4px;color:var(--muted);text-transform:uppercase;
     letter-spacing:.6px;font-weight:600}
+  /* Task 10: task detail moves from a persistent side panel to a modal —
+     .modal-panel adapts the .insp panel look (background/padding/overflow)
+     into a centered, width-capped, scrollable box over a dimmed backdrop. */
+  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);
+    display:flex;align-items:center;justify-content:center;z-index:50}
+  .modal-panel{background:var(--panel);overflow:auto;padding:16px;
+    width:min(640px,92vw);max-height:86vh;border-radius:12px;border:1px solid var(--line)}
+  .modal-panel h2{font-size:13px;margin:0 0 4px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.6px;font-weight:600}
   label{display:block;font-size:12px;color:var(--muted);margin:14px 0 5px}
   input[type=text],textarea,select{width:100%;background:var(--panel2);color:var(--text);
     border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;
@@ -2005,6 +2014,9 @@ _HTML = r"""<!DOCTYPE html>
     <div id="insp"><div class="empty">Select a node to edit it.</div></div>
   </div>
 </main>
+<div id="taskModal" class="modal-backdrop" style="display:none" onclick="if(event.target===this) closeTaskModal()">
+  <div class="modal-panel" id="taskDetailPanel"></div>
+</div>
 <script>
 const $=s=>document.querySelector(s);
 // Native macOS <select> popups do not reliably remain document.activeElement.
@@ -2320,10 +2332,10 @@ async function pollBoard(){
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
     // steal focus mid-typing. The next tick refreshes once the user is done.
     const detailChanged=boardDetailRenderKey()!==BOARD_DETAIL_RENDER_KEY;
-    if(detailChanged && pollingCanReplace($('#insp'))) renderTaskDetail();
+    if(detailChanged && pollingCanReplace($('#taskDetailPanel'))) renderTaskDetail();
   } else{
-    if(pollingCanReplace($('#insp'))){
-      boardSel=null; $('#insp').innerHTML='<div class="empty">Select a task.</div>';
+    if(pollingCanReplace($('#taskDetailPanel'))){
+      boardSel=null; $('#taskDetailPanel').innerHTML='<div class="empty">Select a task.</div>';
       BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey(); RENDERED_BOARD_DETAIL_TASK=null;
     }
   }
@@ -2450,7 +2462,16 @@ async function onColDrop(e,status){
   }
   await pollBoard();
 }
-function openTaskModal(id){ selectTask(id); }   // Task 9 replaces this with a real modal
+function openTaskModal(id){
+  selectTask(id);
+  $('#taskModal').style.display='flex';
+  document.addEventListener('keydown', _modalEscHandler);
+}
+function closeTaskModal(){
+  $('#taskModal').style.display='none';
+  document.removeEventListener('keydown', _modalEscHandler);
+}
+function _modalEscHandler(e){ if(e.key==='Escape') closeTaskModal(); }
 function showNewTaskForm(){
   NEW_TASK_OPEN=true;
   const wfOpts=(S.workflows||[]).map(w=>`<option value="${esc(w.name)}">${esc(w.title)}</option>`).join('');
@@ -2498,7 +2519,7 @@ function renderPipelineDots(t){
 }
 function renderTaskDetail(){
   const t=(BOARD.tasks||[]).find(x=>x.id===boardSel);
-  const panel=$('#insp');
+  const panel=$('#taskDetailPanel');
   const sameTask=!!(t&&RENDERED_BOARD_DETAIL_TASK===t.id);
   const panelScroll=sameTask?panel.scrollTop:0;
   const previousReview=sameTask?$('#reviewLog'):null;
@@ -2540,10 +2561,13 @@ function renderTaskDetail(){
   panel.innerHTML=`
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">${esc(t.id)}</h2>
-      <select onchange="changeTaskStatus('${esc(t.id)}',this.value)" style="color:${statusColor};border-color:${statusColor};background:transparent">
-        ${BOARD_ORDER.map(s=>
-          `<option value="${s}" ${t.status===s?'selected':''}>${esc(s)}</option>`).join('')}
-      </select>
+      <div class="row" style="gap:8px">
+        <select onchange="changeTaskStatus('${esc(t.id)}',this.value)" style="color:${statusColor};border-color:${statusColor};background:transparent">
+          ${BOARD_ORDER.map(s=>
+            `<option value="${s}" ${t.status===s?'selected':''}>${esc(s)}</option>`).join('')}
+        </select>
+        <button class="icon-btn" onclick="closeTaskModal()" title="Close">✕</button>
+      </div>
     </div>
     <div class="taskTitle">${esc(t.title)}</div>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>

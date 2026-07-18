@@ -720,7 +720,7 @@ def test_polling_dom_replacement_stops_for_any_document_selection():
     board = html[html.index("async function pollBoard()"):
                  html.index("let BLOCKED_Q_TASK")]
     assert "pollingCanReplace($('#listView'))" in board
-    assert "pollingCanReplace($('#insp'))" in board
+    assert "pollingCanReplace($('#taskDetailPanel'))" in board
 
 
 def test_run_sidebar_preserves_nested_transcript_scroll():
@@ -758,7 +758,7 @@ def test_every_poll_driven_form_render_has_editing_guard():
                  html.index("let BLOCKED_Q_TASK")]
     assert "if(RUN_HISTORY_OPEN && tab==='flow')" in board
     assert "pollingCanReplace($('#listView'))" in board
-    assert "pollingCanReplace($('#insp'))" in board
+    assert "pollingCanReplace($('#taskDetailPanel'))" in board
     blocked = html[html.index("async function pollBlockedQuestion()"):
                    html.index("async function submitAnswer")]
     assert "if(!pollingCanReplace(el)) return" in blocked

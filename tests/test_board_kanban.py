@@ -229,3 +229,9 @@ def test_dropdown_status_change_still_launches_unconditionally(tmp_path, monkeyp
     r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
     assert r["ok"] is True
     assert launched["n"] == 1
+
+
+def test_studio_html_has_task_modal_shell():
+    assert 'id="taskModal"' in studio._HTML
+    assert "function openTaskModal" in studio._HTML
+    assert "function closeTaskModal" in studio._HTML
