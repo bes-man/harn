@@ -40,3 +40,75 @@ def test_delete_removes_role(tmp_path):
     assert roles.delete(env, "dev") is True
     assert roles.find(env, "dev") is None
     assert roles.delete(env, "dev") is False   # already gone
+
+
+def test_generate_validates_against_catalogs(tmp_path, monkeypatch):
+    from harn import agentgen, skills, tools
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    (env / "skills" / "standards").mkdir(parents=True)
+    (env / "skills" / "standards" / "SKILL.md").write_text(
+        "---\nname: standards\ndescription: d\n---\nbody", encoding="utf-8")
+
+    import json as _json
+    reply = _json.dumps({
+        "role": {"name": "triager", "status": "todo", "next_status": "done",
+                 "oracle": True, "body": "You triage."},
+        "workflow": {"nodes": [
+            {"kind": "step", "title": "Read", "required": ["standards", "ghost_skill"],
+             "tools": ["nonexistent_tool"]}]},
+    })
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None, temperature=None):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "an agent that triages bug reports")
+    assert out["role"]["name"] == "triager"
+    # ghost_skill / nonexistent_tool are not in the catalog → dropped
+    step = out["workflow"]["nodes"][0]
+    assert step["required"] == ["standards"]
+    assert step["tools"] == []
+    assert "ghost_skill" in out["dropped"] and "nonexistent_tool" in out["dropped"]
+
+
+def test_generate_unknown_status_falls_back_to_first(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    import json as _json
+    reply = _json.dumps({"role": {"name": "x", "status": "bogus", "body": "b"},
+                         "workflow": {"nodes": []}})
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    assert out["role"]["status"] == "todo"   # first of default lifecycle
+
+
+def test_generate_malformed_reply_never_raises(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text="not json at all")
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    assert isinstance(out, dict) and "role" in out and "workflow" in out
