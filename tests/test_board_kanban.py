@@ -87,3 +87,17 @@ def test_hil_answer_recorded_as_comment(tmp_path):
     loop.answer(env, "use postgres", source="telegram")
     reloaded = tasks.find(env, t.id)
     assert any(c.kind == "hil" and c.text == "use postgres" for c in reloaded.comments)
+
+
+def test_launch_on_drag_in_progress_defaults_false(tmp_path):
+    env = _env(tmp_path)
+    cfg = config_mod.Config.load(env)
+    assert cfg.launch_on_drag_in_progress is False
+
+
+def test_launch_on_drag_in_progress_true_from_toml(tmp_path):
+    env = _env(tmp_path)
+    (env / "harn.toml").write_text(
+        "[board]\nlaunch_on_drag_in_progress = true\n", encoding="utf-8")
+    cfg = config_mod.Config.load(env)
+    assert cfg.launch_on_drag_in_progress is True

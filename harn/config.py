@@ -219,6 +219,11 @@ class Config:
     # Custom board pipeline (see `_parse_board_statuses`). Empty list = fall
     # back to the built-in five-status lifecycle everywhere.
     board_statuses: list = field(default_factory=list)
+    # Kanban drag-drop: does dropping a card into in_progress launch a run
+    # (today's <select>-driven behavior) or only change status, leaving
+    # Launch as an explicit action in the task modal? Default false — a
+    # drag should not have a launch side effect unless a project opts in.
+    launch_on_drag_in_progress: bool = False
     raw: dict = field(default_factory=dict)
 
     @property
@@ -280,6 +285,9 @@ class Config:
             ),
             log_changes=bool(data.get("log", {}).get("changes", True)),
             board_statuses=_parse_board_statuses(data.get("board", {}) or {}),
+            launch_on_drag_in_progress=bool(
+                (data.get("board", {}) or {}).get("launch_on_drag_in_progress", False)
+            ),
             max_cost_usd=_nonneg_float(data["loop"].get("max_cost_usd", 3.0)),
             max_tokens=_nonneg_int(data["loop"].get("max_tokens", 400000)),
             turn_timeout_seconds=_nonneg_int(data["loop"].get("turn_timeout_seconds", 1800)),
