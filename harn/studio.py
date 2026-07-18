@@ -2517,6 +2517,20 @@ function renderPipelineDots(t){
     return `<span class="pdot ${cls}">${esc(id)}</span>`;
   }).join('');
 }
+function renderActivityFeed(t){
+  const items=[
+    ...(t.review_log||[]).map(e=>({ts:e.ts,kind:'agent',
+      text:`${e.event}${e.by?' by '+e.by:e.agent?' ('+e.agent+')':''}${e.summary?': '+e.summary:''}${e.comment?': '+e.comment:''}${e.notes?' — '+e.notes:''}`})),
+    ...(t.comments||[]).map(c=>({ts:c.ts,kind:c.kind,author:c.author,text:c.text})),
+  ].sort((a,b)=>(a.ts||'').localeCompare(b.ts||''));
+  if(!items.length) return '<span class="mut">no activity yet</span>';
+  const KIND_BADGE={agent:'🤖',human:'💬',hil:'📩',external:'🔗'};
+  return items.map(i=>
+    `<div class="activity-item"><span class="kind-badge" title="${esc(i.kind)}">${KIND_BADGE[i.kind]||'•'}</span>`+
+    `<span class="mut" style="font-size:11px">${esc(i.ts||'')}${i.author?' · '+esc(i.author):''}</span>`+
+    `<div>${esc(i.text)}</div></div>`
+  ).join('');
+}
 function renderTaskDetail(){
   const t=(BOARD.tasks||[]).find(x=>x.id===boardSel);
   const panel=$('#taskDetailPanel');
@@ -2531,9 +2545,6 @@ function renderTaskDetail(){
     `<option value="${esc(w.name)}" ${(t.workflow||'default')===w.name?'selected':''}>${esc(w.title)}</option>`).join('');
   const statusColor={todo:'var(--muted)',in_progress:'var(--accent)',review:'var(--accent2)',
     changes_requested:'var(--warn)',done:'var(--accent2)'}[t.status]||'var(--muted)';
-  const reviewLog=(t.review_log||[]).map(e=>
-    `${e.ts||''} ${e.event}${e.by?' by '+e.by:e.agent?' ('+e.agent+')':''}${e.summary?': '+e.summary:''}${e.comment?': '+e.comment:''}${e.notes?' — '+e.notes:''}`
-  ).join('\n') || '(none yet)';
   const decisions=(t.decisions||[]).map(d=>
     `<span class="chip" title="${esc(d.rationale||'')}">${esc(d.decision)}</span>`).join('') || '<span class="mut">none yet</span>';
   const attHtml=(t.attachments||[]).length
@@ -2606,8 +2617,12 @@ function renderTaskDetail(){
     <div class="toolDoc">${esc(t.scratchpad||'(empty)')}</div>
     <label>Decisions <span class="mut">(claims the oracle verifies)</span></label>
     <div class="skillgrid">${decisions}</div>
-    <label>Review log</label>
-    <div class="toolDoc" id="reviewLog" style="max-height:160px;overflow:auto;user-select:text">${esc(reviewLog)}</div>
+    <label>Activity</label>
+    <div class="toolDoc" id="reviewLog" style="max-height:220px;overflow:auto;user-select:text">${renderActivityFeed(t)}</div>
+    <div class="row" style="gap:6px;margin-top:6px">
+      <input type="text" id="commentInput" placeholder="Add a comment…" style="flex:1"/>
+      <button class="ghost" onclick="postComment('${esc(t.id)}')">Post</button>
+    </div>
     ${running?`<label>Run log <span class="mut">(live stdout/stderr tail)</span></label><div class="toolDoc runlog">${esc(BOARD.run_log||'(starting…)')}</div>`:''}
   `;
   if(sameTask){
@@ -2617,6 +2632,15 @@ function renderTaskDetail(){
   }
   RENDERED_BOARD_DETAIL_TASK=t.id;
   BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey();
+}
+async function postComment(taskId){
+  const box=$('#commentInput');
+  const text=box?box.value.trim():'';
+  if(!text) return;
+  const r=await post_('/api/tasks/comment',{task_id:taskId,text});
+  if(!r.ok){ alert(r.error||'comment failed'); return; }
+  if(box) box.value='';
+  await pollBoard();
 }
 async function assignWorkflow(taskId,name){
   await fetch(api('/api/tasks/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
