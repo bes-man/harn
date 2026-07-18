@@ -373,27 +373,46 @@ def delete_patch_ref(cwd: Path, task_id: str, name: str) -> None:
 
 def commit_to_branch(cwd: Path, branch: str, message: str,
                      exclude: tuple[str, ...] = ()) -> str | None:
-    """Create/checkout `branch` from HEAD, stage the working-tree changes
-    (minus `exclude` pathspecs), commit, return the commit sha. Returns None
-    (touching nothing) if not a repo, nothing to commit, or any git step
-    fails — harn's ONLY commit path, opt-in per role."""
+    """Stage the working-tree changes (minus `exclude` pathspecs) and, only if
+    there's something to commit, create/checkout `branch` from HEAD and commit
+    there. Returns the commit sha, or None (touching nothing beyond staging)
+    if not a repo, nothing to commit, or any git step fails — harn's ONLY
+    commit path, opt-in per role.
+
+    HEAD is always restored to the branch this was called on: on success the
+    commit lands on `branch` (which push_branch then pushes) while HEAD moves
+    back to the original branch; on failure the branch switch (if any) is
+    undone and a branch we created is deleted. This is a tool touching the
+    human's real working repo (not an isolated worktree) — it must never
+    leave the caller on a surprise branch."""
     if not is_repo(cwd) or not branch:
         return None
-    # branch may already exist (a re-run) — checkout if so, else create.
-    if _run(["rev-parse", "--verify", "--quiet", branch], cwd)[0] == 0:
-        if _run(["checkout", branch], cwd)[0] != 0:
-            return None
-    elif _run(["checkout", "-b", branch], cwd)[0] != 0:
-        return None
+    code, orig, _ = _run(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    orig = orig if code == 0 and orig else None
     pathspec = [".", *[f":(exclude){p}" for p in exclude]]
     _run(["add", "-A", "--", *pathspec], cwd)
-    # nothing staged → nothing to commit
+    # nothing staged → nothing to commit; don't create/switch a branch.
     if _run(["diff", "--cached", "--quiet"], cwd)[0] == 0:
         return None
-    if _run(["commit", "-m", message], cwd)[0] != 0:
-        return None
-    code, out, _ = _run(["rev-parse", "HEAD"], cwd)
-    return out if code == 0 else None
+    # branch may already exist (a re-run) — checkout if so, else create.
+    branch_existed = _run(["rev-parse", "--verify", "--quiet", branch], cwd)[0] == 0
+    if branch_existed:
+        switched = _run(["checkout", branch], cwd)[0] == 0
+    else:
+        switched = _run(["checkout", "-b", branch], cwd)[0] == 0
+    if not switched:
+        return None  # never left orig branch; staged index remains, harmless
+    sha = None
+    if _run(["commit", "-m", message], cwd)[0] == 0:
+        code, out, _ = _run(["rev-parse", "HEAD"], cwd)
+        sha = out if code == 0 else None
+    # Restore HEAD to the original branch on every path past the checkout:
+    # success leaves the commit safely on `branch`; failure undoes the switch.
+    if orig:
+        _run(["checkout", orig], cwd)
+    if sha is None and not branch_existed:
+        _run(["branch", "-D", branch], cwd)
+    return sha
 
 
 def push_branch(cwd: Path, remote: str, branch: str) -> bool:

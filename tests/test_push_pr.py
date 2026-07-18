@@ -50,11 +50,11 @@ def test_commit_to_branch_commits_working_tree_changes(tmp_path):
     (repo / "new.txt").write_text("new\n", encoding="utf-8")
     sha = gitutil.commit_to_branch(repo, "harn/PRJ-1", "work on PRJ-1")
     assert sha
-    # on the new branch, both changes committed
+    # HEAD is restored to the original branch; the commit lives on harn/PRJ-1.
     branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
                             cwd=repo, capture_output=True, text=True).stdout.strip()
-    assert branch == "harn/PRJ-1"
-    log = subprocess.run(["git", "log", "--oneline", "-1"], cwd=repo,
+    assert branch != "harn/PRJ-1"
+    log = subprocess.run(["git", "log", "harn/PRJ-1", "--oneline", "-1"], cwd=repo,
                         capture_output=True, text=True).stdout
     assert "work on PRJ-1" in log
 
@@ -68,6 +68,35 @@ def test_commit_to_branch_non_repo_returns_none(tmp_path):
     d = tmp_path / "plain"
     d.mkdir()
     assert gitutil.commit_to_branch(d, "b", "m") is None
+
+
+def test_commit_to_branch_nothing_to_commit_leaves_original_branch(tmp_path):
+    repo = _repo(tmp_path)
+    orig = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                          cwd=repo, capture_output=True, text=True).stdout.strip()
+    assert gitutil.commit_to_branch(repo, "harn/PRJ-X", "noop") is None
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                            cwd=repo, capture_output=True, text=True).stdout.strip()
+    assert branch == orig
+    assert subprocess.run(["git", "rev-parse", "--verify", "harn/PRJ-X"],
+                          cwd=repo, capture_output=True).returncode != 0
+
+
+def test_commit_to_branch_success_restores_original_branch(tmp_path):
+    repo = _repo(tmp_path)
+    orig = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                          cwd=repo, capture_output=True, text=True).stdout.strip()
+    (repo / "a.txt").write_text("changed\n", encoding="utf-8")
+    sha = gitutil.commit_to_branch(repo, "harn/PRJ-X", "work on PRJ-X")
+    assert sha
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                            cwd=repo, capture_output=True, text=True).stdout.strip()
+    assert branch == orig
+    assert subprocess.run(["git", "rev-parse", "--verify", "harn/PRJ-X"],
+                          cwd=repo, capture_output=True).returncode == 0
+    log = subprocess.run(["git", "log", "harn/PRJ-X", "--oneline"], cwd=repo,
+                        capture_output=True, text=True).stdout
+    assert "work on PRJ-X" in log
 
 
 def test_push_branch_non_repo_returns_false(tmp_path):
