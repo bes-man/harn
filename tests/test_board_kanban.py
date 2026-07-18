@@ -190,3 +190,42 @@ def test_studio_html_has_dragging_guard_in_poll_board():
     assert "let DRAGGING" in studio._HTML or "var DRAGGING" in studio._HTML
     assert "onColDrop" in studio._HTML
     assert "/api/tasks/status" in studio._HTML   # drop still uses the existing route
+
+
+def test_drag_drop_into_in_progress_only_launches_when_setting_enabled(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
+    launched = {"n": 0}
+    def fake_launch(pr, ed, task_id, *, auto=False):
+        launched["n"] += 1
+        return {"ok": True, "pid": 1, "task_id": task_id, "auto": auto}
+    monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
+
+    r = studio.set_task_status_payload(
+        env, {"task_id": t.id, "status": "in_progress", "source": "drag"})
+    assert r["ok"] is True
+    assert launched["n"] == 0          # default false: no launch
+    assert tasks.find(env, t.id).status == "in_progress"
+
+    (env / "harn.toml").write_text(
+        "[board]\nlaunch_on_drag_in_progress = true\n", encoding="utf-8")
+    t2 = tasks.create_task(env, "T2")
+    studio.set_task_workflow(env, {"task_id": t2.id, "workflow": ""})
+    r2 = studio.set_task_status_payload(
+        env, {"task_id": t2.id, "status": "in_progress", "source": "drag"})
+    assert r2["ok"] is True
+    assert launched["n"] == 1          # now enabled: launches
+
+
+def test_dropdown_status_change_still_launches_unconditionally(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "T")
+    studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
+    launched = {"n": 0}
+    monkeypatch.setattr(studio.runner_mod, "launch",
+                        lambda pr, ed, tid, *, auto=False: launched.update(n=1) or
+                        {"ok": True, "pid": 1, "task_id": tid, "auto": auto})
+    r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
+    assert r["ok"] is True
+    assert launched["n"] == 1

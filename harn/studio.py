@@ -902,7 +902,9 @@ def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
     active = runner_mod.active(env_dir)
     if active and active.get("task_id") == task_id:
         return {"ok": False, "error": "a run is active for this task — stop it first"}
-    if new_status == tasks_mod.IN_PROGRESS:
+    if new_status == tasks_mod.IN_PROGRESS and (
+        payload.get("source") != "drag" or Config.load(env_dir).launch_on_drag_in_progress
+    ):
         if not task.workflow_confirmed:
             return {"ok": False,
                     "error": "pick a flow for this task before starting it"}
@@ -2439,7 +2441,7 @@ async function onColDrop(e,status){
   const priorStatus=t.status;
   t.status=status;             // optimistic move
   renderBoard();
-  const r=await post_('/api/tasks/status',{task_id:taskId,status});
+  const r=await post_('/api/tasks/status',{task_id:taskId,status,source:'drag'});
   if(!r.ok){
     t.status=priorStatus;      // roll back
     renderBoard();
