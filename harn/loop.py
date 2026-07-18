@@ -2851,6 +2851,29 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
                 reconcile_headless(env_dir, cfg, t, project_root)
                 reconciled.add(t.id)
 
+        # 4) Agent-role triggers (companion spec): Telegram slash commands +
+        #    status-watch auto mode. Both converge on triggers.dispatch_command
+        #    (Telegram) / triggers.auto_scan (auto), which both ultimately
+        #    call roles_runner.run_role — same as the HTTP API route.
+        from . import roles as roles_mod, triggers as triggers_mod
+        if roles_mod.discover(env_dir):
+            tg = TelegramHIL.from_env(env_dir)
+            if tg:
+                for cmd in tg.poll_commands(state_dir):
+                    parsed = triggers_mod.parse_command(cmd["text"])
+                    if not parsed:
+                        continue
+                    command, arg = parsed
+                    result = triggers_mod.dispatch_command(
+                        project_root, env_dir, command, arg, cfg=cfg)
+                    reply_text = (
+                        f"✅ {result.get('task_id', '')}: {result.get('status', '')}"
+                        if result.get("ok")
+                        else f"❌ {result.get('error', 'run failed')}"
+                    )
+                    tg.send(reply_text)
+            triggers_mod.auto_scan(project_root, env_dir, cfg=cfg)
+
         if _once:
             return
         _sleep(poll_s)

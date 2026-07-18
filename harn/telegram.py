@@ -27,7 +27,55 @@ from pathlib import Path
 _OFFSET_FILE = ".telegram_offset"
 _GRACE_POLL_SEC = 2  # how often to check the local channel during chat grace
 _AUTO_CALLBACK = "harn_auto"  # callback_data for the "Decide for me" button
+_CREDENTIALS_FILE = "telegram_credentials.json"
 _warned: set[str] = set()
+
+
+def _credentials_path(env_dir: Path) -> Path:
+    return env_dir / "state" / _CREDENTIALS_FILE
+
+
+def load_credentials(env_dir: Path | None = None) -> tuple[str, str]:
+    """Load Telegram credentials, preferring process environment overrides."""
+    token = (os.environ.get("HARN_TELEGRAM_BOT_TOKEN") or "").strip()
+    user_id = (os.environ.get("HARN_TELEGRAM_CHAT_ID") or "").strip()
+    if env_dir is not None and (not token or not user_id):
+        try:
+            saved = json.loads(_credentials_path(env_dir).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            saved = {}
+        token = token or str(saved.get("api_key") or "").strip()
+        user_id = user_id or str(saved.get("user_id") or "").strip()
+    return token, user_id
+
+
+def save_credentials(env_dir: Path, api_key: str, user_id: str) -> None:
+    """Persist local Studio credentials with owner-only file permissions.
+
+    Blank values keep their existing counterpart, so saving unrelated Settings
+    never erases a token that the UI intentionally does not read back.
+    """
+    old_key, old_user = load_credentials(env_dir)
+    data = {
+        "api_key": (api_key or "").strip() or old_key,
+        "user_id": (user_id or "").strip() or old_user,
+    }
+    path = _credentials_path(env_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    if env_dir.name == "harn_env":
+        ignore = env_dir.parent / ".gitignore"
+        entry = "harn_env/state/telegram_credentials.json"
+        existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+        if entry not in existing.splitlines():
+            prefix = existing.rstrip("\n")
+            ignore.write_text(
+                (prefix + "\n" if prefix else "") + entry + "\n",
+                encoding="utf-8")
 
 
 def _format_card(task_id: str | None, emoji: str, status: str,
@@ -98,9 +146,8 @@ class TelegramHIL:
 
     # --- construction ---
     @classmethod
-    def from_env(cls) -> "TelegramHIL | None":
-        token = (os.environ.get("HARN_TELEGRAM_BOT_TOKEN") or "").strip()
-        chat_id = (os.environ.get("HARN_TELEGRAM_CHAT_ID") or "").strip()
+    def from_env(cls, env_dir: Path | None = None) -> "TelegramHIL | None":
+        token, chat_id = load_credentials(env_dir)
         if not token or not chat_id:
             return None
         return cls(token=token, chat_id=chat_id)
@@ -227,6 +274,31 @@ class TelegramHIL:
                     continue
             return text
         return None
+
+    def poll_commands(self, state_dir: Path) -> list[dict]:
+        """Non-blocking drain of new updates (timeout=0), returning every
+        `/command …` text message from the trusted chat (see the chat_id
+        check in `_reply_from_updates` — same trust boundary, same offset
+        file, so this and `await_answer` never reprocess each other's
+        updates). Used by `harn watch`'s per-tick trigger scan (agent-
+        triggers spec) — commands from any other chat are silently ignored,
+        and non-command text (HIL answers) is left for `await_answer`.
+        """
+        offset = self._load_offset(state_dir)
+        offset, updates = self._get_updates(offset, poll_timeout=0)
+        self._save_offset(state_dir, offset)
+        out: list[dict] = []
+        for upd in updates:
+            msg = upd.get("message") or {}
+            if str(msg.get("chat", {}).get("id")) != str(self.chat_id):
+                continue
+            if (msg.get("from") or {}).get("is_bot"):
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+            out.append({"text": text, "message_id": msg.get("message_id")})
+        return out
 
     def await_answer(
         self,

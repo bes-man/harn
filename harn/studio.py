@@ -930,6 +930,16 @@ def save_task_plan_route(env_dir: Path, payload: dict) -> dict:
     return {"ok": True, "plan": plan}
 
 
+def run_agent_payload(env_dir: Path, payload: dict) -> dict:
+    """`POST /api/agents/run` — body `{"name": <role>, "task_id": ...}` or
+    `{"name": <role>, "text": ...}`. Localhost-only like the rest of Studio;
+    shares the exact code path a Telegram `/<command>` uses (see
+    triggers.run_agent_payload / dispatch_command) — the door for external
+    systems too (agent-triggers spec)."""
+    from . import triggers as triggers_mod
+    return triggers_mod.run_agent_payload(env_dir.parent, env_dir, payload)
+
+
 def launch_task(env_dir: Path, payload: dict) -> dict:
     """Start a background `harn run --task <id>` for one task (see runner.py —
     single-runner-at-a-time; refuses if a run is already active)."""
@@ -1312,6 +1322,8 @@ def _make_handler(default_env: Path):
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/launch":
                 self._json(launch_task(env, body))
+            elif route == "/api/agents/run":
+                self._json(run_agent_payload(env, body))
             elif route == "/api/tasks/launch_workflow":
                 self._json(launch_workflow(env, body))
             elif route == "/api/tasks/stop":
