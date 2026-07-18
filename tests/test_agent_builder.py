@@ -188,6 +188,56 @@ def test_generate_non_list_nodes_never_raises(tmp_path, monkeypatch):
     assert out["workflow"]["nodes"] == []
 
 
+def test_generate_node_missing_title_gets_default(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    import json as _json
+    reply = _json.dumps({
+        "role": {"name": "x", "status": "todo", "body": "b"},
+        "workflow": {"nodes": [
+            {"kind": "step", "body": "do x", "required": [], "tools": []}]},
+    })
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    step = out["workflow"]["nodes"][0]
+    assert isinstance(step["title"], str) and step["title"].strip() != ""
+    assert isinstance(step["body"], str)
+
+
+def test_generate_node_nonstring_title_coerced(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    import json as _json
+    reply = _json.dumps({
+        "role": {"name": "x", "status": "todo", "body": "b"},
+        "workflow": {"nodes": [
+            {"kind": "step", "title": 123, "body": "do y", "required": [], "tools": []}]},
+    })
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    step = out["workflow"]["nodes"][0]
+    assert isinstance(step["title"], str)
+    assert step["title"] == "123"
+
+
 def test_agents_payload_lists_and_save_delete_roundtrip(tmp_path):
     from harn import studio
     env = tmp_path / ENV_DIRNAME

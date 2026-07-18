@@ -85,7 +85,12 @@ def generate(env_dir: Path, cfg, description: str) -> dict:
         tools_list = tools_raw if isinstance(tools_raw, list) else []
         tl = [t for t in tools_list if t in known_tools]
         dropped += [t for t in tools_list if t not in known_tools]
-        clean_nodes.append({**n, "kind": "step", "required": req, "tools": tl})
+        title = str(n.get("title") or "").strip()
+        if not title:
+            title = f"Step {len(clean_nodes) + 1}"
+        body = str(n.get("body") or "")
+        clean_nodes.append({"kind": "step", "title": title, "body": body,
+                            "required": req, "tools": tl})
 
     return {"role": role, "workflow": {"nodes": clean_nodes},
             "dropped": sorted(set(dropped))}
