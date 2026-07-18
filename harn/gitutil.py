@@ -369,3 +369,35 @@ def clear_patch_refs(cwd: Path, task_id: str) -> None:
 def delete_patch_ref(cwd: Path, task_id: str, name: str) -> None:
     if is_repo(cwd):
         _run(["update-ref", "-d", f"refs/harn/patches/{task_id}/{name}"], cwd)
+
+
+def commit_to_branch(cwd: Path, branch: str, message: str,
+                     exclude: tuple[str, ...] = ()) -> str | None:
+    """Create/checkout `branch` from HEAD, stage the working-tree changes
+    (minus `exclude` pathspecs), commit, return the commit sha. Returns None
+    (touching nothing) if not a repo, nothing to commit, or any git step
+    fails — harn's ONLY commit path, opt-in per role."""
+    if not is_repo(cwd) or not branch:
+        return None
+    # branch may already exist (a re-run) — checkout if so, else create.
+    if _run(["rev-parse", "--verify", "--quiet", branch], cwd)[0] == 0:
+        if _run(["checkout", branch], cwd)[0] != 0:
+            return None
+    elif _run(["checkout", "-b", branch], cwd)[0] != 0:
+        return None
+    pathspec = [".", *[f":(exclude){p}" for p in exclude]]
+    _run(["add", "-A", "--", *pathspec], cwd)
+    # nothing staged → nothing to commit
+    if _run(["diff", "--cached", "--quiet"], cwd)[0] == 0:
+        return None
+    if _run(["commit", "-m", message], cwd)[0] != 0:
+        return None
+    code, out, _ = _run(["rev-parse", "HEAD"], cwd)
+    return out if code == 0 else None
+
+
+def push_branch(cwd: Path, remote: str, branch: str) -> bool:
+    """Push `branch` to `remote` (best-effort). Returns success."""
+    if not is_repo(cwd) or not remote or not branch:
+        return False
+    return _run(["push", "-u", remote, branch], cwd, timeout=60)[0] == 0
