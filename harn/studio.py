@@ -2081,7 +2081,7 @@ function pollingCanReplace(el){
 document.addEventListener('pointerdown',event=>{
   const target=event.target;
   if(!target||!target.closest||target.closest(FORM_CONTROL_SELECTOR+',button')) return;
-  ACTIVE_TEXT_DRAG_PANEL=target.closest('#listView,#insp');
+  ACTIVE_TEXT_DRAG_PANEL=target.closest('#listView,#insp,#taskDetailPanel');
 },true);
 document.addEventListener('pointerup',()=>{
   setTimeout(()=>{ ACTIVE_TEXT_DRAG_PANEL=null; },0);
@@ -2502,7 +2502,7 @@ async function submitNewTask(){
   if(!r.ok){ alert(r.error||'create failed'); return; }
   closeNewTaskForm();
   await pollBoard();
-  selectTask(r.task_id);
+  openTaskModal(r.task_id);
 }
 function renderPipelineDots(t){
   const running=BOARD.run&&BOARD.run.task_id===t.id;
