@@ -112,3 +112,54 @@ def test_generate_malformed_reply_never_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
     out = agentgen.generate(env, Config(), "desc")
     assert isinstance(out, dict) and "role" in out and "workflow" in out
+
+
+def test_generate_non_dict_role_never_raises(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    import json as _json
+    reply = _json.dumps({"role": "triager", "workflow": {"nodes": []}})
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    assert isinstance(out, dict) and "role" in out
+    assert out["role"]["name"] == "agent"   # fell back to default since role was a string
+
+
+def test_generate_string_required_field_is_dropped_cleanly(tmp_path, monkeypatch):
+    from harn import agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    (env / "skills" / "standards").mkdir(parents=True)
+    (env / "skills" / "standards" / "SKILL.md").write_text(
+        "---\nname: standards\ndescription: d\n---\nbody", encoding="utf-8")
+
+    import json as _json
+    reply = _json.dumps({
+        "role": {"name": "x", "status": "todo", "body": "b"},
+        "workflow": {"nodes": [
+            {"kind": "step", "title": "Read", "required": "standards", "tools": 5}]},
+    })
+
+    class FakeAdapter:
+        name = "fake"
+        def available(self): return True
+        def run_turn(self, *a, **k):
+            from harn.adapters.base import AgentResult
+            return AgentResult(ok=True, text=reply)
+    monkeypatch.setattr(agentgen.loop_mod, "get_adapter", lambda n: FakeAdapter())
+    out = agentgen.generate(env, Config(), "desc")
+    step = out["workflow"]["nodes"][0]
+    assert step["required"] == []
+    assert step["tools"] == []
+    for ch in ("s", "t", "a", "n", "d"):
+        assert ch not in out["dropped"]

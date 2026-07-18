@@ -62,7 +62,8 @@ def generate(env_dir: Path, cfg, description: str) -> dict:
     except Exception:
         draft = {}
 
-    role = dict(draft.get("role") or {})
+    role_raw = draft.get("role")
+    role = dict(role_raw) if isinstance(role_raw, dict) else {}
     role.setdefault("name", "agent")
     if role.get("status") not in statuses:
         role["status"] = statuses[0] if statuses else "todo"
@@ -75,10 +76,14 @@ def generate(env_dir: Path, cfg, description: str) -> dict:
     for n in (nodes or []):
         if not isinstance(n, dict):
             continue
-        req = [s for s in (n.get("required") or []) if s in known_skills]
-        dropped += [s for s in (n.get("required") or []) if s not in known_skills]
-        tl = [t for t in (n.get("tools") or []) if t in known_tools]
-        dropped += [t for t in (n.get("tools") or []) if t not in known_tools]
+        req_raw = n.get("required")
+        req_list = req_raw if isinstance(req_raw, list) else []
+        req = [s for s in req_list if s in known_skills]
+        dropped += [s for s in req_list if s not in known_skills]
+        tools_raw = n.get("tools")
+        tools_list = tools_raw if isinstance(tools_raw, list) else []
+        tl = [t for t in tools_list if t in known_tools]
+        dropped += [t for t in tools_list if t not in known_tools]
         clean_nodes.append({**n, "kind": "step", "required": req, "tools": tl})
 
     return {"role": role, "workflow": {"nodes": clean_nodes},
