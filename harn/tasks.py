@@ -207,6 +207,7 @@ class Task:
     # Parallelism: ids this task waits on (only runnable once all are `done`),
     # and the worker that currently owns it (set on atomic claim).
     depends_on:  list[str] = field(default_factory=list)
+    labels:      list[str] = field(default_factory=list)
     claimed_by:  str | None = None
     claimed_at:  str = ""
     # Clarification funnel: set once planning has narrowed the task to a
@@ -358,6 +359,7 @@ def to_dict(task: Task) -> dict:
         "baseline_ref": task.baseline_ref,
         "review_log":  [e.to_dict() for e in task.review_log],
         "depends_on":  task.depends_on,
+        "labels":      task.labels,
         "claimed_by":  task.claimed_by,
         "claimed_at":  task.claimed_at,
         "spec_locked": task.spec_locked,
@@ -376,7 +378,7 @@ def to_dict(task: Task) -> dict:
 _CONTEXT_MARKER = "## Context"
 _CONTEXT_MARKER_LINE = f"\n{_CONTEXT_MARKER}\n"
 _FRONTMATTER_FIELDS = ("id", "title", "status", "priority", "workflow",
-                       "prds", "depends_on", "external")
+                       "prds", "depends_on", "external", "labels")
 
 
 def _state_path(md_path: Path) -> Path:
@@ -407,7 +409,7 @@ def _render_frontmatter(task: Task) -> str:
         "id": task.id, "title": task.title, "status": task.status,
         "priority": task.priority, "workflow": task.workflow,
         "prds": task.prds, "depends_on": task.depends_on,
-        "external": task.external,
+        "external": task.external, "labels": task.labels,
     }
     lines = ["---"]
     for k in _FRONTMATTER_FIELDS:
@@ -560,6 +562,7 @@ def _build_task(path: Path, fm: dict, sections: dict, context_body: str,
         priority=int(fm.get("priority") or 100),
         prds=list(fm.get("prds") or []),
         depends_on=list(fm.get("depends_on") or []),
+        labels=list(fm.get("labels") or []),
         workflow=fm.get("workflow") or None,
         external=fm.get("external") or None,
         description=sections.get("Description", "").strip(),
@@ -972,6 +975,7 @@ def create_task(
     task_id: str | None = None,
     id_prefix: str = "PRJ",
     depends_on: list[str] | None = None,
+    labels: list[str] | None = None,
     workflow: str | None = None,
 ) -> Task:
     """Create a new task (`<id>.md` + `<id>.state.json`) and return the Task."""
@@ -991,6 +995,7 @@ def create_task(
         skills=list(skills or []),
         description=description or _DESCRIPTION_TEMPLATE.format(what=title),
         depends_on=list(depends_on or []),
+        labels=list(labels or []),
         workflow=(workflow or None),
     )
     _save(task)
