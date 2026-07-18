@@ -3896,6 +3896,7 @@ function renderPlanBanner(){
 
 /* ---------- tabs + list views ---------- */
 function showTab(t){
+  closeTaskModal();
   if(t!=='flow' && PLAN_MODE){
     if(dirty && !confirm('Unsaved plan edits will be lost. Leave anyway?')){ return; }
     closeTaskPlan();
