@@ -186,3 +186,32 @@ def test_generate_non_list_nodes_never_raises(tmp_path, monkeypatch):
     out = agentgen.generate(env, Config(), "desc")
     assert isinstance(out, dict)
     assert out["workflow"]["nodes"] == []
+
+
+def test_agents_payload_lists_and_save_delete_roundtrip(tmp_path):
+    from harn import studio
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    (env / "tasks").mkdir(parents=True)
+    r = studio.save_agent_payload(env, {"name": "dev", "status": "todo", "body": "b"})
+    assert r["ok"] is True
+    payload = studio.agents_payload(env)
+    assert any(a["name"] == "dev" for a in payload["agents"])
+    assert "todo" in [s if isinstance(s, str) else s["name"] for s in payload["statuses"]]
+    d = studio.delete_agent_payload(env, {"name": "dev"})
+    assert d["ok"] is True
+    assert not any(a["name"] == "dev" for a in studio.agents_payload(env)["agents"])
+
+
+def test_generate_agent_payload_never_writes(tmp_path, monkeypatch):
+    from harn import studio, agentgen
+    from harn.config import Config
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    (env / "tasks").mkdir(parents=True)
+    monkeypatch.setattr(agentgen, "generate",
+                        lambda e, c, d: {"role": {"name": "x", "status": "todo"},
+                                         "workflow": {"nodes": []}, "dropped": []})
+    r = studio.generate_agent_payload(env, env.parent, Config(), {"description": "d"})
+    assert r["ok"] is True and r["draft"]["role"]["name"] == "x"
+    assert list((env / "agents").glob("*.md")) == []   # nothing persisted

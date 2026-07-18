@@ -27,9 +27,11 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import agentgen as agentgen_mod
 from . import attachments as attachments_mod
 from . import events as events_mod
 from . import mcp_server
+from . import roles as roles_mod
 from . import runner as runner_mod
 from . import skills as skills_mod
 from . import state as state_mod
@@ -991,6 +993,46 @@ def run_agent_payload(env_dir: Path, payload: dict) -> dict:
     return triggers_mod.run_agent_payload(env_dir.parent, env_dir, payload)
 
 
+def agents_payload(env_dir: Path) -> dict:
+    """`GET /api/agents` — list of role agents plus lifecycle statuses and
+    the skill/tool catalogs the agent builder UI needs for pickers."""
+    ags = [{"name": r.name, "command": r.command, "status": r.status,
+            "next_status": r.next_status, "trigger": r.trigger, "oracle": r.oracle,
+            "isolation": r.isolation, "secrets": r.secrets, "agent": r.agent,
+            "model": r.model, "workflow": r.workflow, "body": r.body()}
+           for r in roles_mod.discover(env_dir)]
+    return {"agents": ags,
+            "statuses": [s for s in tasks_mod.lifecycle(env_dir)],
+            "skills": [s.name for s in skills_mod.discover(env_dir)],
+            "tools": [t.name for t in tools_mod.discover(env_dir)]}
+
+
+def save_agent_payload(env_dir: Path, body: dict) -> dict:
+    """`POST /api/agents/save` — create or update a role agent's .md file."""
+    if not (body.get("name") or "").strip():
+        return {"ok": False, "error": "name is required"}
+    if not (body.get("status") or "").strip():
+        return {"ok": False, "error": "status is required"}
+    roles_mod.save(env_dir, body)
+    return {"ok": True, "name": body["name"]}
+
+
+def delete_agent_payload(env_dir: Path, body: dict) -> dict:
+    """`POST /api/agents/delete` — remove a role agent's .md file."""
+    ok = roles_mod.delete(env_dir, (body.get("name") or "").strip())
+    return {"ok": ok, "error": None if ok else "no such agent"}
+
+
+def generate_agent_payload(env_dir: Path, project_root: Path, cfg: Config, body: dict) -> dict:
+    """`POST /api/agents/generate` — LLM-drafts a role + workflow from a
+    free-text description. Never persists; the caller reviews the draft and
+    calls save_agent_payload separately if they want to keep it."""
+    desc = (body.get("description") or "").strip()
+    if not desc:
+        return {"ok": False, "error": "description is required"}
+    return {"ok": True, "draft": agentgen_mod.generate(env_dir, cfg, desc)}
+
+
 def launch_task(env_dir: Path, payload: dict) -> dict:
     """Start a background `harn run --task <id>` for one task (see runner.py —
     single-runner-at-a-time; refuses if a run is already active)."""
@@ -1286,6 +1328,8 @@ def _make_handler(default_env: Path):
                 self._json(tools_catalog_payload(env))
             elif route == "/api/board":
                 self._json(board_payload(env))
+            elif route == "/api/agents":
+                self._json(agents_payload(env))
             elif route == "/api/tasks/blocked_question":
                 self._json(blocked_question_payload(env, self._query("task") or ""))
             elif route == "/api/tasks/transcript":
@@ -1379,6 +1423,12 @@ def _make_handler(default_env: Path):
                 self._json(launch_task(env, body))
             elif route == "/api/agents/run":
                 self._json(run_agent_payload(env, body))
+            elif route == "/api/agents/save":
+                self._json(save_agent_payload(env, body))
+            elif route == "/api/agents/delete":
+                self._json(delete_agent_payload(env, body))
+            elif route == "/api/agents/generate":
+                self._json(generate_agent_payload(env, env.parent, Config.load(env), body))
             elif route == "/api/tasks/launch_workflow":
                 self._json(launch_workflow(env, body))
             elif route == "/api/tasks/stop":
