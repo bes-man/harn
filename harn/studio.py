@@ -2029,6 +2029,7 @@ _HTML = r"""<!DOCTYPE html>
       <button id="tabFlow" class="active" onclick="showTab('flow')">Flow</button>
       <button id="tabSkills" onclick="showTab('skills')">Skills</button>
       <button id="tabTools" onclick="showTab('tools')">Tools</button>
+      <button id="tabAgents" onclick="showTab('agents')">Agents</button>
       <button id="tabBoard" onclick="showTab('board')">Board</button>
       <button id="tabSettings" onclick="showTab('settings')">Settings</button>
     </div>
@@ -2145,6 +2146,9 @@ const TRASH_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stro
 let S={workflow:{preamble:"",nodes:[]},skills:[],layout:{},workflows:[],active:'default',toolDocs:{}};
 let L={};                 // title -> {x,y}
 let selNode=null, tab='flow', dirty=false, skillSel=-1, bodyMode='preview';
+/* ---------- agents (role) tab state ---------- */
+let AGENTS=[], AGENT_STATUSES=[], AGENT_SKILLS=[], AGENT_TOOLS=[];
+let agentSel=-1, AGENT_DRAFT=null, AGENT_GEN_TEXT='';
 let PROG={stages:{},totals:{},active:null,ended:false};
 // null = editing a workflow PRESET (the normal Flow tab). {taskId} = editing
 // one task's OWN plan snapshot instead (opened via the Board's "Edit this
@@ -3952,7 +3956,7 @@ function showTab(t){
     closeTaskPlan();
   }
   tab=t; bodyMode='preview';
-  ['flow','skills','tools','board','settings'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
+  ['flow','skills','tools','agents','board','settings'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
   $('#surface').style.display = t==='flow'?'':'none';
   $('#listView').style.display = t==='flow'?'none':'block';
   $('#zoom').style.display = t==='flow'?'':'none';
@@ -3964,6 +3968,7 @@ function showTab(t){
   if(t==='flow')renderFlow();
   else if(t==='skills')renderSkills();
   else if(t==='tools')renderTools();
+  else if(t==='agents')renderAgents();
   else if(t==='settings')renderSettings();
   else{ pollBoard(); }
 }
@@ -4368,6 +4373,181 @@ function renameTool(oldn,newn){ newn=(newn||'').trim(); if(!newn||newn===oldn){r
 function deleteTool(t){ if(!confirm('Remove tool "'+t+'" from all steps?'))return;
   S.workflow.nodes.forEach(n=>{ if(n.tools){ const k=n.tools.indexOf(t); if(k>=0)n.tools.splice(k,1); } });
   toolSel=null; checkDirty(); renderTools(); }
+
+/* ---------- agents tab: role builder + generate-from-prompt ----------
+   Roles live in harn_env/agents/<name>.md (roles.py); this tab is the
+   visual editor over GET/POST /api/agents{,/save,/delete,/generate}
+   (Task 3). Mirrors renderSkills()/renderSkillEditor() — a list on the
+   left (#listView) and an editor on the right (#insp), same as every
+   other non-Flow tab. */
+async function loadAgentsData(){
+  try{
+    const r=await (await fetch(api('/api/agents'))).json();
+    AGENTS=r.agents||[]; AGENT_STATUSES=r.statuses||[];
+    AGENT_SKILLS=r.skills||[]; AGENT_TOOLS=r.tools||[];
+  }catch(e){}
+}
+async function renderAgents(){
+  await loadAgentsData();
+  const v=$('#listView');
+  const rows=AGENTS.map((a,i)=>`<div class="skillrow${agentSel===i?' sel':''}" onclick="selectAgent(${i})">`+
+    `<div style="width:100%"><div class="nm">${esc(a.name)}</div>`+
+    `<div class="ds">status: ${esc(a.status)}${a.next_status?' → '+esc(a.next_status):''} · ${esc(a.trigger)}</div></div></div>`).join('');
+  v.innerHTML='<h2>AGENTS</h2>'+(rows||'<div class="empty">No agents yet — generate one below, or "+ Add agent".</div>')+
+    '<button class="ghost" style="margin-top:8px" onclick="addAgent()">＋ Add agent</button>';
+  if(agentSel>=0 && agentSel<AGENTS.length) renderAgentEditor();
+  else $('#insp').innerHTML='<div class="empty">Select an agent to edit it.</div>'+renderAgentGenerateBox();
+}
+function selectAgent(i){ agentSel=i; AGENT_DRAFT=null; renderAgents(); }
+function addAgent(){
+  let base='new-agent', n=base, i=2; while(AGENTS.some(a=>a.name===n)){ n=base+'-'+i; i++; }
+  AGENTS.push({name:n, command:n, status:AGENT_STATUSES[0]||'', next_status:'', trigger:'manual',
+    oracle:true, isolation:'main', secrets:[], agent:'', model:'', workflow:'', body:'# '+n+'\n\n'});
+  agentSel=AGENTS.length-1; AGENT_DRAFT=null; renderAgents();
+}
+function renderAgentGenerateBox(){
+  return `<div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line)">
+    <h2 style="margin:0 0 8px">Generate agent</h2>
+    <p class="mut" style="font-size:12px;line-height:1.5">Describe the agent in plain
+      language — harn drafts a role + workflow from this project's existing skills
+      and tools. Nothing is saved until you click Save agent.</p>
+    <textarea id="agentGenText" rows="3" oninput="AGENT_GEN_TEXT=this.value">${esc(AGENT_GEN_TEXT)}</textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="generateAgent()">Generate agent</button>
+      <span class="status" id="agentGenSt"></span>
+    </div>
+  </div>`;
+}
+async function generateAgent(){
+  const text=(AGENT_GEN_TEXT||'').trim();
+  const st=$('#agentGenSt');
+  if(!text){ if(st) st.textContent='describe the agent first'; return; }
+  if(st) st.textContent='generating…';
+  const r=await post_('/api/agents/generate',{description:text});
+  if(!r.ok){ if(st) st.textContent=r.error||'generate failed'; return; }
+  const role=r.draft.role||{};
+  if(agentSel<0 || !AGENTS[agentSel]){
+    AGENTS.push({name:'agent', command:'', status:AGENT_STATUSES[0]||'', next_status:'',
+      trigger:'manual', oracle:true, isolation:'main', secrets:[], agent:'', model:'', workflow:'', body:''});
+    agentSel=AGENTS.length-1;
+  }
+  const a=AGENTS[agentSel];
+  a.name=role.name||a.name; a.command=role.command||a.command||a.name;
+  a.status=role.status||a.status; a.next_status=role.next_status||'';
+  a.oracle=(role.oracle!==undefined)?!!role.oracle:a.oracle;
+  a.isolation=role.isolation||a.isolation||'main';
+  a.body=role.body||a.body||'';
+  const draftWf=r.draft.workflow||{nodes:[]};
+  AGENT_DRAFT={workflow:draftWf, dropped:r.draft.dropped||[]};
+  if((draftWf.nodes||[]).length && !a.workflow) a.workflow=a.name;
+  AGENT_GEN_TEXT='';
+  renderAgents();
+}
+function renderAgentEditor(){
+  const a=AGENTS[agentSel];
+  if(!a){ $('#insp').innerHTML='<div class="empty">Select an agent to edit it.</div>'+renderAgentGenerateBox(); return; }
+  const statusOpts=AGENT_STATUSES.map(s=>`<option value="${esc(s)}" ${a.status===s?'selected':''}>${esc(s)}</option>`).join('');
+  const nextOpts='<option value="">(none)</option>'+AGENT_STATUSES.map(s=>
+    `<option value="${esc(s)}" ${a.next_status===s?'selected':''}>${esc(s)}</option>`).join('');
+  const wfDatalist=(S.workflows||[]).map(w=>`<option value="${esc(w.name)}">`).join('');
+  const droppedNote=(AGENT_DRAFT&&AGENT_DRAFT.dropped&&AGENT_DRAFT.dropped.length)
+    ? `<div class="mut" style="margin-top:8px">Dropped from the draft (not in this project's skills/tools): ${esc(AGENT_DRAFT.dropped.join(', '))}</div>` : '';
+  $('#insp').innerHTML=`
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Agent</h2>
+      <button class="icon-btn" onclick="deleteAgent(${agentSel})" title="Delete this agent">${TRASH_SVG}</button>
+    </div>
+    <label>Name <span class="mut">(slug)</span></label>
+    <input type="text" value="${esc(a.name)}" oninput="AGENTS[${agentSel}].name=this.value.trim().toLowerCase().replace(/\\s+/g,'-')"/>
+    <label>Command <span class="mut">(Telegram /slash command)</span></label>
+    <input type="text" value="${esc(a.command||'')}" oninput="AGENTS[${agentSel}].command=this.value.trim()"/>
+    <label>Status <span class="mut">(board status this role services)</span></label>
+    <select onchange="AGENTS[${agentSel}].status=this.value">${statusOpts}</select>
+    <label>Next status <span class="mut">(on success; blank = no transition)</span></label>
+    <select onchange="AGENTS[${agentSel}].next_status=this.value">${nextOpts}</select>
+    <label>Trigger</label>
+    <select onchange="AGENTS[${agentSel}].trigger=this.value">
+      <option value="manual" ${a.trigger!=='auto'?'selected':''}>manual</option>
+      <option value="auto" ${a.trigger==='auto'?'selected':''}>auto</option>
+    </select>
+    <label><input type="checkbox" ${a.oracle!==false?'checked':''} onchange="AGENTS[${agentSel}].oracle=this.checked"/> Oracle re-check gates the transition</label>
+    <label>Isolation</label>
+    <select onchange="AGENTS[${agentSel}].isolation=this.value">
+      <option value="main" ${a.isolation!=='worktree'?'selected':''}>main</option>
+      <option value="worktree" ${a.isolation==='worktree'?'selected':''}>worktree</option>
+    </select>
+    <label>Secrets <span class="mut">(comma-separated env var NAMES, values never stored here)</span></label>
+    <input type="text" value="${esc((a.secrets||[]).join(', '))}" oninput="AGENTS[${agentSel}].secrets=this.value.split(',').map(s=>s.trim()).filter(Boolean)"/>
+    <label>Agent <span class="mut">(CLI adapter override; blank = project default)</span></label>
+    <input type="text" value="${esc(a.agent||'')}" oninput="AGENTS[${agentSel}].agent=this.value.trim()"/>
+    <label>Model <span class="mut">(override; blank = project default)</span></label>
+    <input type="text" value="${esc(a.model||'')}" oninput="AGENTS[${agentSel}].model=this.value.trim()"/>
+    <label>Workflow <span class="mut">(preset this role's runs execute; blank = project default)</span></label>
+    <div class="row" style="gap:6px">
+      <input list="agentWfNames" style="flex:1" value="${esc(a.workflow||'')}" oninput="AGENTS[${agentSel}].workflow=this.value.trim()"/>
+      <button class="ghost" onclick="openAgentWorkflow(${agentSel})">Open in Flow canvas</button>
+    </div>
+    <datalist id="agentWfNames">${wfDatalist}</datalist>
+    <label>## Role <span class="mut">(persona / instructions injected into every step this role runs, Markdown)</span></label>
+    <textarea style="min-height:160px" oninput="AGENTS[${agentSel}].body=this.value">${esc(a.body||'')}</textarea>
+    ${droppedNote}
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveAgent(${agentSel})">Save agent</button>
+      <span class="status" id="agentSt"></span>
+    </div>
+    ${renderAgentGenerateBox()}`;
+}
+async function openAgentWorkflow(i){
+  const a=AGENTS[i]; if(!a) return;
+  const name=(a.workflow||'').trim();
+  if(name && name!==(S.active||'default') && (S.workflows||[]).some(w=>w.name===name)) await switchWorkflow(name);
+  showTab('flow');
+}
+async function saveAgent(i){
+  const a=AGENTS[i]; const st=$('#agentSt');
+  if(!a || !a.name){ if(st) st.textContent='name required'; return; }
+  if(!a.status){ if(st) st.textContent='status required'; return; }
+  if(st) st.textContent='saving…';
+  const r=await post_('/api/agents/save',{
+    name:a.name, command:a.command, status:a.status, next_status:a.next_status,
+    trigger:a.trigger, oracle:a.oracle, isolation:a.isolation, secrets:a.secrets||[],
+    agent:a.agent, model:a.model, workflow:a.workflow, body:a.body||''});
+  if(!r.ok){ if(st) st.textContent=r.error||'save failed'; return; }
+  // If Generate drafted a workflow too, persist it via the existing
+  // flow-save path (POST /api/workflow) so the Flow canvas can open it —
+  // never disturbs whichever preset the user currently has open.
+  if(AGENT_DRAFT && AGENT_DRAFT.workflow && (AGENT_DRAFT.workflow.nodes||[]).length && a.workflow){
+    await saveAgentWorkflow(a.workflow, AGENT_DRAFT.workflow);
+    AGENT_DRAFT=null;
+  }
+  if(st) st.textContent='saved ✓';
+  await renderAgents();
+}
+async function saveAgentWorkflow(name, workflow){
+  const exists=(S.workflows||[]).some(w=>w.name===name);
+  if(!exists){
+    await fetch(api('/api/workflows/create'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name, title:name, description:'Generated for agent '+name, version:'1'})});
+  }
+  const wasActive=S.active||'default';
+  if(wasActive!==name){
+    await fetch(api('/api/workflows/activate'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name})});
+  }
+  await fetch(api('/api/workflow'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({preamble:'', nodes:workflow.nodes||[]})});
+  if(wasActive!==name){
+    await fetch(api('/api/workflows/activate'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:wasActive})});
+  }
+  await load();   // refresh S.workflows/S.active/S.workflow after the round trip
+}
+async function deleteAgent(i){
+  const a=AGENTS[i]; if(!a || !confirm('Delete agent "'+a.name+'"?')) return;
+  await post_('/api/agents/delete',{name:a.name});
+  AGENTS.splice(i,1); agentSel=-1; AGENT_DRAFT=null;
+  renderAgents();
+}
 
 /* ---------- resizable inspector ---------- */
 let rs=null;

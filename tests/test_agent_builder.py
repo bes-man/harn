@@ -215,3 +215,10 @@ def test_generate_agent_payload_never_writes(tmp_path, monkeypatch):
     r = studio.generate_agent_payload(env, env.parent, Config(), {"description": "d"})
     assert r["ok"] is True and r["draft"]["role"]["name"] == "x"
     assert list((env / "agents").glob("*.md")) == []   # nothing persisted
+
+
+def test_studio_html_has_agents_tab():
+    from harn import studio
+    assert "showTab('agents')" in studio._HTML
+    assert "/api/agents/generate" in studio._HTML
+    assert "/api/agents/save" in studio._HTML
