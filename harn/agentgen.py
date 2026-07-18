@@ -72,8 +72,9 @@ def generate(env_dir: Path, cfg, description: str) -> dict:
 
     wf = draft.get("workflow") or {}
     nodes = wf.get("nodes") if isinstance(wf, dict) else None
+    nodes = nodes if isinstance(nodes, list) else []
     clean_nodes = []
-    for n in (nodes or []):
+    for n in nodes:
         if not isinstance(n, dict):
             continue
         req_raw = n.get("required")
