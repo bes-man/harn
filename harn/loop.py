@@ -573,7 +573,7 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
                        step: dict, feedback_tail: str = "",
                        auto: bool = False, onfail_context: str = "",
                        parallel_note: str = "", tool_results: str = "",
-                       context_injection: str = "") -> str:
+                       context_injection: str = "", role_note: str = "") -> str:
     """ONE prompt builder for EVERY workflow step (replaces the six
     stage-specific builders). Structure is stable
     context first (AGENTS.md, skills index, task spec), the step's own
@@ -599,6 +599,8 @@ def _build_step_prompt(env_dir: Path, cfg: Config, task: tasks.Task,
     scoped = (step.get("tool_mode") or "auto") == "scoped"
     if cfg.loop_aware and not parallel_note and not scoped:
         parts.append(_LIFECYCLE_NOTE)
+    if role_note:
+        parts.append(role_note)
     parts.append(
         "## Available skills (load only what you need)\n"
         "Read a skill via `read_skill` ONLY when needed:\n" + skills.index(env_dir))
@@ -1546,7 +1548,7 @@ def reconcile_headless(env_dir: Path, cfg: Config, task: tasks.Task,
 
 
 def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
-            *, rerun: bool = False) -> dict:
+            *, rerun: bool = False, role_note: str = "") -> dict:
     """Run (or rerun) exactly ONE step of a task's own workflow plan, outside
     `run()`'s full multi-step cycle — the studio UI's per-step Run/Rerun
     controls and `harn run --task ID --step STEP_ID [--rerun]`.
@@ -1639,7 +1641,7 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         result = _run_turn(
             step_adapter, env_dir, _build_step_prompt(
                 env_dir, cfg, task, step, tool_results=tool_results,
-                context_injection=context_injection),
+                context_injection=context_injection, role_note=role_note),
             project_root, task_id=task_id, stage=step_id, step_title=title,
             overrides=_step_overrides(cfg, step), tok_totals=tok_totals,
             tok_costs=tok_costs, cfg=cfg, attempt=attempt)

@@ -276,6 +276,19 @@ def cmd_run(args) -> int:
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1
+    if getattr(args, "as_role", None):
+        if not args.task_id:
+            print("[harn] --as requires --task", file=sys.stderr)
+            return 2
+        from . import roles_runner
+        r = roles_runner.run_role(root, env_dir, args.task_id, args.as_role)
+        if r.get("warning"):
+            print(f"[harn] {r['warning']}", file=sys.stderr)
+        if not r["ok"]:
+            print(f"[harn] {r['error']}", file=sys.stderr)
+            return 1
+        print(f"[harn] '{args.task_id}' run as '{args.as_role}' — status: {r['status']}")
+        return 0
     if args.step:
         if not args.task_id:
             print("[harn] --step requires --task", file=sys.stderr)
@@ -583,6 +596,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with --step: first restore the working tree to "
                          "that step's git checkpoint, discarding its last "
                          "attempt, before running it again")
+    rp.add_argument("--as", dest="as_role", metavar="ROLE", default=None,
+                    help="run --task as this agent role (harn_env/agents/"
+                         "ROLE.md) instead of the default loop — see the "
+                         "agent-roles spec")
     rp.set_defaults(func=cmd_run)
 
     ap = sub.add_parser("answer", help="answer a blocked question and resume")

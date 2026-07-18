@@ -21,6 +21,8 @@ from pathlib import Path
 from . import ENV_DIRNAME
 
 _GITIGNORE_HEADER = "# harn (generated — agent connectors; safe to remove)"
+_CODEX_BEGIN = "# >>> harn generated mcp"
+_CODEX_END = "# <<< harn generated mcp"
 
 
 def _templates_dir() -> Path:
@@ -121,7 +123,38 @@ def _root_connectors_for(chain: list[str]) -> set[str]:
         paths.add(".mcp.json")
     if "cursor" in chain:
         paths.add(".cursor/mcp.json")
+    if "codex" in chain:
+        paths.add(".codex/config.toml")
     return paths
+
+
+def _codex_mcp_block(servers: dict) -> str:
+    lines = [_CODEX_BEGIN]
+    for name, server in servers.items():
+        lines += [f"[mcp_servers.{name}]",
+                  f"command = {json.dumps(server['command'])}",
+                  f"args = {json.dumps(server.get('args') or [])}"]
+        env = server.get("env") or {}
+        if env:
+            lines.append(f"[mcp_servers.{name}.env]")
+            lines += [f"{key} = {json.dumps(str(value))}" for key, value in env.items()]
+    lines.append(_CODEX_END)
+    return "\n".join(lines) + "\n"
+
+
+def write_codex_mcp_config(project_root: Path, servers: dict) -> Path:
+    """Upsert only Harn's marked MCP block, preserving user Codex settings."""
+    path = project_root / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if _CODEX_BEGIN in text and _CODEX_END in text:
+        before, rest = text.split(_CODEX_BEGIN, 1)
+        _, after = rest.split(_CODEX_END, 1)
+        text = before.rstrip() + "\n\n" + _codex_mcp_block(servers) + after.lstrip("\n")
+    else:
+        text = text.rstrip() + ("\n\n" if text.strip() else "") + _codex_mcp_block(servers)
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _write_agent_configs(project_root: Path) -> tuple[list[str], list[str]]:
@@ -151,6 +184,11 @@ def _write_agent_configs(project_root: Path) -> tuple[list[str], list[str]]:
             written.append(".cursor/mcp.json (Cursor)")
         root_paths.append(".cursor/mcp.json")
 
+    if "codex" in chain:
+        path = write_codex_mcp_config(project_root, _mcp_servers(project_root))
+        written.append(".codex/config.toml (Codex CLI)")
+        root_paths.append(".codex/config.toml")
+
     # Home-dir agents → paste snippet inside harn_env (no root files).
     others = [a for a in chain if a in ("codex", "antigravity", "qwen")]
     if others:
@@ -168,6 +206,12 @@ def _write_agent_configs(project_root: Path) -> tuple[list[str], list[str]]:
         )
         written.append("harn_env/mcp_snippets.md (Codex/Antigravity/Qwen)")
     return written, root_paths
+
+
+def refresh_agent_connectors(project_root: Path) -> None:
+    """Refresh generated project MCP connectors before every headless run."""
+    _, root_paths = _write_agent_configs(project_root)
+    _gitignore_add(project_root, root_paths)
 
 
 def _gitignore_add(project_root: Path, rel_paths: list[str]) -> None:
@@ -209,8 +253,16 @@ def setup(project_root: Path) -> dict:
 
     # A new project starts with EMPTY tasks/ and prd/ — no demo content. The
     # agent fills them during onboarding; samples live in harn_example/.
-    for sub in ("state", "tasks", "prd", "design", "services"):
+    # `agents/` is where role definitions (<name>.md) live — also empty by
+    # default (see the agent-roles spec).
+    for sub in ("state", "tasks", "prd", "design", "services", "agents"):
         (env_dir / sub).mkdir(exist_ok=True)
+
+    # Secrets a role declares by NAME (harn_env/agents/<name>.md `secrets:`)
+    # live here as KEY=value lines, chmod 600, never committed — see
+    # secrets_store.py and the agent-roles spec's "Secrets" section.
+    from . import secrets_store
+    secrets_store.ensure_file(env_dir)
 
     # The single-file workflow the agent follows (flow + likely skills). Written
     # after the skill templates are copied so the skills index is populated;
@@ -221,7 +273,7 @@ def setup(project_root: Path) -> dict:
         created.append(workflow.FILENAME)
 
     agent_cfgs, root_paths = _write_agent_configs(project_root)
-    _gitignore_add(project_root, root_paths)
+    _gitignore_add(project_root, [*root_paths, "harn_env/secrets.env"])
 
     return {
         "env_dir": str(env_dir),
@@ -348,8 +400,17 @@ def teardown(project_root: Path) -> list[str]:
     for rel in candidates:
         p = project_root / rel
         if p.exists():
-            p.unlink()
-            removed.append(rel)
+            if rel == ".codex/config.toml":
+                text = p.read_text(encoding="utf-8")
+                if _CODEX_BEGIN in text and _CODEX_END in text:
+                    before, rest = text.split(_CODEX_BEGIN, 1)
+                    _, after = rest.split(_CODEX_END, 1)
+                    p.write_text((before.rstrip()+"\n"+after.lstrip("\n")).strip()+"\n",
+                                 encoding="utf-8")
+                    removed.append(rel + " (harn block)")
+            else:
+                p.unlink()
+                removed.append(rel)
     # tidy empty .cursor dir
     cur = project_root / ".cursor"
     if cur.is_dir() and not any(cur.iterdir()):
