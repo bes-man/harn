@@ -74,3 +74,16 @@ def test_comments_field_in_to_dict(tmp_path):
     reloaded = tasks.find(env, t.id)
     d = tasks.to_dict(reloaded)
     assert d["comments"][0]["text"] == "note"
+
+
+def test_hil_answer_recorded_as_comment(tmp_path):
+    from harn import loop, state
+    env = _env(tmp_path)
+    t = tasks.create_task(env, "Do it")
+    state_dir = env / "state"
+    st = state.State(current_task=t.id)
+    st.block("which db?")
+    st.save(state_dir)
+    loop.answer(env, "use postgres", source="telegram")
+    reloaded = tasks.find(env, t.id)
+    assert any(c.kind == "hil" and c.text == "use postgres" for c in reloaded.comments)

@@ -2707,7 +2707,7 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
     # answer, never automatically, keeps the persisted cap meaningful.
     if st.current_task:
         cur_task = tasks.find(env_dir, st.current_task)
-        if cur_task and cur_task.step_results:
+        if cur_task:
             changed = False
             for res in cur_task.step_results.values():
                 if isinstance(res, dict) and res.get("attempts"):
@@ -2715,6 +2715,7 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
                     changed = True
             if changed:
                 tasks._save(cur_task)
+            tasks.add_comment(env_dir, cur_task, text, author=source, kind="hil")
     with (state_dir / "ANSWERS.md").open("a", encoding="utf-8") as fh:
         fh.write(f"\n## Q: {question}\n{text}\n")
     st.save(state_dir)
