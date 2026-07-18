@@ -75,8 +75,27 @@ CONTEXT_CAP = 4000
 
 
 def _normalize_status(raw: str) -> str:
+    """Normalize a status string. Preserves any non-empty status verbatim
+    (custom pipelines use names outside the built-in `LIFECYCLE`, and a task
+    holding a status later removed from config must stay readable — see the
+    custom-board-statuses spec) — only a `_DONE_ALIASES` synonym is
+    canonicalized to `DONE`, and only a blank status falls back to `TODO`."""
     s = raw.strip().lower().replace("-", "_").replace(" ", "_")
-    return DONE if s in _DONE_ALIASES else (s if s in LIFECYCLE else TODO)
+    if s in _DONE_ALIASES:
+        return DONE
+    return s or TODO
+
+
+def lifecycle(env_dir: Path | None) -> list[str]:
+    """The ordered status pipeline for this project — the configured
+    `[board]` list, or the built-in five-status `LIFECYCLE` when the project
+    has no custom config (or `env_dir` is None, e.g. legacy/global callers)."""
+    if env_dir is not None:
+        from . import config as config_mod
+        names = [s["name"] for s in config_mod.Config.load(env_dir).board_statuses]
+        if names:
+            return names
+    return LIFECYCLE
 
 
 def cap_text(text: str, limit: int = CONTEXT_CAP) -> str:
@@ -218,6 +237,11 @@ class Task:
     # snapshot (harn_env/tasks/<id>.workflow.json). Keyed by step id so it
     # survives step re-ordering/renaming in the plan.
     step_results: dict = field(default_factory=dict)
+    # Local mirror of an externally-tracked task (GitLab/Linear/ClickUp —
+    # pull-to-local model, no sync logic yet; shape only, see the
+    # custom-board-statuses spec). {"provider": ..., "id": ..., "url": ...}
+    # or None for a purely local task.
+    external: dict | None = None
 
     @property
     def done(self) -> bool:
@@ -342,6 +366,7 @@ def to_dict(task: Task) -> dict:
         "stage_checkpoints": task.stage_checkpoints,
         "task_patch_refs": task.task_patch_refs,
         "step_results": task.step_results,
+        "external": task.external,
     }
 
 
@@ -351,7 +376,7 @@ def to_dict(task: Task) -> dict:
 _CONTEXT_MARKER = "## Context"
 _CONTEXT_MARKER_LINE = f"\n{_CONTEXT_MARKER}\n"
 _FRONTMATTER_FIELDS = ("id", "title", "status", "priority", "workflow",
-                       "prds", "depends_on")
+                       "prds", "depends_on", "external")
 
 
 def _state_path(md_path: Path) -> Path:
@@ -382,6 +407,7 @@ def _render_frontmatter(task: Task) -> str:
         "id": task.id, "title": task.title, "status": task.status,
         "priority": task.priority, "workflow": task.workflow,
         "prds": task.prds, "depends_on": task.depends_on,
+        "external": task.external,
     }
     lines = ["---"]
     for k in _FRONTMATTER_FIELDS:
@@ -535,6 +561,7 @@ def _build_task(path: Path, fm: dict, sections: dict, context_body: str,
         prds=list(fm.get("prds") or []),
         depends_on=list(fm.get("depends_on") or []),
         workflow=fm.get("workflow") or None,
+        external=fm.get("external") or None,
         description=sections.get("Description", "").strip(),
         result=sections.get("Result", "").strip(),
         decisions=decisions,
@@ -898,7 +925,7 @@ def tasks_in_review(env_dir: Path) -> list[Task]:
 
 
 def by_status(env_dir: Path) -> dict[str, list[Task]]:
-    out: dict[str, list[Task]] = {s: [] for s in LIFECYCLE}
+    out: dict[str, list[Task]] = {s: [] for s in lifecycle(env_dir)}
     for t in sorted(_load_tasks_light(env_dir), key=lambda t: (t.priority, t.id)):
         out.setdefault(t.status, []).append(t)
     return out
@@ -977,8 +1004,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def set_status(task: Task, status: str) -> None:
-    if status not in LIFECYCLE:
+def set_status(task: Task, status: str, env_dir: Path | None = None) -> None:
+    """Set `task.status`, validated against the project's configured
+    pipeline (`lifecycle(env_dir)`) when `env_dir` is given, else the
+    built-in `LIFECYCLE` (back-compat for internal call sites that only
+    ever pass one of the five hardcoded statuses)."""
+    allowed = lifecycle(env_dir) if env_dir is not None else LIFECYCLE
+    if status not in allowed:
         raise ValueError(f"unknown status: {status!r}")
     task.status = status
     _save(task)
@@ -1154,11 +1186,16 @@ def board(env_dir: Path) -> str:
         return "(no tasks)"
     lines: list[str] = []
     by_id = {x.id: x for x in _load_tasks_light(env_dir)}
-    for status in LIFECYCLE:
+    # Configured pipeline first, then any status still holding tasks that
+    # fell outside it (e.g. a status removed from `harn.toml` after tasks
+    # were already set to it) — those must stay visible, never dropped.
+    ordered = list(lifecycle(env_dir))
+    ordered += [s for s in groups if s not in ordered]
+    for status in ordered:
         items = groups.get(status) or []
         if not items:
             continue
-        lines.append(_STATUS_LABEL[status])
+        lines.append(_STATUS_LABEL.get(status, f"• {status}"))
         for t in items:
             prds = f" · {', '.join(t.prds)}" if t.prds else ""
             subs = f" [{sum(1 for s in t.subtasks if s.status == DONE)}/{len(t.subtasks)} subtasks]" if t.subtasks else ""

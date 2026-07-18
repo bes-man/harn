@@ -719,7 +719,11 @@ def board_payload(env_dir: Path) -> dict:
         d["attachments"] = attachments_mod.list_files(env_dir, t.id)
         ts.append(d)
     run = runner_mod.active(env_dir)
-    payload = {"tasks": ts, "run": run}
+    statuses = [
+        {"name": s, "label": tasks_mod._STATUS_LABEL.get(s, s)}
+        for s in tasks_mod.lifecycle(env_dir)
+    ]
+    payload = {"tasks": ts, "run": run, "statuses": statuses}
     if run:
         payload["run_log"] = runner_mod.log_tail(env_dir, 40)
     return payload
@@ -844,7 +848,7 @@ def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
     task = tasks_mod.find(env_dir, task_id)
     if task is None:
         return {"ok": False, "error": f"no task {task_id}"}
-    if new_status not in tasks_mod.LIFECYCLE:
+    if new_status not in tasks_mod.lifecycle(env_dir):
         return {"ok": False, "error": f"unknown status: {new_status!r}"}
     active = runner_mod.active(env_dir)
     if active and active.get("task_id") == task_id:
@@ -854,14 +858,14 @@ def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
             return {"ok": False,
                     "error": "pick a flow for this task before starting it"}
         prior_status = task.status
-        tasks_mod.set_status(task, new_status)
+        tasks_mod.set_status(task, new_status, env_dir)
         result = runner_mod.launch(env_dir.parent, env_dir, task_id, auto=False)
         if not result.get("ok"):
-            tasks_mod.set_status(task, prior_status)   # roll back — atomic with launch
+            tasks_mod.set_status(task, prior_status, env_dir)   # roll back — atomic with launch
             return {"ok": False, "error": result.get("error", "launch failed")}
         return {"ok": True, "task_id": task_id, "status": new_status,
                 "launched": True}
-    tasks_mod.set_status(task, new_status)
+    tasks_mod.set_status(task, new_status, env_dir)
     return {"ok": True, "task_id": task_id, "status": new_status}
 
 
@@ -2042,7 +2046,7 @@ async function load(){
   snapshotWorkflow(); clearDirty();
   setStatus(S.skills.length+' skills · '+S.workflow.nodes.filter(n=>n.kind==='step').length+' steps');
   await loadToolsData(false);
-  try{ BOARD=await (await fetch(api('/api/board'))).json(); }catch(e){}
+  try{ BOARD=await (await fetch(api('/api/board'))).json(); applyBoardStatuses(BOARD.statuses); }catch(e){}
   await ensureModelsLoaded();
   renderWorkflows(); render(); loadConfig(); pollProgress();
   setInterval(()=>{ pollProgress(); pollBoard(); }, 1500);
@@ -2184,9 +2188,17 @@ let BOARD_LIST_RENDER_KEY=null;
 let BOARD_DETAIL_RENDER_KEY=null;
 let RENDERED_BOARD_DETAIL_TASK=null;
 let boardPollGeneration=0;
-const BOARD_ORDER=['todo','in_progress','review','changes_requested','done'];
-const BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your review',
+let BOARD_ORDER=['todo','in_progress','review','changes_requested','done'];
+let BOARD_LABEL={todo:'To do',in_progress:'In progress',review:'Awaiting your review',
   changes_requested:'Changes requested',done:'Done'};
+function applyBoardStatuses(statuses){
+  // Columns come from the server payload (project's configured pipeline),
+  // not a hardcoded list — see the custom-board-statuses spec. Falls back to
+  // the built-in five when the payload omits/empties it (older server).
+  if(!Array.isArray(statuses)||!statuses.length) return;
+  BOARD_ORDER=statuses.map(s=>s.name);
+  BOARD_LABEL=Object.fromEntries(statuses.map(s=>[s.name,s.label||s.name]));
+}
 function boardListRenderKey(){
   return JSON.stringify({tasks:BOARD.tasks||[],run:BOARD.run||null,selected:boardSel});
 }
@@ -2201,6 +2213,7 @@ async function pollBoard(){
   try{ next=await (await fetch(api('/api/board'))).json(); }catch(e){ return; }
   if(generation!==boardPollGeneration) return;
   BOARD=next;
+  applyBoardStatuses(BOARD.statuses);
   if(BOARD.run&&BOARD.run.task_id) LAST_RUN_TASK=BOARD.run.task_id;   // remember for the run-history panel
   // The blocked-question banner reflects per-ENV state (harn has one active
   // task at a time — see blocked_question_payload), not per-selected-task, so
@@ -2408,7 +2421,7 @@ function renderTaskDetail(){
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">${esc(t.id)}</h2>
       <select onchange="changeTaskStatus('${esc(t.id)}',this.value)" style="color:${statusColor};border-color:${statusColor};background:transparent">
-        ${['todo','in_progress','review','changes_requested','done'].map(s=>
+        ${BOARD_ORDER.map(s=>
           `<option value="${s}" ${t.status===s?'selected':''}>${esc(s)}</option>`).join('')}
       </select>
     </div>

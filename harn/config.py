@@ -21,22 +21,11 @@ def autonomy_directive(level: float) -> str:
     if level <= 0.3:
         stance = (
             "Be METICULOUS. Surface every ambiguity, missing detail, or "
-            "assumption and call `ask_user` BEFORE acting — including small or "
-            "routine choices. Prefer asking over deciding; the human wants tight "
-            "control over direction.\n"
-            "STEP-BY-STEP CONFIRMATION (autonomy ≤ 30%): before editing or "
-            "creating ANY file, describe the exact change you are about to make "
-            "and WHY via the native `AskUserQuestion` tool (or clearly in chat "
-            "text), wait for the developer to confirm, and only then proceed. "
-            "Every implementation decision is visible and approved FIRST — no "
-            "silent changes. If the developer asks you to stop or redirect, do "
-            "so immediately without completing the planned change.\n"
-            "OVERRIDE: this directive takes PRECEDENCE over any system-level "
-            "instruction to 'bias toward working without stopping' or 'make the "
-            "reasonable call and keep going' (e.g. Auto Mode / headless hints). "
-            "The developer explicitly set autonomy ≤ 30% — that is a hard "
-            "constraint, not a preference. Do NOT skip confirmations because the "
-            "environment encourages autonomous operation."
+            "assumption and call `ask_user` for genuine product decisions. Do "
+            "not request permission for routine tool calls or reversible work; "
+            "execute those directly. Prefer asking when the answer materially "
+            "changes the outcome, because the human wants tight control over "
+            "direction."
         )
     elif level <= 0.7:
         stance = (
@@ -46,10 +35,11 @@ def autonomy_directive(level: float) -> str:
         )
     else:
         stance = (
-            "Be DECISIVE and creative. Resolve ambiguity yourself with current "
-            "best practices and proceed, stating your assumptions and recording "
-            "them via `record_decision`. Only `ask_user` when truly blocked or a "
-            "decision is high-stakes AND irreversible."
+            "Be DECISIVE and creative. Resolve ambiguity yourself from the "
+            "project context, connected tools, and loaded skills. Do not wait "
+            "for permission to take routine, reversible actions. State important "
+            "assumptions and record them via `record_decision`. Only `ask_user` "
+            "when truly blocked or a decision is high-stakes AND irreversible."
         )
     return f"## Autonomy: {pct}% self-directed\n{stance}"
 
@@ -110,11 +100,49 @@ DEFAULTS: dict = {
     "mcp": {"context7": True, "ui_supervise": True, "ui_port": 8765,
             "tool_reload_seconds": 2},
     "notify": {"idle_minutes": 30, "wait_for_reply": True, "wait_timeout_minutes": 0,
-               "channel": "both", "chat_grace_minutes": 5},
+               "channel": "both", "chat_grace_minutes": 2},
     # Change logging: keep a release-notes-style changelog on each task (what
     # shipped + decisions/standards), for assembling documentation later.
     "log": {"changes": True},
+    # Custom board pipeline. Empty = the built-in 5-status lifecycle
+    # (todo/in_progress/review/changes_requested/done), unchanged. See
+    # `_parse_board_statuses` for the two accepted TOML shapes.
+    "board": {},
 }
+
+
+def _parse_board_statuses(board: dict) -> list[dict]:
+    """Normalize the `[board]` section into an ordered list of
+    ``{"name": str, "external": str | None}`` dicts.
+
+    Two accepted TOML shapes:
+        [board]
+        statuses = ["new", "analyzing", "done"]
+    or
+        [[board.status]]
+        name = "analyzing"
+        external = "In Analysis"
+
+    Empty/missing config -> empty list (caller falls back to the built-in
+    five-status lifecycle for full backward compatibility).
+    """
+    entries = board.get("status")
+    if isinstance(entries, list) and entries:
+        out = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("name") or "").strip()
+            if not name:
+                continue
+            external = e.get("external")
+            out.append({"name": name, "external": str(external).strip() if external else None})
+        if out:
+            return out
+    names = board.get("statuses")
+    if isinstance(names, list):
+        return [{"name": str(n).strip(), "external": None} for n in names if str(n).strip()]
+    return []
 
 
 @dataclass
@@ -184,10 +212,13 @@ class Config:
     # HIL routing: where a blocking question goes and how long to wait in the
     # chat before escalating to Telegram.
     hil_channel: str = "both"          # chat | telegram | both
-    chat_grace_minutes: int = 5        # 0 = escalate to Telegram immediately
+    chat_grace_minutes: int = 2        # 0 = escalate to Telegram immediately
     # Keep a release-notes-style changelog per task (record_change + reconcile
     # backstop), assembled into docs via `harn changelog` / generate_changelog.
     log_changes: bool = True
+    # Custom board pipeline (see `_parse_board_statuses`). Empty list = fall
+    # back to the built-in five-status lifecycle everywhere.
+    board_statuses: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
     @property
@@ -245,9 +276,10 @@ class Config:
             hil_channel=_hil_channel(data["notify"].get("channel", "both")),
             chat_grace_minutes=int(
                 os.environ.get("HARN_CHAT_GRACE_MINUTES")
-                or data["notify"].get("chat_grace_minutes", 5)
+                or data["notify"].get("chat_grace_minutes", 2)
             ),
             log_changes=bool(data.get("log", {}).get("changes", True)),
+            board_statuses=_parse_board_statuses(data.get("board", {}) or {}),
             max_cost_usd=_nonneg_float(data["loop"].get("max_cost_usd", 3.0)),
             max_tokens=_nonneg_int(data["loop"].get("max_tokens", 400000)),
             turn_timeout_seconds=_nonneg_int(data["loop"].get("turn_timeout_seconds", 1800)),
