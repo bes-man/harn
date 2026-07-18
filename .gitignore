@@ -217,3 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 harn_env/
+
+# Local verification artifacts (Playwright MCP snapshots/screenshots, ad-hoc
+# root-level PNGs from manual browser verification) — not source, not shared.
+.playwright-mcp/
+/*.png
