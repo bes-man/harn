@@ -177,3 +177,10 @@ def test_add_comment_payload_unknown_task(tmp_path):
     env = _env(tmp_path)
     r = studio.add_comment_payload(env, {"task_id": "NOPE", "text": "hi"})
     assert r["ok"] is False
+
+
+def test_studio_html_renders_kanban_columns_unconditionally():
+    assert "kanban-col" in studio._HTML
+    assert "data-status=" in studio._HTML
+    # The old early-return-on-empty-column guard must be gone.
+    assert "if(!list.length) return;" not in studio._HTML

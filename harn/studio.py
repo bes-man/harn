@@ -1679,6 +1679,21 @@ _HTML = r"""<!DOCTYPE html>
   .boardgroup{margin-bottom:16px}
   .bglabel{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;
     margin:0 0 6px;padding:0 6px}
+  .kanban-board{display:flex;flex-direction:row;gap:12px;overflow-x:auto;padding-bottom:8px}
+  .kanban-col{flex:0 0 280px;width:280px;display:flex;flex-direction:column;
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    max-height:calc(100vh - 220px)}
+  .kanban-col-head{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;
+    padding:8px 10px;border-bottom:1px solid var(--line)}
+  .kanban-col-body{flex:1 1 auto;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
+  .kanban-card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:8px 9px;cursor:pointer}
+  .kanban-card:hover{background:var(--panel2);border-color:var(--accent)}
+  .kanban-card.sel{background:var(--panel2);border-left:2px solid var(--accent)}
+  .kanban-card.running{border-left:2px solid var(--accent2)}
+  .kanban-card-title{font-weight:600;font-size:13px;margin-bottom:4px}
+  .kanban-card-labels{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
+  .kanban-card-labels:empty{display:none;margin:0}
   .taskrow.sel{background:var(--panel2);border-left:2px solid var(--accent)}
   .taskrow.running{border-left:2px solid var(--accent2)}
   .live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent2);
@@ -2380,22 +2395,35 @@ function renderBoard(){
       `${rt?': '+esc(rt.title):''} (pid ${BOARD.run.pid}${BOARD.run.auto?' · auto':''})`+
       `<button class="ghost" onclick="stopRun()" title="Steps already done stay done; edit the plan, then ▶ Resume">⏸ Pause</button></div>`;
   }
+  html+='<div class="kanban-board">';
   BOARD_ORDER.forEach(s=>{
     const list=(groups[s]||[]).slice().sort((a,b)=>a.priority-b.priority);
-    if(!list.length) return;
-    html+=`<div class="boardgroup"><div class="bglabel">${BOARD_LABEL[s]||s} · ${list.length}</div>`;
+    html+=`<div class="kanban-col" data-status="${esc(s)}" ondragover="onColDragOver(event)" ondrop="onColDrop(event,'${esc(s)}')">`+
+      `<div class="kanban-col-head">${BOARD_LABEL[s]||s} · ${list.length}</div>`+
+      `<div class="kanban-col-body">`;
     list.forEach(t=>{
       const running=BOARD.run&&BOARD.run.task_id===t.id;
-      html+=`<div class="skillrow taskrow ${boardSel===t.id?'sel':''} ${running?'running':''}" onclick="selectTask('${esc(t.id)}')">`+
-        `<div style="width:100%"><div class="nm">${esc(t.id)}: ${esc(t.title)}${running?'<span class="live-dot" title="running"></span>':''}</div>`+
-        `<div class="ds">${esc(t.workflow||'default workflow')} · priority ${t.priority}${t.claimed_by?' · '+esc(t.claimed_by):''}</div></div></div>`;
+      const draggable=!running;
+      html+=`<div class="kanban-card ${boardSel===t.id?'sel':''} ${running?'running':''}" `+
+        `draggable="${draggable}" ondragstart="onCardDragStart(event,'${esc(t.id)}')" ondragend="onCardDragEnd(event)" `+
+        `onclick="openTaskModal('${esc(t.id)}')">`+
+        `<div class="kanban-card-title">${esc(t.id)}: ${esc(t.title)}${running?'<span class="live-dot" title="running"></span>':''}</div>`+
+        `<div class="kanban-card-labels">${(t.labels||[]).map(l=>`<span class="chip">${esc(l)}</span>`).join('')}</div>`+
+        `<div class="ds">${esc(t.workflow||'default workflow')} · priority ${t.priority}${t.claimed_by?' · '+esc(t.claimed_by):''}</div>`+
+        `</div>`;
     });
-    html+='</div>';
+    html+='</div></div>';
   });
+  html+='</div>';
   if(!(BOARD.tasks||[]).length) html+='<div class="empty">No tasks yet — create one from an agent session (create_task).</div>';
   v.innerHTML=html;
   BOARD_LIST_RENDER_KEY=boardListRenderKey();
 }
+function onColDragOver(e){ e.preventDefault(); }
+function onCardDragStart(e,id){}
+function onCardDragEnd(e){}
+function onColDrop(e,status){ e.preventDefault(); }
+function openTaskModal(id){ selectTask(id); }   // Task 9 replaces this with a real modal
 function showNewTaskForm(){
   NEW_TASK_OPEN=true;
   const wfOpts=(S.workflows||[]).map(w=>`<option value="${esc(w.name)}">${esc(w.title)}</option>`).join('');
