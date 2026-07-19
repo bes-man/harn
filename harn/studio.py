@@ -1486,12 +1486,18 @@ def _make_handler(default_env: Path):
                 # consume `self.rfile` in the process, leaving nothing for
                 # us to parse). rfile is read exactly once, here.
                 n = int(self.headers.get("Content-Length") or 0)
+                if n > _MAX_ATTACHMENT_BYTES:
+                    mb = _MAX_ATTACHMENT_BYTES // (1024 * 1024)
+                    self._json({"ok": False, "error": f"file too large (max {mb}MB)"}); return
                 raw = self.rfile.read(n) if n else b""
                 content_type = self.headers.get("Content-Type", "")
                 fields, files = _parse_multipart(raw, content_type)
                 if "file" not in files:
                     self._json({"ok": False, "error": "file is required"}); return
                 filename, data = files["file"]
+                if len(data) > _MAX_ATTACHMENT_BYTES:
+                    mb = _MAX_ATTACHMENT_BYTES // (1024 * 1024)
+                    self._json({"ok": False, "error": f"file too large (max {mb}MB)"}); return
                 self._json(intake_payload(
                     env.parent, env, filename=filename, data=data,
                     text=fields.get("text", ""), agent=fields.get("agent") or None))

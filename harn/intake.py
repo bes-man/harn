@@ -85,6 +85,12 @@ def intake(
     cfg = cfg or Config.load(env_dir)
     if cfg.intake_confirm_before_run:
         summary = f"New task {task.id} ({title!r}) from {filename!r} — run /{agent}?"
+        # NOTE: when this is reached from `harn watch`'s Telegram document
+        # handling (auto-run command attached to a document), `_confirm`
+        # blocks the dispatcher tick inline for up to `timeout_s` — no other
+        # command/document is processed meanwhile, and any Telegram message
+        # sent during the wait is consumed by `await_answer`'s offset advance
+        # and silently dropped. See docs/agent-api.md "Known limitation".
         if not _confirm(env_dir, cfg, summary):
             return {"ok": True, "task_id": task.id, "confirmed": False}
 

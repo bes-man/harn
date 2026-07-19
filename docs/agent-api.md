@@ -3,7 +3,7 @@
 `harn ui` (the studio) exposes a small set of HTTP endpoints that let an
 external system — a script, a bot, another agent — drive harn the same way
 the browser UI does. This document covers the three "agent" routes: running
-a role, drafting a new role, and (planned) document intake.
+a role, drafting a new role, and document intake (uploading a file that becomes a task).
 
 All routes take the project's env dir via the `env` query parameter, e.g.
 `POST /api/agents/run?env=/path/to/project/harn_env`. If `env` is omitted the
@@ -31,7 +31,7 @@ LLM tokens, or mutate a role becomes **protected**:
 - `POST /api/tasks/status` (moving a task to `in_progress` auto-launches a
   run, so this route is gated the same as the explicit launch routes)
 - `POST /api/tools/chat` (runs an LLM turn)
-- `POST /api/tasks/intake` (planned; see below)
+- `POST /api/tasks/intake` (multipart file upload → task; see below)
 
 Read-only `GET` info routes (`/api/state`, `/api/board`, `/api/tasks/transcript`,
 etc.) are **not** protected — the threat model here is unauthorized action
@@ -170,11 +170,47 @@ in this project (filtered out of the draft). On a missing description:
 
 ## `POST /api/tasks/intake`
 
-**Not implemented yet.** This route is planned as part of the
-document-intake feature (turning an uploaded document into one or more
-tasks) and is not callable today — calling it currently returns `404`.
+Turn an uploaded document into a task with the file attached, optionally
+routed to an agent role. `multipart/form-data` body:
 
-Its auth behavior is already wired ahead of the implementation: it's in
-the same protected-route set as `/api/agents/run` and `/api/agents/generate`,
-so once it ships it will follow the same Bearer/loopback rules described
-above with no further auth changes needed.
+- `file` (required) — the document. Rejected if larger than the attachment
+  cap (25 MB) with `{"ok": false, "error": "file too large (max 25MB)"}`.
+- `text` (optional) — the task description (first line becomes the title).
+- `agent` (optional) — a role name/command to run on the new task (subject
+  to the confirm gate, below).
+
+Response: `{"ok": true, "task_id": "PRJ-001"}` (plus the run result merged in
+when `agent` was given and the run proceeded). A missing `file` →
+`{"ok": false, "error": "file is required"}`.
+
+Follows the same Bearer/loopback auth rules as the routes above (it's in the
+protected set). curl (loopback, no token needed):
+
+```
+curl -X POST 'http://127.0.0.1:9999/api/tasks/intake?env=/path/to/project/harn_env' \
+  -F 'file=@report.pdf' \
+  -F 'text=Investigate the Safari login bug' \
+  -F 'agent=analyst'
+```
+
+The same intake path also accepts a **document sent to the Telegram bot**
+from the trusted chat: the caption becomes the task text, and a caption that
+starts with `/<role>` routes the new task to that role.
+
+### Confirm gate
+
+`[intake] confirm_before_run` (default `true`) governs whether a
+document-triggered task that would run an agent asks for confirmation first.
+When `true` and an `agent` is given, harn posts a confirmation to Telegram and
+waits for a yes before launching; a decline or timeout keeps the task (with
+the file attached) without running it. Set it to `false` for unattended
+intake that runs immediately.
+
+**Known limitation:** when `confirm_before_run = true` and a *Telegram*
+document carries a `/command` (auto-run), the `harn watch` dispatcher blocks
+inline on the confirmation for up to the confirm timeout — no other
+command/document is processed during that window, and any Telegram message
+sent while it waits is consumed and silently dropped. For unattended or
+high-throughput Telegram intake, set `confirm_before_run = false`, or confirm
+promptly. (The HTTP route blocks only the single request thread, not the
+dispatcher.)

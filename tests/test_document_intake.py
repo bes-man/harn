@@ -213,3 +213,95 @@ def test_failed_document_download_creates_no_task(tmp_path):
     assert result.get("ok") is False
     assert tasks.load_tasks(env) == []
     assert sent and "couldn't download" in sent[0].lower()
+
+
+# --- Finding 1 (final review A): /api/tasks/intake enforces a size cap ---- #
+
+
+def test_http_intake_rejects_oversize_content_length_without_reading_body(tmp_path, monkeypatch):
+    """The intake route must check Content-Length against _MAX_ATTACHMENT_BYTES
+    BEFORE calling rfile.read(n). Proof: we announce a huge Content-Length but
+    never send a matching body. If the handler read() first, it would block
+    on those never-arriving bytes and this test would time out; instead it
+    must respond immediately with the oversize error."""
+    import json
+    import socket
+    import threading
+    from http.server import ThreadingHTTPServer
+    from harn import studio, scaffold, tasks, ENV_DIRNAME
+
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    monkeypatch.setattr(studio, "_MAX_ATTACHMENT_BYTES", 100)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), studio._make_handler(env))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        request = (
+            f"POST /api/tasks/intake?env={env} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Content-Type: multipart/form-data; boundary=X\r\n"
+            "Content-Length: 100000000\r\n"  # 100MB claimed, never sent
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        chunks = []
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            sock.close()
+        resp = b"".join(chunks).decode("utf-8", errors="replace")
+        status_line, _, rest = resp.partition("\r\n")
+        assert " 200 " in status_line
+        _, _, body = rest.partition("\r\n\r\n")
+        data = json.loads(body)
+        assert data["ok"] is False
+        assert "large" in data["error"]
+        assert tasks.load_tasks(env) == []
+    finally:
+        srv.shutdown()
+
+
+def test_http_intake_rejects_oversize_actual_body(tmp_path, monkeypatch):
+    """Behavioral check on the whole request/response cycle: a real multipart
+    body whose file part exceeds the cap is rejected and no task is created."""
+    import json
+    import threading
+    import urllib.request
+    import urllib.error
+    from http.server import ThreadingHTTPServer
+    from harn import studio, scaffold, tasks, ENV_DIRNAME
+
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    monkeypatch.setattr(studio, "_MAX_ATTACHMENT_BYTES", 20)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), studio._make_handler(env))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        boundary = "BOUNDARY"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"r.pdf\"\r\n"
+            f"Content-Type: application/pdf\r\n\r\n{'x' * 500}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/tasks/intake?env={env}",
+            data=body, method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            data = json.loads(e.read())
+        assert data["ok"] is False
+        assert "large" in data["error"]
+        assert tasks.load_tasks(env) == []
+    finally:
+        srv.shutdown()
