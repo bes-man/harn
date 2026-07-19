@@ -271,3 +271,13 @@ def test_bearer_check_scheme_case_insensitive(tmp_path):
     assert studio._check_bearer("s3cret", "8.8.8.8", "bearer s3cret") is True
     assert studio._check_bearer("s3cret", "8.8.8.8", "BEARER s3cret") is True
     assert studio._check_bearer("s3cret", "8.8.8.8", "bearer wrong") is False
+
+
+def test_agent_api_doc_exists_and_covers_endpoints():
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "docs" / "agent-api.md"
+    assert p.exists()
+    text = p.read_text(encoding="utf-8")
+    for route in ("/api/agents/run", "/api/agents/generate", "/api/tasks/intake"):
+        assert route in text
+    assert "HARN_API_TOKEN" in text and "Bearer" in text

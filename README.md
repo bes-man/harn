@@ -437,6 +437,17 @@ reconciles its tool list against what's on disk. A custom tool you add (or
 edit) mid-session becomes callable within a couple of seconds, with no server
 restart needed.
 
+## Agent API
+
+`harn ui` also exposes a small HTTP API for driving harn from outside the
+browser — `POST /api/agents/run` (dispatch a role against a task),
+`POST /api/agents/generate` (LLM-draft a new role, never persists), and a
+planned `POST /api/tasks/intake` (document-intake feature, not implemented
+yet). These are localhost-only by default; set `HARN_API_TOKEN` in
+`harn_env/secrets.env` to require `Authorization: Bearer <token>` from
+non-loopback callers. See [docs/agent-api.md](docs/agent-api.md) for
+request/response shapes, the auth model, and curl examples.
+
 ## Phases vs. task statuses
 
 - **Loop phase** (`state/STATE.json`): `PLANNING → READY → EXECUTING →
