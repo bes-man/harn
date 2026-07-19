@@ -2738,6 +2738,46 @@ def _progress_tail_lines(env_dir: Path) -> list[str]:
     return p.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
+def _intake_document(project_root: Path, env_dir: Path, cfg: Config,
+                      tg: TelegramHIL, doc: dict) -> dict:
+    """Route one Telegram document/photo update through `intake.intake`.
+
+    Downloads the file, then parses `doc["caption"]`: if it's a `/command`,
+    that command becomes `agent` and the remaining text (or the caption
+    itself, if there's no remainder) becomes `text`; otherwise the whole
+    caption is `text` and no agent is dispatched. Always replies the
+    outcome via `tg.send` — callers (the watch tick) additionally guard
+    this so a bad document never breaks the tick.
+    """
+    from . import intake as intake_mod
+    from . import triggers as triggers_mod
+
+    caption = doc.get("caption") or ""
+    parsed = triggers_mod.parse_command(caption)
+    if parsed:
+        agent, rest = parsed
+        text = rest or caption
+    else:
+        agent, text = None, caption
+
+    data = tg.download_file(doc["file_id"])
+    result = intake_mod.intake(
+        project_root, env_dir,
+        filename=doc.get("filename") or "file",
+        data=data or b"",
+        text=text,
+        agent=agent,
+        cfg=cfg,
+    )
+    reply_text = (
+        f"✅ {result.get('task_id', '')}: {result.get('status', 'saved')}"
+        if result.get("ok")
+        else f"❌ {result.get('error', 'intake failed')}"
+    )
+    tg.send(reply_text)
+    return result
+
+
 def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
           _sleep=time.sleep, _once: bool = False) -> None:
     """The dispatcher (companion to chat-mode work; not a daemon/Docker).
@@ -2860,7 +2900,8 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
         if roles_mod.discover(env_dir):
             tg = TelegramHIL.from_env(env_dir)
             if tg:
-                for cmd in tg.poll_commands(state_dir):
+                updates = tg.poll_updates(state_dir)
+                for cmd in updates["commands"]:
                     parsed = triggers_mod.parse_command(cmd["text"])
                     if not parsed:
                         continue
@@ -2873,6 +2914,14 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
                         else f"❌ {result.get('error', 'run failed')}"
                     )
                     tg.send(reply_text)
+                for doc in updates["documents"]:
+                    try:
+                        _intake_document(project_root, env_dir, cfg, tg, doc)
+                    except Exception as exc:
+                        try:
+                            tg.send(f"❌ document intake failed: {exc}")
+                        except Exception:
+                            pass
             triggers_mod.auto_scan(project_root, env_dir, cfg=cfg)
 
         if _once:

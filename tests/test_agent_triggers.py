@@ -321,6 +321,13 @@ def test_watch_tick_routes_telegram_command_and_replies(tmp_path, monkeypatch):
         def poll_commands(self, state_dir):
             return [{"text": f"/analyst {t.id}", "message_id": 1}]
 
+        def poll_updates(self, state_dir):
+            # watch() now drains via poll_updates (single-drain to avoid
+            # double-consuming the Telegram offset alongside documents) —
+            # mirror poll_commands's return so this test's command-routing
+            # assertion is unaffected.
+            return {"commands": self.poll_commands(state_dir), "documents": []}
+
         def send(self, text, **kw):
             sent.append(text)
             return 1

@@ -111,3 +111,31 @@ def test_intake_confirm_on_but_no_telegram_defaults_to_run(tmp_path, monkeypatch
     r = intake.intake(tmp_path, env, filename="f.txt", data=b"x", text="do it", agent="analyst")
     assert r["ok"] is True
     assert called["cmd"] == "analyst"        # unconfigured Telegram → _confirm defaults True → dispatched
+
+
+# --- watch() integration: a Telegram document routes through intake ------- #
+
+def test_watch_tick_routes_a_telegram_document_to_intake(tmp_path, monkeypatch):
+    from harn import loop, scaffold, ENV_DIRNAME, roles
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(exist_ok=True)
+    (env / "agents" / "analyst.md").write_text("---\nname: analyst\nstatus: todo\n---\n## Role\na", encoding="utf-8")
+    intook = {}
+
+    class FakeHIL:
+        def poll_updates(self, sd):
+            return {"commands": [], "documents":
+                [{"file_id": "F", "filename": "r.pdf", "caption": "/analyst reproduce", "message_id": 1}]}
+
+        def download_file(self, fid):
+            return b"BYTES"
+
+        def send(self, *a, **k):
+            return 1
+
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
+    monkeypatch.setattr(loop, "_intake_document",
+        lambda pr, ed, cfg, tg, doc: intook.setdefault("cap", doc["caption"]))
+    loop.watch(env, tmp_path, _once=True)
+    assert intook.get("cap") == "/analyst reproduce"
