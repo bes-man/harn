@@ -2761,10 +2761,13 @@ def _intake_document(project_root: Path, env_dir: Path, cfg: Config,
         agent, text = None, caption
 
     data = tg.download_file(doc["file_id"])
+    if data is None:
+        tg.send("❌ couldn't download the document")
+        return {"ok": False, "error": "download failed"}
     result = intake_mod.intake(
         project_root, env_dir,
         filename=doc.get("filename") or "file",
-        data=data or b"",
+        data=data,
         text=text,
         agent=agent,
         cfg=cfg,

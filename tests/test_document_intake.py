@@ -139,3 +139,32 @@ def test_watch_tick_routes_a_telegram_document_to_intake(tmp_path, monkeypatch):
         lambda pr, ed, cfg, tg, doc: intook.setdefault("cap", doc["caption"]))
     loop.watch(env, tmp_path, _once=True)
     assert intook.get("cap") == "/analyst reproduce"
+
+
+def test_failed_document_download_creates_no_task(tmp_path):
+    from harn import loop, scaffold, tasks, ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(exist_ok=True)
+    (env / "agents" / "analyst.md").write_text("---\nname: analyst\nstatus: todo\n---\n## Role\na", encoding="utf-8")
+    sent = []
+
+    class FakeHIL:
+        def poll_updates(self, sd):
+            return {"commands": [], "documents":
+                [{"file_id": "F", "filename": "r.pdf", "caption": "/analyst reproduce", "message_id": 1}]}
+
+        def download_file(self, fid):
+            return None
+
+        def send(self, msg, *a, **k):
+            sent.append(msg)
+            return 1
+
+    cfg = Config.load(env)
+    doc = {"file_id": "F", "filename": "r.pdf", "caption": "/analyst reproduce", "message_id": 1}
+    result = loop._intake_document(tmp_path, env, cfg, FakeHIL(), doc)
+
+    assert result.get("ok") is False
+    assert tasks.load_tasks(env) == []
+    assert sent and "couldn't download" in sent[0].lower()
