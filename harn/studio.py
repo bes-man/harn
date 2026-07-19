@@ -13,6 +13,7 @@ without binding a socket.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import math
 import mimetypes
@@ -43,6 +44,29 @@ from . import workflow as workflow_mod
 from . import workflows as workflows_mod
 from .config import Config
 from .loop import _pick_adapter
+
+
+# --------------------------------------------------------------------------- #
+# Bearer-token auth gate for sensitive routes
+# --------------------------------------------------------------------------- #
+_PROTECTED_ROUTES = {"/api/agents/run", "/api/agents/generate", "/api/tasks/intake"}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def _check_bearer(configured_token: str, client_ip: str, auth_header: str) -> bool:
+    """Authorize a sensitive-route request. No token configured → allow
+    (back-compat). Loopback client → allow (local operator/UI). Otherwise the
+    Authorization header must be `Bearer <token>` matching the configured
+    token (constant-time)."""
+    if not configured_token:
+        return True
+    if client_ip in _LOOPBACK:
+        return True
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        return False
+    presented = auth_header[len(prefix):].strip()
+    return hmac.compare_digest(presented, configured_token)
 
 
 # --------------------------------------------------------------------------- #
@@ -1316,6 +1340,12 @@ def _make_handler(default_env: Path):
             env = self._env()
             if env is None:
                 self._json({"error": "invalid or missing env"}, 400); return
+            if route in _PROTECTED_ROUTES:
+                from . import secrets_store as _sec
+                token = (_sec.load(env).get("HARN_API_TOKEN") or "").strip()
+                ip = self.client_address[0] if self.client_address else ""
+                if not _check_bearer(token, ip, self.headers.get("Authorization", "")):
+                    self._json({"error": "unauthorized"}, 401); return
             if route == "/api/state":
                 self._json(state_payload(env))
             elif route == "/api/config":
@@ -1381,6 +1411,12 @@ def _make_handler(default_env: Path):
             env = self._env()
             if env is None:
                 self._json({"error": "invalid or missing env"}, 400); return
+            if route in _PROTECTED_ROUTES:
+                from . import secrets_store as _sec
+                token = (_sec.load(env).get("HARN_API_TOKEN") or "").strip()
+                ip = self.client_address[0] if self.client_address else ""
+                if not _check_bearer(token, ip, self.headers.get("Authorization", "")):
+                    self._json({"error": "unauthorized"}, 401); return
             body = self._read_json()
             if route == "/api/workflow":
                 self._json(apply_workflow(env, body))

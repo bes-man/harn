@@ -240,3 +240,22 @@ def test_run_role_push_pr_failure_does_not_fail_run(tmp_path, monkeypatch):
     assert r["ok"] is True
     assert r.get("pr_url") is None
     assert pushed["branch"].endswith("PRJ-1")
+
+
+def test_bearer_check_no_token_configured_allows_all(tmp_path):
+    from harn import studio
+    # token unset → always authorized (back-compat)
+    assert studio._check_bearer(configured_token="", client_ip="8.8.8.8", auth_header="") is True
+
+
+def test_bearer_check_loopback_exempt(tmp_path):
+    from harn import studio
+    assert studio._check_bearer(configured_token="s3cret", client_ip="127.0.0.1", auth_header="") is True
+    assert studio._check_bearer(configured_token="s3cret", client_ip="::1", auth_header="") is True
+
+
+def test_bearer_check_remote_requires_valid_token(tmp_path):
+    from harn import studio
+    assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="Bearer s3cret") is True
+    assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="Bearer wrong") is False
+    assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="") is False
