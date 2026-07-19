@@ -139,6 +139,25 @@ def _http_post_json(url: str, params: dict, timeout: int) -> dict | None:
     return body if isinstance(body, dict) else None
 
 
+def _http_get_bytes(url: str, timeout: int) -> bytes | None:
+    """GET a URL; return the raw response body, or None on failure.
+
+    Mirrors `_http_post_json`'s error handling/isolation so tests can stub
+    the network without touching urllib internals.
+    """
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+            return resp.read()
+    except ssl.SSLError as e:
+        _warn_once("ssl", f"TLS error ({e}). If behind a proxy/AV, install certifi "
+                          "or set HARN_TELEGRAM_SSL_VERIFY=0.")
+        return None
+    except Exception as e:
+        _warn_once("net", f"file download from {url.rsplit('/', 1)[-1]} failed: {e}")
+        return None
+
+
 @dataclass
 class TelegramHIL:
     token: str
@@ -275,6 +294,66 @@ class TelegramHIL:
             return text
         return None
 
+    def _classify_update(self, upd: dict) -> tuple[str, dict] | None:
+        """Classify one update from the trusted chat into a command or
+        document dict, or None if it's foreign/bot/irrelevant.
+
+        Shared by `poll_updates` (the real single-drain classifier) so
+        `poll_commands`/`poll_documents` agree on the same trust boundary.
+        """
+        msg = upd.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(self.chat_id):
+            return None
+        if (msg.get("from") or {}).get("is_bot"):
+            return None
+        message_id = msg.get("message_id")
+        document = msg.get("document")
+        photo = msg.get("photo")
+        if document or photo:
+            if document:
+                file_id = document.get("file_id")
+                filename = document.get("file_name") or f"file-{message_id}"
+            else:
+                largest = max(photo, key=lambda p: p.get("file_size") or 0)
+                file_id = largest.get("file_id")
+                filename = f"photo-{message_id}.jpg"
+            return "document", {
+                "file_id": file_id,
+                "filename": filename,
+                "caption": msg.get("caption") or "",
+                "message_id": message_id,
+            }
+        text = (msg.get("text") or "").strip()
+        if text.startswith("/"):
+            return "command", {"text": text, "message_id": message_id}
+        return None
+
+    def poll_updates(self, state_dir: Path) -> dict:
+        """Non-blocking single drain (timeout=0) of new updates, classified
+        into commands and documents/photos from the trusted chat.
+
+        This is the ONE drain that should be used when a caller needs both
+        commands and documents in the same tick (e.g. `harn watch`) — calling
+        `poll_commands` and `poll_documents` back-to-back would double-drain
+        the shared offset file, so whichever runs first would consume
+        everything and the second would see nothing. `poll_commands` and
+        `poll_documents` remain as thin wrappers (each doing their own drain)
+        for isolated callers/tests; a caller needing both must use this
+        method instead.
+        """
+        offset = self._load_offset(state_dir)
+        offset, updates = self._get_updates(offset, poll_timeout=0)
+        self._save_offset(state_dir, offset)
+        commands: list[dict] = []
+        documents: list[dict] = []
+        for upd in updates:
+            classified = self._classify_update(upd)
+            if classified is None:
+                continue
+            kind, item = classified
+            (commands if kind == "command" else documents).append(item)
+        return {"commands": commands, "documents": documents}
+
     def poll_commands(self, state_dir: Path) -> list[dict]:
         """Non-blocking drain of new updates (timeout=0), returning every
         `/command …` text message from the trusted chat (see the chat_id
@@ -283,22 +362,55 @@ class TelegramHIL:
         updates). Used by `harn watch`'s per-tick trigger scan (agent-
         triggers spec) — commands from any other chat are silently ignored,
         and non-command text (HIL answers) is left for `await_answer`.
+
+        Does its own drain (offset load/save), independent of
+        `poll_documents`/`poll_updates` — fine for isolated callers, but a
+        caller that also needs documents in the same tick must use
+        `poll_updates` instead to avoid double-draining the offset.
         """
         offset = self._load_offset(state_dir)
         offset, updates = self._get_updates(offset, poll_timeout=0)
         self._save_offset(state_dir, offset)
         out: list[dict] = []
         for upd in updates:
-            msg = upd.get("message") or {}
-            if str(msg.get("chat", {}).get("id")) != str(self.chat_id):
-                continue
-            if (msg.get("from") or {}).get("is_bot"):
-                continue
-            text = (msg.get("text") or "").strip()
-            if not text.startswith("/"):
-                continue
-            out.append({"text": text, "message_id": msg.get("message_id")})
+            classified = self._classify_update(upd)
+            if classified and classified[0] == "command":
+                out.append(classified[1])
         return out
+
+    def poll_documents(self, state_dir: Path) -> list[dict]:
+        """Non-blocking drain of new updates (timeout=0), returning every
+        document/photo message from the trusted chat as
+        `{"file_id", "filename", "caption", "message_id"}`. Same trust
+        boundary as `poll_commands` (see `_classify_update`).
+
+        Does its own drain, independent of `poll_commands`/`poll_updates` —
+        see the double-drain caution on `poll_commands`.
+        """
+        offset = self._load_offset(state_dir)
+        offset, updates = self._get_updates(offset, poll_timeout=0)
+        self._save_offset(state_dir, offset)
+        out: list[dict] = []
+        for upd in updates:
+            classified = self._classify_update(upd)
+            if classified and classified[0] == "document":
+                out.append(classified[1])
+        return out
+
+    def download_file(self, file_id: str) -> bytes | None:
+        """Download a Telegram file by id: getFile → file_path → GET bytes.
+
+        Best-effort — returns None on any failure (unresolved file, missing
+        path, or a failed download).
+        """
+        body = self._api("getFile", {"file_id": file_id})
+        if not body:
+            return None
+        path = (body.get("result") or {}).get("file_path")
+        if not path:
+            return None
+        url = f"https://api.telegram.org/file/bot{self.token}/{path}"
+        return _http_get_bytes(url, 30)
 
     def await_answer(
         self,
