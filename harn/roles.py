@@ -54,6 +54,7 @@ class Role:
     isolation: str = "main"        # main | worktree
     agent: str = ""                # CLI adapter override (empty = project default)
     model: str = ""                # model override (empty = project default)
+    push: bool = False             # opt-in commit->push->PR stage after success
 
     def body(self) -> str:
         """The role's persona/instructions — everything after the frontmatter,
@@ -91,6 +92,7 @@ def discover(env_dir: Path) -> list[Role]:
         if not name or not status:
             continue
         oracle_raw = fm.get("oracle", True)
+        push_raw = fm.get("push", False)
         out.append(Role(
             name=name,
             path=role_md,
@@ -108,6 +110,7 @@ def discover(env_dir: Path) -> list[Role]:
                       else "main"),
             agent=str(fm.get("agent") or "").strip(),
             model=str(fm.get("model") or "").strip(),
+            push=push_raw if isinstance(push_raw, bool) else False,
         ))
     return out
 
@@ -131,7 +134,7 @@ def _safe_name(name: str) -> str:
 
 
 _ROLE_FM_FIELDS = ("name", "command", "status", "trigger", "next_status",
-                   "workflow", "oracle", "secrets", "isolation", "agent", "model")
+                   "workflow", "oracle", "secrets", "isolation", "agent", "model", "push")
 
 
 def _render_role(data: dict) -> str:

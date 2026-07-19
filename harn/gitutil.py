@@ -420,3 +420,15 @@ def push_branch(cwd: Path, remote: str, branch: str) -> bool:
     if not is_repo(cwd) or not remote or not branch:
         return False
     return _run(["push", "-u", remote, branch], cwd, timeout=60)[0] == 0
+
+
+def default_branch(cwd: Path) -> str:
+    """The remote's default branch name (e.g. 'main'), or '' if it can't be
+    determined (no repo, no origin, no symbolic-ref set) — used as the
+    fallback base for opening a PR when config leaves `git_pr_base` empty."""
+    if not is_repo(cwd):
+        return ""
+    code, out, _ = _run(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
+    if code != 0 or not out:
+        return ""
+    return out.rsplit("/", 1)[-1]

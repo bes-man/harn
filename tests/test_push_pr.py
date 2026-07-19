@@ -139,3 +139,104 @@ def test_gh_create_pr_missing_binary_returns_none(monkeypatch, tmp_path):
         raise FileNotFoundError("gh")
     monkeypatch.setattr(prhost.subprocess, "run", boom)
     assert prhost.create_pr(tmp_path, base="main", head="h", title="t", body="b") is None
+
+
+def test_role_push_field_discovered(tmp_path):
+    from harn import roles
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    roles.save(env, {"name": "dev", "status": "todo", "push": True, "body": "x"})
+    r = roles.find(env, "dev")
+    assert r.push is True
+    roles.save(env, {"name": "dev2", "status": "todo", "body": "x"})
+    assert roles.find(env, "dev2").push is False
+
+
+def _push_pr_setup(tmp_path):
+    from harn import roles, loop, tasks, workflows, scaffold, ENV_DIRNAME as _ENV
+    _git(["init", "-q"], tmp_path)
+    _git(["config", "user.email", "t@t"], tmp_path)
+    _git(["config", "user.name", "t"], tmp_path)
+    scaffold.setup(tmp_path)
+    env = tmp_path / _ENV
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd=""\n'
+        'require_tests=false\n[loop]\noracle=false\n[notify]\nwait_for_reply=false\n'
+        '[git]\npr_base = "dev"\n')
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-qm", "base"], tmp_path)
+    from .conftest import make_task
+    t = make_task(env, "PRJ-1", title="Feat")
+    plan = {"preamble": "", "nodes": [{"kind": "step", "title": "Do", "body": "do",
+        "id": "step-1", "agent": "", "model": "", "effort": "", "temperature": "",
+        "required": [], "tools": [], "enabled": True}]}
+    workflows.save_task_plan(env, t.id, plan)
+    (env / "agents").mkdir(exist_ok=True)
+    (env / "agents" / "dev.md").write_text(
+        "---\nname: dev\nstatus: todo\noracle: false\npush: true\n---\n## Role\ndev", encoding="utf-8")
+    return env
+
+
+def test_run_role_push_stage_commits_pushes_opens_pr(tmp_path, monkeypatch):
+    from harn import roles_runner, loop, tasks
+    from harn.adapters.base import AgentResult
+
+    env = _push_pr_setup(tmp_path)
+
+    # the run makes a file change so there's something to commit
+    def fake_turn(prompt, cwd, timeout=1800, *, model=None, effort=None, temperature=None):
+        (cwd / "out.txt").write_text("done\n", encoding="utf-8")
+        return AgentResult(ok=True, text="done")
+    class Fake:
+        name = "fake"
+        def available(self): return True
+        run_turn = staticmethod(fake_turn)
+    monkeypatch.setattr(loop, "get_adapter", lambda n: Fake())
+
+    pushed = {}
+    def fake_push_branch(cwd, remote, branch):
+        pushed["branch"] = branch
+        return True
+    def fake_create_pr(cwd, *, base, head, title, body):
+        pushed["base"] = base
+        return "https://github.com/o/r/pull/7"
+    monkeypatch.setattr(roles_runner.gitutil, "push_branch", fake_push_branch)
+    monkeypatch.setattr(roles_runner.prhost, "create_pr", fake_create_pr)
+
+    r = roles_runner.run_role(tmp_path, env, "PRJ-1", "dev")
+    assert r["ok"] is True
+    assert r.get("pr_url") == "https://github.com/o/r/pull/7"
+    assert pushed["base"] == "dev"          # configurable base honored
+    assert pushed["branch"].endswith("PRJ-1")
+    assert "https://github.com/o/r/pull/7" in tasks.find(env, "PRJ-1").result
+
+
+def test_run_role_push_pr_failure_does_not_fail_run(tmp_path, monkeypatch):
+    from harn import roles_runner, loop
+    from harn.adapters.base import AgentResult
+
+    env = _push_pr_setup(tmp_path)
+
+    def fake_turn(prompt, cwd, timeout=1800, *, model=None, effort=None, temperature=None):
+        (cwd / "out.txt").write_text("done\n", encoding="utf-8")
+        return AgentResult(ok=True, text="done")
+    class Fake:
+        name = "fake"
+        def available(self): return True
+        run_turn = staticmethod(fake_turn)
+    monkeypatch.setattr(loop, "get_adapter", lambda n: Fake())
+
+    pushed = {}
+    def fake_push_branch(cwd, remote, branch):
+        pushed["branch"] = branch
+        return True
+    monkeypatch.setattr(roles_runner.gitutil, "push_branch", fake_push_branch)
+    monkeypatch.setattr(roles_runner.prhost, "create_pr",
+                        lambda cwd, *, base, head, title, body: None)
+
+    r = roles_runner.run_role(tmp_path, env, "PRJ-1", "dev")
+    assert r["ok"] is True
+    assert r.get("pr_url") is None
+    assert pushed["branch"].endswith("PRJ-1")

@@ -16,6 +16,7 @@ from . import config as config_mod
 from . import events as events_mod
 from . import gitutil
 from . import loop as loop_mod
+from . import prhost
 from . import roles as roles_mod
 from . import secrets_store
 from . import tasks as tasks_mod
@@ -139,9 +140,40 @@ def run_role(project_root: Path, env_dir: Path, task_id: str, role_name: str,
     tracker.push_status(task)
     tracker.push_result(task)
 
+    pr_url = None
+    if getattr(role, "push", False):
+        pr_url = _push_and_open_pr(env_dir, project_root, task, role, cfg)
+
     events_mod.emit(env_dir, "stage_end", task_id=task.id, stage="role_run",
                     role=role.name, ok=True, verdict=verdict)
-    return {"ok": True, "task_id": task.id, "status": task.status, "warning": warning}
+    return {"ok": True, "task_id": task.id, "status": task.status,
+            "warning": warning, "pr_url": pr_url}
+
+
+def _push_and_open_pr(env_dir: Path, project_root: Path, task: "tasks_mod.Task",
+                      role: "roles_mod.Role", cfg: "config_mod.Config") -> str | None:
+    """Commit -> push -> open PR after a successful role run. Opt-in
+    (`role.push`) and fully guarded: any failure here degrades to None and
+    NEVER fails the (already-succeeded) run."""
+    try:
+        branch = f"{cfg.git_branch_prefix}{task.id}"
+        sha = gitutil.commit_to_branch(project_root, branch,
+                                       f"{task.title} ({task.id})",
+                                       exclude=("harn_env",))
+        if not sha:
+            return None
+        if not gitutil.push_branch(project_root, cfg.git_push_remote, branch):
+            return None
+        base = cfg.git_pr_base or gitutil.default_branch(project_root) or "main"
+        url = prhost.create_pr(project_root, base=base, head=branch,
+                               title=f"{task.title} ({task.id})",
+                               body=(task.result or task.description or "")[:4000])
+        if url:
+            task.result = (task.result + "\n\n" if task.result else "") + f"PR: {url}"
+            tasks_mod._save(task)
+        return url
+    except Exception:
+        return None
 
 
 def _role_oracle_review(env_dir: Path, cfg: "config_mod.Config",
