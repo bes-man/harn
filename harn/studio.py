@@ -31,6 +31,7 @@ from pathlib import Path
 from . import agentgen as agentgen_mod
 from . import attachments as attachments_mod
 from . import events as events_mod
+from . import intake as intake_mod
 from . import mcp_server
 from . import roles as roles_mod
 from . import runner as runner_mod
@@ -1284,6 +1285,54 @@ def upload_attachment(env_dir: Path, payload: dict) -> dict:
     return {"ok": True, "name": p.name}
 
 
+def _parse_multipart(body: bytes, content_type: str) -> tuple[dict, dict]:
+    """Parse a `multipart/form-data` body without the (Python 3.13+-removed)
+    `cgi` module. `fields[name] = str` for plain fields; `files[name] =
+    (filename, bytes)` for parts that carry a `filename`. Uses the stdlib
+    `email` module: a message is reconstructed from the Content-Type header
+    plus the raw body, then walked part by part — `email` already knows how
+    to split on the boundary and decode part headers, so we don't hand-roll
+    that.
+    """
+    import email
+    from email.message import Message
+
+    fields: dict = {}
+    files: dict = {}
+    msg = email.message_from_bytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    )
+    if not msg.is_multipart():
+        return fields, files
+    for part in msg.get_payload():
+        if not isinstance(part, Message):
+            continue
+        name = part.get_param("name", header="Content-Disposition")
+        if not name:
+            continue
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = b""
+        if filename:
+            files[name] = (filename, payload)
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                fields[name] = payload.decode(charset)
+            except (UnicodeDecodeError, LookupError):
+                fields[name] = payload.decode("utf-8", errors="replace")
+    return fields, files
+
+
+def intake_payload(project_root: Path, env_dir: Path, *, filename: str, data: bytes,
+                    text: str = "", agent: str | None = None) -> dict:
+    """Thin HTTP-layer wrapper over `intake.intake` — kept pure/no-socket so
+    it's unit-testable without spinning up the server."""
+    return intake_mod.intake(project_root, env_dir, filename=filename, data=data,
+                              text=text, agent=agent)
+
+
 def delete_attachment(env_dir: Path, payload: dict) -> dict:
     """Remove one attachment from a task."""
     task_id = (payload.get("task_id") or "").strip()
@@ -1431,6 +1480,22 @@ def _make_handler(default_env: Path):
                 ip = self.client_address[0] if self.client_address else ""
                 if not _check_bearer(token, ip, self.headers.get("Authorization", "")):
                     self._json({"error": "unauthorized"}, 401); return
+            if route == "/api/tasks/intake":
+                # Multipart body — read the raw bytes ourselves instead of
+                # `_read_json()` (which would try to json.loads() them and
+                # consume `self.rfile` in the process, leaving nothing for
+                # us to parse). rfile is read exactly once, here.
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n else b""
+                content_type = self.headers.get("Content-Type", "")
+                fields, files = _parse_multipart(raw, content_type)
+                if "file" not in files:
+                    self._json({"ok": False, "error": "file is required"}); return
+                filename, data = files["file"]
+                self._json(intake_payload(
+                    env.parent, env, filename=filename, data=data,
+                    text=fields.get("text", ""), agent=fields.get("agent") or None))
+                return
             body = self._read_json()
             if route == "/api/workflow":
                 self._json(apply_workflow(env, body))

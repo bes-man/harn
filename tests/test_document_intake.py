@@ -141,6 +141,51 @@ def test_watch_tick_routes_a_telegram_document_to_intake(tmp_path, monkeypatch):
     assert intook.get("cap") == "/analyst reproduce"
 
 
+# --- Task 5: POST /api/tasks/intake (multipart, no cgi) ------------------- #
+
+
+def test_parse_multipart_extracts_file_and_fields():
+    from harn import studio
+    boundary = "BOUNDARY"
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhello\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"agent\"\r\n\r\nanalyst\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"r.pdf\"\r\n"
+        f"Content-Type: application/pdf\r\n\r\nPDFBYTES\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    fields, files = studio._parse_multipart(body, f"multipart/form-data; boundary={boundary}")
+    assert fields["text"] == "hello" and fields["agent"] == "analyst"
+    assert files["file"][0] == "r.pdf"
+    assert files["file"][1] == b"PDFBYTES"
+
+
+def test_intake_payload_calls_through_to_intake_intake(tmp_path, monkeypatch):
+    from harn import studio, scaffold, ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    called = {}
+
+    def fake_intake(project_root, env_dir, *, filename, data, text, agent=None, cfg=None):
+        called["args"] = (project_root, env_dir, filename, data, text, agent)
+        return {"ok": True, "task_id": "T-1"}
+
+    monkeypatch.setattr(studio.intake_mod, "intake", fake_intake)
+    result = studio.intake_payload(tmp_path, env, filename="r.pdf", data=b"BYTES",
+                                    text="investigate", agent="analyst")
+    assert result == {"ok": True, "task_id": "T-1"}
+    assert called["args"] == (tmp_path, env, "r.pdf", b"BYTES", "investigate", "analyst")
+
+
+def test_intake_payload_missing_file_is_error(tmp_path):
+    from harn import studio, scaffold, ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    # Simulate the do_POST branch's own guard: no file field at all.
+    fields, files = studio._parse_multipart(b"", "multipart/form-data; boundary=X")
+    assert "file" not in files
+
+
 def test_failed_document_download_creates_no_task(tmp_path):
     from harn import loop, scaffold, tasks, ENV_DIRNAME
     scaffold.setup(tmp_path)
