@@ -53,3 +53,47 @@ def test_download_file_returns_bytes(monkeypatch, tmp_path):
     hil = TelegramHIL(token="t", chat_id="42")
     data = hil.download_file("F-good")
     assert data == b"PDFDATA"
+
+
+# --- Task 3: intake.intake() -------------------------------------------- #
+
+
+def test_intake_creates_task_and_attaches_file(tmp_path):
+    from harn import intake, tasks, attachments, scaffold, ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    r = intake.intake(tmp_path, env, filename="report.pdf", data=b"PDF",
+                      text="Investigate the outage\ndetails here")
+    assert r["ok"] is True
+    t = tasks.find(env, r["task_id"])
+    assert t.title == "Investigate the outage"
+    files = attachments.list_files(env, t.id)
+    assert any(f["name"] == "report.pdf" for f in files)
+
+
+def test_intake_with_agent_confirm_off_dispatches(tmp_path, monkeypatch):
+    from harn import intake, scaffold, ENV_DIRNAME, triggers
+    from harn.config import Config
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    (env / "harn.toml").write_text("[intake]\nconfirm_before_run = false\n", encoding="utf-8")
+    called = {}
+    monkeypatch.setattr(intake.triggers_mod, "dispatch_command",
+        lambda pr, ed, cmd, arg, cfg=None: called.setdefault("cmd", cmd) or {"ok": True, "task_id": arg, "status": "done"})
+    r = intake.intake(tmp_path, env, filename="f.txt", data=b"x", text="do it", agent="analyst")
+    assert r["ok"] is True
+    assert called["cmd"] == "analyst"
+
+
+def test_intake_confirm_decline_does_not_dispatch(tmp_path, monkeypatch):
+    from harn import intake, scaffold, ENV_DIRNAME
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME  # confirm_before_run defaults True
+    # confirm gate returns "no"
+    monkeypatch.setattr(intake, "_confirm", lambda env_dir, cfg, summary: False)
+    dispatched = {"n": 0}
+    monkeypatch.setattr(intake.triggers_mod, "dispatch_command",
+        lambda *a, **k: dispatched.update(n=dispatched["n"] + 1) or {"ok": True})
+    r = intake.intake(tmp_path, env, filename="f.txt", data=b"x", text="do it", agent="analyst")
+    assert dispatched["n"] == 0            # declined → never dispatched
+    assert r["ok"] is True and r.get("confirmed") is False
