@@ -27,14 +27,29 @@ def _confirm(env_dir: Path, cfg: Config, summary: str) -> bool:
     Fully guarded — any failure talking to Telegram is treated as a decline
     unless we've already decided to default to True (unconfigured), so a
     broken Telegram integration never crashes `intake()`.
+
+    `_confirm` must never hang: `await_answer` is always called with a bounded
+    `timeout_s` (derived from `cfg.wait_timeout_minutes` when set, else a
+    5-minute default), so a Telegram card that nobody answers still returns
+    within a bounded time instead of blocking the calling HTTP request
+    thread forever. A timeout / no answer fails safe to False (don't
+    auto-run — the task and file are already saved, a human can run it
+    manually later).
     """
     try:
         hil = TelegramHIL.from_env(env_dir)
         if hil is None:
             return True
+        timeout_s = (
+            cfg.wait_timeout_minutes * 60
+            if getattr(cfg, "wait_timeout_minutes", 0) > 0
+            else 300
+        )
         reply, _source = hil.await_answer(
             f"{summary} — reply 'yes' to run",
             state_dir=env_dir / "state",
+            timeout_s=timeout_s,
+            remind_every_s=timeout_s // 2 or 1,
         )
         if not reply:
             return False

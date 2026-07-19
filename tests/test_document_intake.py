@@ -97,3 +97,17 @@ def test_intake_confirm_decline_does_not_dispatch(tmp_path, monkeypatch):
     r = intake.intake(tmp_path, env, filename="f.txt", data=b"x", text="do it", agent="analyst")
     assert dispatched["n"] == 0            # declined → never dispatched
     assert r["ok"] is True and r.get("confirmed") is False
+
+
+def test_intake_confirm_on_but_no_telegram_defaults_to_run(tmp_path, monkeypatch):
+    from harn import intake, scaffold, ENV_DIRNAME
+    monkeypatch.delenv("HARN_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HARN_TELEGRAM_CHAT_ID", raising=False)
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME  # confirm_before_run defaults True, no credentials file saved
+    called = {}
+    monkeypatch.setattr(intake.triggers_mod, "dispatch_command",
+        lambda pr, ed, cmd, arg, cfg=None: called.setdefault("cmd", cmd) or {"ok": True, "task_id": arg, "status": "done"})
+    r = intake.intake(tmp_path, env, filename="f.txt", data=b"x", text="do it", agent="analyst")
+    assert r["ok"] is True
+    assert called["cmd"] == "analyst"        # unconfigured Telegram → _confirm defaults True → dispatched
