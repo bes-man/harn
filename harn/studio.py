@@ -62,11 +62,16 @@ def _check_bearer(configured_token: str, client_ip: str, auth_header: str) -> bo
         return True
     if client_ip in _LOOPBACK:
         return True
-    prefix = "Bearer "
-    if not auth_header.startswith(prefix):
+    scheme, sep, rest = auth_header.partition(" ")
+    if not sep or scheme.lower() != "bearer":
         return False
-    presented = auth_header[len(prefix):].strip()
-    return hmac.compare_digest(presented, configured_token)
+    presented = rest.strip()
+    # `str.encode("utf-8")` never raises, unlike hmac.compare_digest() on a
+    # non-ASCII str (http.server decodes headers as Latin-1, so a header
+    # with non-ASCII bytes yields a non-ASCII str here). Comparing the
+    # utf-8 encodings keeps this constant-time and closed on bad input
+    # instead of raising a TypeError.
+    return hmac.compare_digest(presented.encode("utf-8"), configured_token.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------- #

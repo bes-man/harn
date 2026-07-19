@@ -259,3 +259,15 @@ def test_bearer_check_remote_requires_valid_token(tmp_path):
     assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="Bearer s3cret") is True
     assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="Bearer wrong") is False
     assert studio._check_bearer(configured_token="s3cret", client_ip="8.8.8.8", auth_header="") is False
+
+
+def test_bearer_check_nonascii_header_returns_false_not_raises(tmp_path):
+    from harn import studio
+    assert studio._check_bearer("s3cret", "8.8.8.8", "Bearer \xff\xfe") is False
+
+
+def test_bearer_check_scheme_case_insensitive(tmp_path):
+    from harn import studio
+    assert studio._check_bearer("s3cret", "8.8.8.8", "bearer s3cret") is True
+    assert studio._check_bearer("s3cret", "8.8.8.8", "BEARER s3cret") is True
+    assert studio._check_bearer("s3cret", "8.8.8.8", "bearer wrong") is False
