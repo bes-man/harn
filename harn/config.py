@@ -109,6 +109,7 @@ DEFAULTS: dict = {
     # `_parse_board_statuses` for the two accepted TOML shapes.
     "board": {},
     "git": {"pr_base": "", "branch_prefix": "harn/", "push_remote": "origin"},
+    "intake": {"confirm_before_run": True},
 }
 
 
@@ -228,6 +229,7 @@ class Config:
     git_pr_base: str = ""
     git_branch_prefix: str = "harn/"
     git_push_remote: str = "origin"
+    intake_confirm_before_run: bool = True
     raw: dict = field(default_factory=dict)
 
     @property
@@ -301,5 +303,6 @@ class Config:
             git_pr_base=str((data.get("git", {}) or {}).get("pr_base", "") or "").strip(),
             git_branch_prefix=str((data.get("git", {}) or {}).get("branch_prefix", "harn/") or "harn/").strip(),
             git_push_remote=str((data.get("git", {}) or {}).get("push_remote", "origin") or "origin").strip(),
+            intake_confirm_before_run=bool((data.get("intake", {}) or {}).get("confirm_before_run", True)),
             raw=data,
         )
