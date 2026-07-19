@@ -16,11 +16,27 @@ with no token — this is the "local operator" setup and needs no
 configuration.
 
 If you set `HARN_API_TOKEN` in `harn_env/secrets.env` (`KEY=value` lines,
-gitignored, chmod 600), three routes become **protected**:
+gitignored, chmod 600), every route that can launch agent execution, spend
+LLM tokens, or mutate a role becomes **protected**:
 
 - `POST /api/agents/run`
 - `POST /api/agents/generate`
-- `POST /api/tasks/intake`
+- `POST /api/agents/save`
+- `POST /api/agents/delete`
+- `POST /api/tasks/launch`
+- `POST /api/tasks/launch_workflow`
+- `POST /api/tasks/run_stage`
+- `POST /api/tasks/run_step`
+- `POST /api/tasks/rerun_workflow`
+- `POST /api/tasks/status` (moving a task to `in_progress` auto-launches a
+  run, so this route is gated the same as the explicit launch routes)
+- `POST /api/tools/chat` (runs an LLM turn)
+- `POST /api/tasks/intake` (planned; see below)
+
+Read-only `GET` info routes (`/api/state`, `/api/board`, `/api/tasks/transcript`,
+etc.) are **not** protected — the threat model here is unauthorized action
+(launching agents, spending tokens, mutating roles), not information
+disclosure, so those stay reachable without a token.
 
 Protected-route requests must carry:
 
@@ -38,6 +54,30 @@ If `HARN_API_TOKEN` is unset, behavior is unchanged from before this
 feature: no token is required from anyone (protection is opt-in).
 
 A request that fails the check gets `401 {"error": "unauthorized"}`.
+
+### Reverse-proxy caveat — read this before binding to a non-loopback host
+
+The loopback exemption assumes `harn ui` receives connections directly, with
+no intermediary. **If you front `harn ui` with a reverse proxy** (nginx,
+Caddy, an SSH tunnel terminating locally, etc.) that terminates TLS and
+forwards to `127.0.0.1`, then **every** proxied request — including ones
+from a remote, unauthenticated attacker — arrives at the studio process
+looking like it came from `127.0.0.1`. The loopback check can't tell the
+difference, so it treats all of them as trusted and the `HARN_API_TOKEN`
+check is skipped entirely. In that configuration the token provides **no
+protection** for remote callers, silently.
+
+harn does **not** trust `X-Forwarded-For` or similar headers to recover the
+real client IP — that header is attacker-controlled and trivially spoofed,
+so trusting it would be worse than the current behavior, not better.
+
+If you need `harn ui` reachable from off-box:
+
+- Prefer running it bound directly to the interface you want (not behind a
+  loopback-terminating proxy), so real peer IPs reach the loopback check, or
+- If a reverse proxy is required, enforce access control **at the proxy
+  layer** (mTLS, an auth gate, IP allowlisting, a VPN) — do not rely on
+  `HARN_API_TOKEN` to do that job when a loopback proxy sits in front.
 
 ### curl example (remote caller, token configured)
 

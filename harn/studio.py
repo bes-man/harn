@@ -49,7 +49,16 @@ from .loop import _pick_adapter
 # --------------------------------------------------------------------------- #
 # Bearer-token auth gate for sensitive routes
 # --------------------------------------------------------------------------- #
-_PROTECTED_ROUTES = {"/api/agents/run", "/api/agents/generate", "/api/tasks/intake"}
+_PROTECTED_ROUTES = {
+    "/api/agents/run", "/api/agents/generate", "/api/tasks/intake",
+    "/api/agents/save", "/api/agents/delete",
+    "/api/tasks/launch", "/api/tasks/launch_workflow", "/api/tasks/run_stage",
+    "/api/tasks/run_step", "/api/tasks/rerun_workflow", "/api/tasks/status",
+    "/api/tools/chat",
+}
+# "localhost" never actually appears in client_address[0] (BaseHTTPServer hands
+# back the numeric peer IP, not a resolved hostname) — kept here as
+# belt-and-suspenders in case that assumption ever changes.
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 

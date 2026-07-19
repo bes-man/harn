@@ -273,6 +273,19 @@ def test_bearer_check_scheme_case_insensitive(tmp_path):
     assert studio._check_bearer("s3cret", "8.8.8.8", "bearer wrong") is False
 
 
+def test_protected_routes_cover_launch_and_spend():
+    """Locks the scope of _PROTECTED_ROUTES so a future edit can't silently
+    narrow it back to only the original 3 routes — every route that launches
+    an agent run or spends LLM tokens must require the bearer token for
+    non-loopback callers."""
+    from harn import studio
+    for route in (
+        "/api/agents/run", "/api/agents/generate", "/api/tasks/intake",
+        "/api/tasks/launch", "/api/tools/chat", "/api/agents/save",
+    ):
+        assert route in studio._PROTECTED_ROUTES
+
+
 def test_agent_api_doc_exists_and_covers_endpoints():
     from pathlib import Path
     p = Path(__file__).resolve().parent.parent / "docs" / "agent-api.md"
