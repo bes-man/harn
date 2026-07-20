@@ -1912,13 +1912,11 @@ _HTML = r"""<!DOCTYPE html>
   .tabs button.active{border-color:var(--accent);color:var(--accent)}
   .wfbar{display:flex;align-items:center;gap:6px}
   .wfbar select{font:inherit;padding:6px 30px 6px 9px;max-width:200px;width:auto}
-  .wfdesc{font-size:11px;color:var(--muted);max-width:200px;overflow:hidden;
-    text-overflow:ellipsis;white-space:nowrap}
   button.ghost{padding:6px 8px;font-size:12px;line-height:1}
   .header-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto;margin-left:auto}
   @media (max-width:1500px){
     header{gap:8px}
-    .wfdesc,.proj,.toggles{display:none}
+    .proj,.toggles{display:none}
     .wfbar select{max-width:160px}
   }
   @media (max-width:1120px){
@@ -2256,7 +2254,6 @@ _HTML = r"""<!DOCTYPE html>
     <span class="proj" id="proj" title="current project (env)"></span>
     <div class="wfbar" id="wfbar" title="active workflow — the flow agents follow">
       <select id="wfSel" onchange="switchWorkflow(this.value)"></select>
-      <span class="wfdesc" id="wfDesc"></span>
       <button class="ghost" onclick="newWorkflow()" title="New workflow preset">＋</button>
       <button class="ghost" onclick="editWorkflowMeta()" title="Edit name / description / version">✎</button>
       <button class="icon-btn" id="wfDelBtn" onclick="deleteWorkflow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg></button>
@@ -2476,9 +2473,6 @@ function renderWorkflows(){
   list.forEach(w=>{ const o=document.createElement('option');
     o.value=w.name; o.textContent=w.title+(w.version?(' · v'+w.version):'');
     if(w.name===active)o.selected=true; sel.appendChild(o); });
-  const cur=list.find(w=>w.name===active)||{};
-  $('#wfDesc').textContent=cur.description||'';
-  $('#wfDesc').title=cur.description||'';
   const del=$('#wfDelBtn'); const isDefault=active==='default';
   del.disabled=isDefault;
   del.title=isDefault?"The default workflow can't be deleted.":'Delete this preset';
@@ -4312,8 +4306,7 @@ async function renderSettings(){
     numField('setMaxCost','Max cost per run (USD)',LM_SETTINGS.max_cost_usd,'(0 = unlimited)')+
     numField('setMaxTokens','Max tokens per run',LM_SETTINGS.max_tokens,'(0 = unlimited)')+
     numField('setTurnTimeout','Per-turn timeout (seconds)',LM_SETTINGS.turn_timeout_seconds,'(0 = adapter default 1800)')+
-    numField('setMaxIters','Max iterations per run',LM_SETTINGS.max_iterations,'(0 = unlimited/off)')+
-    `<button class="primary" onclick="saveLoopMcp()">Save loop &amp; MCP settings</button> <span id="lmStatus" class="status"></span>`;
+    numField('setMaxIters','Max iterations per run',LM_SETTINGS.max_iterations,'(0 = unlimited/off)');
   $('#hilFields').innerHTML=
     `<div class="field"><label>Autonomy <span class="mut">(100% = decide from project context and loaded skills)</span></label>`+
     `<input type="range" id="setAutonomy" value="${LM_SETTINGS.autonomy_percent||0}" min="0" max="100" step="1" `+
@@ -4324,7 +4317,10 @@ async function renderSettings(){
     `<input type="password" id="setTelegramApiKey" value="" autocomplete="new-password" placeholder="${LM_SETTINGS.telegram_configured?'••••••••':'123456:ABC…'}"/></div>`+
     `<div class="field"><label>Telegram user ID</label>`+
     `<input type="text" id="setTelegramUserId" value="${esc(LM_SETTINGS.telegram_user_id||'')}" inputmode="numeric"/></div>`+
-    `<div class="mut" style="font-size:11px;line-height:1.6">Questions appear in the Studio sidebar first. If unanswered, harn sends the same options and recommendation to this Telegram user.</div>`;
+    `<div class="mut" style="font-size:11px;line-height:1.6">Questions appear in the Studio sidebar first. If unanswered, harn sends the same options and recommendation to this Telegram user.</div>`+
+    `<div class="row" style="margin-top:14px;gap:10px">`+
+    `<button class="primary" onclick="saveLoopMcp()">Save settings</button>`+
+    `<span class="status" id="hilStatus"></span></div>`;
   const chk=(id,label,val,hint)=>`<div class="field"><label><input type="checkbox" id="${id}" ${val?'checked':''}/> ${label}</label>`+
     `<div class="mut" style="font-size:11px;margin-left:22px">${hint}</div></div>`;
   $('#pipelineFields').innerHTML=
@@ -4334,11 +4330,17 @@ async function renderSettings(){
   $('#mcpFields').innerHTML=
     `<div class="field"><label><input type="checkbox" id="setSupervise" ${LM_SETTINGS.mcp_ui_supervise?'checked':''}/> harn ui supervises an MCP server</label></div>`+
     numField('setMcpPort','MCP port',LM_SETTINGS.mcp_ui_port,'(harn mcp --http)')+
-    numField('setReload','Tool hot-reload (seconds)',LM_SETTINGS.mcp_tool_reload_seconds,'(0 = disable live reload)');
+    numField('setReload','Tool hot-reload (seconds)',LM_SETTINGS.mcp_tool_reload_seconds,'(0 = disable live reload)')+
+    `<div class="row" style="margin-top:14px;gap:10px">`+
+    `<button class="primary" onclick="saveLoopMcp()">Save settings</button>`+
+    `<span class="status" id="lmStatus"></span></div>`;
 }
 async function saveLoopMcp(){
   const num=id=>{const el=$('#'+id); const v=el?el.value.trim():''; return v===''?'':v;};
-  const st=$('#lmStatus'); if(st) st.textContent='saving…';
+  // Two buttons call this (one right under the Telegram fields, one at the
+  // bottom of Settings) so whichever one the user clicked gets feedback.
+  const setStatus=text=>{['lmStatus','hilStatus'].forEach(id=>{const el=$('#'+id); if(el) el.textContent=text;});};
+  setStatus('saving…');
   try{
     const r=await post_('/api/settings',{
       max_cost_usd:num('setMaxCost'), max_tokens:num('setMaxTokens'),
@@ -4351,9 +4353,9 @@ async function saveLoopMcp(){
       oracle:$('#setOracle')?$('#setOracle').checked:false,
       auto_reconcile:$('#setReconcile')?$('#setReconcile').checked:false,
       design:$('#setDesign')?$('#setDesign').checked:false});
-    if(st) st.textContent = r.ok ? 'saved ✓ (restart harn ui for MCP changes)' : (r.error||'save failed');
+    setStatus(r.ok ? 'saved ✓ (restart harn ui for MCP changes)' : (r.error||'save failed'));
     if(r.ok) loadRunCaps();
-  }catch(e){ if(st) st.textContent='save failed'; }
+  }catch(e){ setStatus('save failed'); }
 }
 function settingsModelSelect(current,options){
   const isCustom=!!current && !options.includes(current);

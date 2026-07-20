@@ -532,7 +532,13 @@ def test_header_keeps_primary_actions_inside_viewport():
     assert '<div class="header-actions">' in html
     assert ".header-actions{display:flex" in html
     assert "@media (max-width:1500px)" in html
-    assert ".wfdesc,.proj,.toggles{display:none}" in html
+    assert ".proj,.toggles{display:none}" in html
+    # The workflow description used to live inline in the header (pushing the
+    # tab bar around on long descriptions, e.g. a verbose preset like
+    # spec-writer's) — it's gone from the header entirely now, not just
+    # hidden at narrow widths.
+    assert 'id="wfDesc"' not in html
+    assert ".wfdesc{" not in html
 
 
 def test_flow_sidebar_renders_visual_step_timeline_and_usage_states():
