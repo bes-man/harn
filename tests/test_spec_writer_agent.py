@@ -35,3 +35,35 @@ def test_spec_writer_role_discovered(tmp_path):
     assert r.isolation == "main"
     assert r.push is False
     assert r.body().strip(), "role must have a persona body"
+
+
+_EXPECTED_STEP_TITLES = [
+    "Research",
+    "Competitor analysis",
+    "Best practices",
+    "Risk analysis",
+    "Questions to user",
+    "Draft spec",
+    "Lock spec",
+]
+
+
+def test_spec_writer_workflow_preset_loads(tmp_path):
+    env = _scaffolded_env(tmp_path)
+    wf = workflows.load(env, "spec-writer")
+    assert wf is not None, "spec-writer.json not shipped/loadable"
+    assert wf["name"] == "spec-writer"
+    steps = [n for n in wf["nodes"] if n.get("kind") == "step"]
+    assert [s["title"] for s in steps] == _EXPECTED_STEP_TITLES
+    for s in steps:
+        assert s["id"], f"step {s['title']!r} missing id"
+        assert s["body"].strip(), f"step {s['title']!r} missing body"
+    ids = [s["id"] for s in steps]
+    assert len(ids) == len(set(ids)), "step ids must be unique"
+
+
+def test_spec_writer_role_workflow_matches_preset_name(tmp_path):
+    env = _scaffolded_env(tmp_path)
+    role = next(r for r in roles.discover(env) if r.name == "spec-writer")
+    wf = workflows.load(env, role.workflow)
+    assert wf is not None, "role's workflow: value must resolve to a real preset"

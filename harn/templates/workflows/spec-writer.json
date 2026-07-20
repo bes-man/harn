@@ -1,0 +1,79 @@
+{
+  "name": "spec-writer",
+  "title": "Spec Writer",
+  "description": "Research a task, ask the human what's genuinely ambiguous, and lock a software-spec-shaped set of acceptance criteria.",
+  "version": "1",
+  "preamble": "",
+  "nodes": [
+    {
+      "kind": "step",
+      "id": "step-research",
+      "title": "Research",
+      "body": "Read the task, any linked PRD (`read_prd`), and relevant code/skills (`project`, `architecture`). Restate the problem as one AS-IS paragraph and one TO-BE paragraph. This framing is what every later step reasons against — get it right before moving on.",
+      "required": ["project", "architecture"],
+      "tools": ["read_prd"],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-competitor-analysis",
+      "title": "Competitor analysis",
+      "body": "Research how similar products or features solve this same problem (web search / context7 where the CLI adapter supports it). If live web search isn't available, reason from training knowledge and explicitly flag the gap rather than guessing silently. Record findings as private notes for the draft — competitor names/approaches are NOT a section in the final spec.",
+      "required": [],
+      "tools": [],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-best-practices",
+      "title": "Best practices",
+      "body": "Identify current technical best practices and patterns for this kind of change (skills: `standards`, `architecture`; context7 for library/API specifics). Same rule as competitor analysis: these findings become concrete `## Requirements` lines later, never their own heading.",
+      "required": ["standards", "architecture"],
+      "tools": [],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-risk-analysis",
+      "title": "Risk analysis",
+      "body": "List technical, security, and edge-case risks (skills: `security`, `constraints`). Pair every risk with either a mitigation or an open question for the next step — a risk with neither is not finished.",
+      "required": ["security", "constraints"],
+      "tools": [],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-questions",
+      "title": "Questions to user",
+      "body": "For every ambiguity still open after research/best-practices/risk analysis, call `ask_user(question, skill=...)` — highest-leverage question first, one at a time. Answers arrive via chat or Telegram automatically; do not proceed past a genuine ambiguity by guessing.",
+      "required": [],
+      "tools": ["ask_user", "check_pending_answer", "answer_question"],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-draft-spec",
+      "title": "Draft spec",
+      "body": "Write the task's Description via `update_task(task_id, description=...)` using exactly these headings, in this order: `## Problem`, `## Goal`, `## Scope`, `## Requirements`, `## Constraints & risks`, `## Acceptance criteria`. `## Acceptance criteria` is one observable, independently verifiable fact per line. If the task has `prds` set, also update the linked `harn_env/prd/<slug>.md` directly (edit the file, keep its existing Problem/Goal/Scope/Acceptance criteria/Open questions structure) so the global requirement isn't stranded in one task.",
+      "required": [],
+      "tools": ["update_task"],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    },
+    {
+      "kind": "step",
+      "id": "step-lock-spec",
+      "title": "Lock spec",
+      "body": "Call `lock_spec(task_id, done_when=..., approach=..., decisions=[...])` with the same acceptance criteria written in the Draft spec step, closing the clarification funnel. After this, the task is ready for the normal implementer pipeline to pick up via `get_next_task`.",
+      "required": [],
+      "tools": ["lock_spec"],
+      "agent": "", "model": "", "effort": "", "temperature": "",
+      "enabled": true
+    }
+  ]
+}
