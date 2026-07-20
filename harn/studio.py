@@ -4248,7 +4248,16 @@ function showTab(t){
   else if(t==='agents')loadAndRenderAgents();
   else if(t==='settings')renderSettings();
   else if(t==='api')renderApiDocs();
-  else{ pollBoard(); }
+  else{
+    // pollBoard() only repaints #listView/#insp when the board DATA changed
+    // since its last check — but another tab (Tools/Skills/…) overwrites both
+    // with unrelated content in between. Without this reset, returning to
+    // Board with no task changes in between left the PREVIOUS tab's content
+    // on screen with the Board button showing active. Forcing stale keys
+    // makes the very next poll repaint unconditionally.
+    BOARD_LIST_RENDER_KEY=null; BOARD_DETAIL_RENDER_KEY=null;
+    pollBoard();
+  }
 }
 
 /* ---------- settings tab: default agent + model for harn run ---------- */
