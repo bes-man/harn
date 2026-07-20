@@ -793,16 +793,50 @@ def add_board_status_payload(env_dir: Path, payload: dict) -> dict:
     name = _STATUS_NAME_RE.sub("_", (payload.get("name") or "").strip().lower()).strip("_")
     if not name:
         return {"ok": False, "error": "status name required"}
+    blocked = _board_status_tables_error(env_dir)
+    if blocked:
+        return blocked
+    current = tasks_mod.lifecycle(env_dir)
+    if name in current:
+        return {"ok": False, "error": f"status {name!r} already exists"}
+    return _write_board_statuses(env_dir, current + [name])
+
+
+def reorder_board_status_payload(env_dir: Path, payload: dict) -> dict:
+    """Reorder the board's status/column pipeline (drag/arrow reorder in
+    Studio). `order` must be a permutation of the CURRENT effective lifecycle
+    — this route only reorders, `add_board_status_payload` is what adds a new
+    one, so a mismatched set here means the client's view is stale rather
+    than something to silently reconcile."""
+    order = [str(n).strip() for n in (payload.get("order") or []) if str(n).strip()]
+    if not order:
+        return {"ok": False, "error": "order required"}
+    blocked = _board_status_tables_error(env_dir)
+    if blocked:
+        return blocked
+    current = tasks_mod.lifecycle(env_dir)
+    if sorted(order) != sorted(current):
+        return {"ok": False, "error": "order must contain exactly the current statuses "
+                                        "(add/remove via add_status, not reorder)"}
+    return _write_board_statuses(env_dir, order)
+
+
+def _board_status_tables_error(env_dir: Path) -> dict | None:
     toml = env_dir / "harn.toml"
     text = toml.read_text(encoding="utf-8") if toml.exists() else ""
     if re.search(r"(?m)^\s*\[\[board\.status\]\]\s*$", text):
         return {"ok": False, "error": (
             "this project's [board] uses [[board.status]] tables (custom "
-            "labels) — add the new status by editing harn.toml directly")}
-    current = tasks_mod.lifecycle(env_dir)
-    if name in current:
-        return {"ok": False, "error": f"status {name!r} already exists"}
-    new_list = current + [name]
+            "labels) — edit harn.toml directly instead")}
+    return None
+
+
+def _write_board_statuses(env_dir: Path, new_list: list) -> dict:
+    """Write the `[board] statuses = [...]` shape to harn.toml in place
+    (stdlib can't WRITE toml, so this is a targeted regex edit — same
+    approach as `set_config_flag`)."""
+    toml = env_dir / "harn.toml"
+    text = toml.read_text(encoding="utf-8") if toml.exists() else ""
     arr = "[" + ", ".join(f'"{s}"' for s in new_list) + "]"
     line = f"statuses = {arr}"
     if re.search(r"(?m)^\s*statuses\s*=.*$", text):
@@ -1601,6 +1635,8 @@ def _make_handler(default_env: Path):
                 self._json(set_task_status_payload(env, body))
             elif route == "/api/board/add_status":
                 self._json(add_board_status_payload(env, body))
+            elif route == "/api/board/reorder_statuses":
+                self._json(reorder_board_status_payload(env, body))
             elif route == "/api/tasks/workflow":
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/update":
@@ -1924,7 +1960,13 @@ _HTML = r"""<!DOCTYPE html>
     background:var(--panel2);border:1px solid var(--line);border-radius:8px;
     max-height:calc(100vh - 220px)}
   .kanban-col-head{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;
-    padding:8px 10px;border-bottom:1px solid var(--line)}
+    padding:8px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;
+    justify-content:space-between;gap:6px}
+  .kanban-col-move{display:flex;gap:2px}
+  .kanban-col-move button{background:none;border:none;color:var(--muted);cursor:pointer;
+    font-size:12px;padding:0 3px;line-height:1}
+  .kanban-col-move button:disabled{opacity:.25;cursor:default}
+  .kanban-col-move button:not(:disabled):hover{color:var(--text)}
   .kanban-col-body{flex:1 1 auto;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
   .kanban-card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
     padding:8px 9px;cursor:pointer}
@@ -2662,10 +2704,14 @@ function renderBoard(){
       `<button class="ghost" onclick="stopRun()" title="Steps already done stay done; edit the plan, then ▶ Resume">⏸ Pause</button></div>`;
   }
   html+='<div class="kanban-board">';
-  BOARD_ORDER.forEach(s=>{
+  BOARD_ORDER.forEach((s,i)=>{
     const list=(groups[s]||[]).slice().sort((a,b)=>a.priority-b.priority);
     html+=`<div class="kanban-col" data-status="${esc(s)}" ondragover="onColDragOver(event)" ondrop="onColDrop(event,'${esc(s)}')">`+
-      `<div class="kanban-col-head">${BOARD_LABEL[s]||s} · ${list.length}</div>`+
+      `<div class="kanban-col-head"><span>${BOARD_LABEL[s]||s} · ${list.length}</span>`+
+      `<span class="kanban-col-move">`+
+      `<button ${i===0?'disabled':''} onclick="moveBoardColumn(${i},-1)" title="Move left">◀</button>`+
+      `<button ${i===BOARD_ORDER.length-1?'disabled':''} onclick="moveBoardColumn(${i},1)" title="Move right">▶</button>`+
+      `</span></div>`+
       `<div class="kanban-col-body">`;
     list.forEach(t=>{
       const running=BOARD.run&&BOARD.run.task_id===t.id;
@@ -2702,6 +2748,24 @@ async function addBoardColumn(){
   const r=await post_('/api/board/add_status',{name});
   if(r.error||r.ok===false){ alert(r.error||'could not add status'); return; }
   await pollBoard();
+}
+let COLUMN_REORDER_BUSY=false;
+async function moveBoardColumn(i,dir){
+  // Guard against double-fires from a fast double-click racing two in-flight
+  // reorders — the second POST would compute its swap against a stale
+  // BOARD_ORDER and clobber the first.
+  if(COLUMN_REORDER_BUSY)return;
+  const j=i+dir;
+  if(j<0||j>=BOARD_ORDER.length)return;
+  const order=BOARD_ORDER.slice();
+  [order[i],order[j]]=[order[j],order[i]];
+  COLUMN_REORDER_BUSY=true;
+  try{
+    const r=await post_('/api/board/reorder_statuses',{order});
+    if(r.error||r.ok===false){ alert(r.error||'could not reorder statuses'); return; }
+    BOARD_ORDER=order;
+    renderBoard();
+  } finally { COLUMN_REORDER_BUSY=false; }
 }
 function onColDragOver(e){ e.preventDefault(); e.dataTransfer.dropEffect='move'; }
 function onCardDragStart(e,id){
