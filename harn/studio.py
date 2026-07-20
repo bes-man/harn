@@ -1945,6 +1945,11 @@ _HTML = r"""<!DOCTYPE html>
     font:12.5px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:8px 0}
   .blockedq textarea{width:100%;margin-top:6px;background:var(--panel);color:var(--text);
     border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit}
+  .qopt{display:flex;align-items:flex-start;gap:8px;padding:7px 9px;border:1px solid var(--line);
+    border-radius:6px;background:var(--panel);cursor:pointer;font-size:12.5px;line-height:1.45}
+  .qopt:hover{border-color:var(--accent)}
+  .qopt input{margin-top:2px;flex:0 0 auto}
+  #taskQuestionBox{margin-top:10px}
   /* ---- task-plan edit mode (Board -> Edit this task's plan) ---- */
   .planbanner{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:20;
     display:flex;align-items:center;gap:10px;background:var(--panel2);
@@ -2584,7 +2589,8 @@ function boardListRenderKey(){
 }
 function boardDetailRenderKey(){
   const task=(BOARD.tasks||[]).find(t=>t.id===boardSel)||null;
-  return JSON.stringify({task,run:BOARD.run||null,run_log:BOARD.run_log||'',progress:PROG});
+  return JSON.stringify({task,run:BOARD.run||null,run_log:BOARD.run_log||'',progress:PROG,
+    q:BLOCKED_Q_TEXT||null});
 }
 
 async function pollBoard(){
@@ -2628,14 +2634,47 @@ async function pollBoard(){
 }
 let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null, BLOCKED_OPTIONS=[];
 function questionOptions(question){
+  // Agents write options as `A) ...`, `- A) ...`, or markdown-bold
+  // `- **A) sendGift** — ...` (observed live) — accept all three.
   return (question||'').split('\n').map(line=>{
-    const m=line.match(/^\s*(?:[-*]\s*)?([A-C1-3])[\).:\-]\s+(.+)$/i);
+    const m=line.match(/^\s*(?:[-*]\s*)?\*{0,2}([A-D1-4])[\).:\-]\s*(.+)$/i);
     if(!m) return null;
-    return {value:m[1].toUpperCase()+') '+m[2],
-      recommended:/recommended|recommendation|рекоменд/i.test(m[2])};
-  }).filter(Boolean).slice(0,3);
+    const text=m[2].replace(/\*\*/g,'');
+    return {value:m[1].toUpperCase()+') '+text,
+      recommended:/recommended|recommendation|рекоменд/i.test(text)};
+  }).filter(Boolean).slice(0,4);
 }
 function submitOption(option){ submitAnswer(option.value); }
+// The same pending question, rendered INSIDE the Board task modal — the
+// #blockedBanner lives in the flow inspector (.insp), which the Board tab
+// hides entirely (main.full-width), so without this the human looking at
+// the task never sees what the agent is waiting on. Options are
+// checkboxes (agents often ask "A, B, or a combination"), with a
+// free-text fallback.
+function renderTaskQuestionBox(){
+  const box=$('#taskQuestionBox'); if(!box) return;
+  if(!BLOCKED_Q_TEXT){ box.style.display='none'; box.innerHTML=''; return; }
+  const opts=BLOCKED_OPTIONS.map((o,i)=>
+    `<label class="qopt"><input type="checkbox" data-qopt="${i}"/> ${esc(o.value)}`+
+    `${o.recommended?' <span class="live">Recommended</span>':''}</label>`).join('');
+  box.style.display='block';
+  box.innerHTML=`<div class="blockedq"><b>⏳ Agent needs your answer:</b>`+
+    `<pre>${esc(BLOCKED_Q_TEXT)}</pre>`+
+    `${opts?`<div style="display:grid;gap:6px;margin-bottom:9px">${opts}</div>`+
+      `<button class="primary" onclick="submitCheckedOptions()">Submit selected</button>`:''}`+
+    `<textarea id="answerBoxModal" rows="2" placeholder="Or type your own answer..." style="margin-top:8px"></textarea>`+
+    `<button onclick="submitModalAnswer()">Submit answer</button></div>`;
+}
+function submitCheckedOptions(){
+  const picked=[...document.querySelectorAll('#taskQuestionBox [data-qopt]:checked')]
+    .map(el=>BLOCKED_OPTIONS[+el.dataset.qopt].value);
+  if(!picked.length){ alert('Select at least one option.'); return; }
+  submitAnswer(picked.join(' + '));
+}
+function submitModalAnswer(){
+  const box=$('#answerBoxModal');
+  submitAnswer(box?box.value:'');
+}
 async function pollBlockedQuestion(){
   const el=$('#blockedBanner');
   if(!el) return;
@@ -2660,9 +2699,11 @@ async function pollBlockedQuestion(){
       `${optionButtons?`<div class="row" style="display:grid;gap:7px;margin-bottom:9px">${optionButtons}</div>`:''}`+
       `<textarea id="answerBox" rows="3" placeholder="Your answer..."></textarea>`+
       `<button onclick="submitAnswer()">Submit answer</button></div>`;
+    renderTaskQuestionBox();
   } else {
     BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
     el.style.display='none'; el.innerHTML='';
+    renderTaskQuestionBox();
   }
 }
 async function submitAnswer(selectedAnswer){
@@ -2909,6 +2950,7 @@ function renderTaskDetail(){
     </div>
     <input type="text" id="taskTitleInput" class="taskTitle" value="${esc(t.title)}"
       onblur="saveTaskField('${esc(t.id)}','title',this.value)"/>
+    <div id="taskQuestionBox" style="display:none"></div>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
     <div class="row" style="margin-top:8px">
@@ -2952,6 +2994,7 @@ function renderTaskDetail(){
     </div>
     ${running?`<label>Run log <span class="mut">(live stdout/stderr tail)</span></label><div class="toolDoc runlog">${esc(BOARD.run_log||'(starting…)')}</div>`:''}
   `;
+  renderTaskQuestionBox();
   if(sameTask){
     panel.scrollTop=panelScroll;
     const nextReview=$('#reviewLog');
