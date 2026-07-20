@@ -770,6 +770,69 @@ def board_payload(env_dir: Path) -> dict:
     return payload
 
 
+_STATUS_NAME_RE = re.compile(r"[^a-z0-9_]+")
+
+
+def add_board_status_payload(env_dir: Path, payload: dict) -> dict:
+    """Append a new status/column to the board pipeline.
+
+    Writes the simple `[board] statuses = [...]` shape to harn.toml (stdlib
+    can't WRITE toml, so this is the same targeted regex edit used elsewhere —
+    see `set_config_flag`). Seeds from the CURRENT effective lifecycle
+    (`tasks_mod.lifecycle`, which already falls back to the built-in
+    five-status pipeline when `[board]` is empty) so existing columns are
+    preserved, not just the new one.
+
+    Projects that hand-authored the `[[board.status]]` array-of-tables shape
+    (per-status external labels — see `config._parse_board_statuses`) are left
+    alone: that shape takes priority over `statuses = [...]` when both are
+    present, so blindly adding the flat form would be silently ignored (or
+    worse, appear to work here while the app keeps using the old table). Ask
+    the human to edit harn.toml directly in that case.
+    """
+    name = _STATUS_NAME_RE.sub("_", (payload.get("name") or "").strip().lower()).strip("_")
+    if not name:
+        return {"ok": False, "error": "status name required"}
+    toml = env_dir / "harn.toml"
+    text = toml.read_text(encoding="utf-8") if toml.exists() else ""
+    if re.search(r"(?m)^\s*\[\[board\.status\]\]\s*$", text):
+        return {"ok": False, "error": (
+            "this project's [board] uses [[board.status]] tables (custom "
+            "labels) — add the new status by editing harn.toml directly")}
+    current = tasks_mod.lifecycle(env_dir)
+    if name in current:
+        return {"ok": False, "error": f"status {name!r} already exists"}
+    new_list = current + [name]
+    arr = "[" + ", ".join(f'"{s}"' for s in new_list) + "]"
+    line = f"statuses = {arr}"
+    if re.search(r"(?m)^\s*statuses\s*=.*$", text):
+        text = re.sub(r"(?m)^\s*statuses\s*=.*$", line, text)
+    elif re.search(r"(?m)^\[board\]\s*$", text):
+        text = re.sub(r"(?m)^\[board\]\s*$", f"[board]\n{line}", text)
+    else:
+        text = (text.rstrip() + "\n\n[board]\n" + line + "\n") if text else f"[board]\n{line}\n"
+    toml.parent.mkdir(parents=True, exist_ok=True)
+    toml.write_text(text, encoding="utf-8")
+    return {"ok": True, "statuses": new_list}
+
+
+def agent_api_doc_payload() -> dict:
+    """The Agent API reference (docs/agent-api.md) for the Studio API tab.
+
+    Prefers the repo-root docs copy (dev/editable installs, always current);
+    falls back to the copy bundled inside the package (`harn/agent-api.md`,
+    kept in sync manually — real `pip install`s don't ship a docs/ tree)."""
+    candidates = [Path(__file__).resolve().parent.parent / "docs" / "agent-api.md",
+                  Path(__file__).resolve().parent / "agent-api.md"]
+    for p in candidates:
+        try:
+            if p.exists():
+                return {"text": p.read_text(encoding="utf-8")}
+        except OSError:
+            pass
+    return {"text": "(agent-api.md not found)"}
+
+
 def transcript_payload(env_dir: Path, task_id: str, *, step_id: str = "",
                        after: str | int = 0, limit: str | int = 500) -> dict:
     """Visible, cursor-paged agent transcript for one task or step."""
@@ -1421,6 +1484,8 @@ def _make_handler(default_env: Path):
                 self._json(tools_catalog_payload(env))
             elif route == "/api/board":
                 self._json(board_payload(env))
+            elif route == "/api/docs/agent-api":
+                self._json(agent_api_doc_payload())
             elif route == "/api/agents":
                 self._json(agents_payload(env))
             elif route == "/api/tasks/blocked_question":
@@ -1534,6 +1599,8 @@ def _make_handler(default_env: Path):
                 self._json(create_task_payload(env, body))
             elif route == "/api/tasks/status":
                 self._json(set_task_status_payload(env, body))
+            elif route == "/api/board/add_status":
+                self._json(add_board_status_payload(env, body))
             elif route == "/api/tasks/workflow":
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/update":
@@ -1959,6 +2026,9 @@ _HTML = r"""<!DOCTYPE html>
   .modelrow4 input[type=text],.modelrow4 select{padding:6px 8px;font-size:12px}
   /* Settings panel (default agent + model for harn run) */
   .settings{max-width:560px}
+  .apidocs{max-width:900px}
+  .apidocs pre{white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.6;
+    background:var(--panel2,#1a1e27);border:1px solid var(--line);border-radius:8px;padding:14px}
   .settings .field{margin:14px 0}
   .settings label{display:block;margin-bottom:5px}
   .status{color:var(--muted);font-size:12px;min-width:120px;text-align:right}
@@ -1968,6 +2038,9 @@ _HTML = r"""<!DOCTYPE html>
   .mcpbadge.stale{color:var(--warn);border-color:#e8b93a66}
   .mcpbadge.down{color:var(--danger);border-color:#ff6b6b66}
   main{display:grid;grid-template-columns:1fr 6px var(--insp-w);height:calc(100vh - 53px)}
+  main.full-width{grid-template-columns:1fr}
+  main.full-width>.grip,main.full-width>.insp{display:none}
+  main.full-width .listview{max-width:none}
   .canvas{position:relative;overflow:auto;background:
     radial-gradient(circle at 1px 1px,#222732 1px,transparent 0) 0 0/24px 24px var(--bg)}
   .canvas.list{overflow:auto}
@@ -2153,6 +2226,7 @@ _HTML = r"""<!DOCTYPE html>
       <button id="tabAgents" onclick="showTab('agents')">Agents</button>
       <button id="tabBoard" onclick="showTab('board')">Board</button>
       <button id="tabSettings" onclick="showTab('settings')">Settings</button>
+      <button id="tabApi" onclick="showTab('api')">API</button>
     </div>
     <div class="toggles" id="toggles">
       <label class="sw"><input type="checkbox" id="tgSemble" onchange="setToggle('semble',this.checked)"><span></span>semble</label>
@@ -2469,7 +2543,8 @@ function applyBoardStatuses(statuses){
   BOARD_LABEL=Object.fromEntries(statuses.map(s=>[s.name,s.label||s.name]));
 }
 function boardListRenderKey(){
-  return JSON.stringify({tasks:BOARD.tasks||[],run:BOARD.run||null,selected:boardSel});
+  return JSON.stringify({tasks:BOARD.tasks||[],run:BOARD.run||null,selected:boardSel,
+    statuses:BOARD.statuses||[]});
 }
 function boardDetailRenderKey(){
   const task=(BOARD.tasks||[]).find(t=>t.id===boardSel)||null;
@@ -2578,6 +2653,7 @@ function renderBoard(){
   const groups={}; (BOARD.tasks||[]).forEach(t=>(groups[t.status]=groups[t.status]||[]).push(t));
   let html='<h2>BOARD</h2>'+
     '<button class="ghost" onclick="showNewTaskForm()" style="margin-bottom:8px">＋ New task</button>'+
+    '<button class="ghost" onclick="addBoardColumn()" style="margin-bottom:8px;margin-left:8px">＋ Add column</button>'+
     `<div id="newTaskForm" style="display:${NEW_TASK_OPEN?'block':'none'}"></div>`;
   if(BOARD.run){
     const rt=(BOARD.tasks||[]).find(t=>t.id===BOARD.run.task_id);
@@ -2608,6 +2684,24 @@ function renderBoard(){
   if(!(BOARD.tasks||[]).length) html+='<div class="empty">No tasks yet — create one from an agent session (create_task).</div>';
   v.innerHTML=html;
   BOARD_LIST_RENDER_KEY=boardListRenderKey();
+}
+async function renderApiDocs(){
+  const v=$('#listView');
+  v.innerHTML='<div class="apidocs"><h2>API</h2><div class="mut">Loading…</div></div>';
+  let text='(failed to load agent-api.md)';
+  try{ const r=await (await fetch(api('/api/docs/agent-api'))).json(); text=r.text||text; }catch(e){}
+  if(tab!=='api') return;
+  v.innerHTML='<div class="apidocs"><h2>API</h2>'+
+    '<p class="mut" style="font-size:12px">HTTP routes for driving harn from a script or another agent '+
+    '(run a role, draft a role, document intake). Full reference below.</p>'+
+    '<pre>'+esc(text)+'</pre></div>';
+}
+async function addBoardColumn(){
+  const name=prompt('New status name (a-z, 0-9, _ — e.g. "in_review"):');
+  if(!name)return;
+  const r=await post_('/api/board/add_status',{name});
+  if(r.error||r.ok===false){ alert(r.error||'could not add status'); return; }
+  await pollBoard();
 }
 function onColDragOver(e){ e.preventDefault(); e.dataTransfer.dropEffect='move'; }
 function onCardDragStart(e,id){
@@ -4077,7 +4171,7 @@ function showTab(t){
     closeTaskPlan();
   }
   tab=t; bodyMode='preview';
-  ['flow','skills','tools','agents','board','settings'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
+  ['flow','skills','tools','agents','board','settings','api'].forEach(x=>$('#tab'+x[0].toUpperCase()+x.slice(1)).classList.toggle('active',x===t));
   $('#surface').style.display = t==='flow'?'':'none';
   $('#listView').style.display = t==='flow'?'none':'block';
   $('#zoom').style.display = t==='flow'?'':'none';
@@ -4086,11 +4180,16 @@ function showTab(t){
   $('#arrangeBtn').style.display=t==='flow'?'':'none';
   $('#addBtn').style.display=t==='flow'?'':'none';
   $('#addSkillBtn').style.display=t==='skills'?'':'none';
+  // Board and API don't use the right-hand inspector panel (#insp) — give
+  // them the full width instead of leaving it empty and cramping the content
+  // (this used to squeeze the kanban board into a narrow, hard-to-read strip).
+  document.querySelector('main').classList.toggle('full-width', t==='board'||t==='api');
   if(t==='flow')renderFlow();
   else if(t==='skills')renderSkills();
   else if(t==='tools')renderTools();
   else if(t==='agents')loadAndRenderAgents();
   else if(t==='settings')renderSettings();
+  else if(t==='api')renderApiDocs();
   else{ pollBoard(); }
 }
 

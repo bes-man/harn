@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harn"
-version = "0.17.115"
+version = "0.17.116"
 description = "Agent-agnostic harness with a ralph-style feedback loop, on-demand skills and human-in-the-loop planning."
 requires-python = ">=3.10"
 dependencies = [
@@ -22,7 +22,7 @@ packages = ["harn", "harn.adapters"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-harn = ["templates/**/*", "templates/**/.*"]
+harn = ["templates/**/*", "templates/**/.*", "agent-api.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
