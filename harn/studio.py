@@ -2170,6 +2170,14 @@ _HTML = r"""<!DOCTYPE html>
      Without this rule the state was invisible - the chip looked identical
      to "off", so one click in three appeared to do nothing. */
   .tog.rec{border-style:dashed;border-color:#3a4f7a;color:#aab6d8}
+  .decisions{max-height:180px;overflow-y:auto}
+  .decision-line{font-size:12px;line-height:1.5;padding:5px 0 5px 14px;position:relative;
+    border-bottom:1px solid var(--line)}
+  .decision-line::before{content:'•';position:absolute;left:2px;color:var(--accent)}
+  .decision-line:last-child{border-bottom:none}
+  .agent-internals{margin:10px 0}
+  .agent-internals summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
+  .agent-internals[open] summary{margin-bottom:6px}
   .empty{color:var(--muted);padding:40px 10px;text-align:center}
   .skillrow{display:flex;align-items:center;gap:8px;padding:8px 6px;border-bottom:1px solid var(--line);cursor:pointer}
   .skillrow:hover{background:var(--panel2)}
@@ -2927,8 +2935,11 @@ function renderTaskDetail(){
     `<option value="${esc(w.name)}" ${(t.workflow||'default')===w.name?'selected':''}>${esc(w.title)}</option>`).join('');
   const statusColor={todo:'var(--muted)',in_progress:'var(--accent)',review:'var(--accent2)',
     changes_requested:'var(--warn)',done:'var(--accent2)'}[t.status]||'var(--muted)';
+  // Plain lines, NOT .chip spans: agents legitimately record paragraph-long
+  // decisions, and a paragraph inside one rounded chip renders as a giant
+  // colored blob. Rationale stays on hover.
   const decisions=(t.decisions||[]).map(d=>
-    `<span class="chip" title="${esc(d.rationale||'')}">${esc(d.decision)}</span>`).join('') || '<span class="mut">none yet</span>';
+    `<div class="decision-line" title="${esc(d.rationale||'')}">${esc(d.decision)}</div>`).join('') || '<span class="mut">none yet</span>';
   const attHtml=(t.attachments||[]).length
     ? `<div class="attgrid">${t.attachments.map(a=>{
         const url=api('/api/attachments/file?task='+encodeURIComponent(t.id)+'&name='+encodeURIComponent(a.name));
@@ -2993,13 +3004,15 @@ function renderTaskDetail(){
     <input type="file" id="attInput" style="display:none" onchange="uploadPickedFile('${esc(t.id)}',this)"/>
     <label>Pipeline <span class="mut">(live while running)</span></label>
     <div class="pipeline">${renderPipelineDots(t)}</div>
-    <label>Context loaded <span class="mut">(what actually entered the agent's context — not just what was available)</span></label>
-    <div class="toolDoc">${contextHtml}</div>
-    <label>Context growing <span class="mut">(scratchpad the agent carries forward)</span></label>
-    <div class="toolDoc">${esc(t.scratchpad||'(empty)')}</div>
-    <label>Decisions <span class="mut">(claims the oracle verifies)</span></label>
-    <div class="skillgrid">${decisions}</div>
-    <label>Activity</label>
+    <label>Decisions <span class="mut">(claims the oracle verifies; hover for the rationale)</span></label>
+    <div class="decisions">${decisions}</div>
+    <details class="agent-internals"><summary>Agent internals <span class="mut">(context loaded · scratchpad — debug detail, rarely needed)</span></summary>
+      <label>Context loaded <span class="mut">(what actually entered the agent's context — not just what was available)</span></label>
+      <div class="toolDoc">${contextHtml}</div>
+      <label>Context growing <span class="mut">(scratchpad the agent carries forward)</span></label>
+      <div class="toolDoc">${esc(t.scratchpad||'(empty)')}</div>
+    </details>
+    <label>Comments <span class="mut">(the conversation on this task — agent events inline, questions answerable right here)</span></label>
     <div class="toolDoc" id="reviewLog" style="max-height:220px;overflow:auto;user-select:text">${renderActivityFeed(t)}</div>
     <div class="row" style="gap:6px;margin-top:6px">
       <input type="text" id="commentInput" placeholder="Add a comment…" style="flex:1"/>
