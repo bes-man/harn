@@ -36,7 +36,7 @@ def test_ask_user_posts_a_comment_on_the_current_task(tmp_path, monkeypatch):
 
     fresh = tasks.find(env, t.id)
     assert len(fresh.comments) == 1
-    assert fresh.comments[0].kind == "agent"
+    assert fresh.comments[0].kind == "question"
     assert fresh.comments[0].author == "agent"
     assert fresh.comments[0].text == "Which option — A, B, or C?"
 

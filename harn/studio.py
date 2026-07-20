@@ -1949,7 +1949,6 @@ _HTML = r"""<!DOCTYPE html>
     border-radius:6px;background:var(--panel);cursor:pointer;font-size:12.5px;line-height:1.45}
   .qopt:hover{border-color:var(--accent)}
   .qopt input{margin-top:2px;flex:0 0 auto}
-  #taskQuestionBox{margin-top:10px}
   /* ---- task-plan edit mode (Board -> Edit this task's plan) ---- */
   .planbanner{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:20;
     display:flex;align-items:center;gap:10px;background:var(--panel2);
@@ -2645,29 +2644,10 @@ function questionOptions(question){
   }).filter(Boolean).slice(0,4);
 }
 function submitOption(option){ submitAnswer(option.value); }
-// The same pending question, rendered INSIDE the Board task modal — the
-// #blockedBanner lives in the flow inspector (.insp), which the Board tab
-// hides entirely (main.full-width), so without this the human looking at
-// the task never sees what the agent is waiting on. Options are
-// checkboxes (agents often ask "A, B, or a combination"), with a
-// free-text fallback.
-function renderTaskQuestionBox(){
-  const box=$('#taskQuestionBox'); if(!box) return;
-  if(!BLOCKED_Q_TEXT){ box.style.display='none'; box.innerHTML=''; return; }
-  const opts=BLOCKED_OPTIONS.map((o,i)=>
-    `<label class="qopt"><input type="checkbox" data-qopt="${i}"/> ${esc(o.value)}`+
-    `${o.recommended?' <span class="live">Recommended</span>':''}</label>`).join('');
-  box.style.display='block';
-  box.innerHTML=`<div class="blockedq"><b>⏳ Agent needs your answer:</b>`+
-    `<pre>${esc(BLOCKED_Q_TEXT)}</pre>`+
-    `${opts?`<div style="display:grid;gap:6px;margin-bottom:9px">${opts}</div>`+
-      `<button class="primary" onclick="submitCheckedOptions()">Submit selected</button>`:''}`+
-    `<textarea id="answerBoxModal" rows="2" placeholder="Or type your own answer..." style="margin-top:8px"></textarea>`+
-    `<button onclick="submitModalAnswer()">Submit answer</button></div>`;
-}
 function submitCheckedOptions(){
-  const picked=[...document.querySelectorAll('#taskQuestionBox [data-qopt]:checked')]
-    .map(el=>BLOCKED_OPTIONS[+el.dataset.qopt].value);
+  const opts=questionOptions(BLOCKED_Q_TEXT);
+  const picked=[...document.querySelectorAll('#qcInteractive [data-qopt]:checked')]
+    .map(el=>opts[+el.dataset.qopt].value);
   if(!picked.length){ alert('Select at least one option.'); return; }
   submitAnswer(picked.join(' + '));
 }
@@ -2699,11 +2679,9 @@ async function pollBlockedQuestion(){
       `${optionButtons?`<div class="row" style="display:grid;gap:7px;margin-bottom:9px">${optionButtons}</div>`:''}`+
       `<textarea id="answerBox" rows="3" placeholder="Your answer..."></textarea>`+
       `<button onclick="submitAnswer()">Submit answer</button></div>`;
-    renderTaskQuestionBox();
   } else {
     BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
     el.style.display='none'; el.innerHTML='';
-    renderTaskQuestionBox();
   }
 }
 async function submitAnswer(selectedAnswer){
@@ -2889,15 +2867,46 @@ function renderActivityFeed(t){
   const items=[
     ...(t.review_log||[]).map(e=>({ts:e.ts,kind:'agent',
       text:`${e.event}${e.by?' by '+e.by:e.agent?' ('+e.agent+')':''}${e.summary?': '+e.summary:''}${e.comment?': '+e.comment:''}${e.notes?' — '+e.notes:''}`})),
-    ...(t.comments||[]).map(c=>({ts:c.ts,kind:c.kind,author:c.author,text:c.text})),
+    ...(t.comments||[]).map(c=>({ts:c.ts,kind:c.kind,author:c.author,text:c.text,comment:true})),
   ].sort((a,b)=>(a.ts||'').localeCompare(b.ts||''));
+  // The currently pending question renders as an INTERACTIVE comment right
+  // in this feed (checkboxes + free text). Detection is TEXT-based, not
+  // kind/metadata-based, on purpose: a question is just a plain-markdown
+  // comment (ask_user posts it; the human's answer lands as the next `hil`
+  // comment via loop.answer) — so when comments later sync to an external
+  // tracker (GitLab issue notes etc.), the same plain-text round-trips and
+  // this overlay keeps working on whatever comes back.
+  let qi=-1;
+  if(BLOCKED_Q_TEXT){
+    for(let i=items.length-1;i>=0;i--){
+      if(items[i].comment && items[i].text===BLOCKED_Q_TEXT){ qi=i; break; }
+    }
+    // Question pending but not (yet) present as a comment — legacy tasks,
+    // or a block raised outside ask_user. Show it as a synthetic feed item
+    // so the human still gets the interactive block.
+    if(qi===-1){ items.push({ts:'',kind:'question',text:BLOCKED_Q_TEXT,comment:true}); qi=items.length-1; }
+  }
   if(!items.length) return '<span class="mut">no activity yet</span>';
-  const KIND_BADGE={agent:'🤖',human:'💬',hil:'📩',external:'🔗'};
-  return items.map(i=>
+  const KIND_BADGE={agent:'🤖',human:'💬',hil:'📩',external:'🔗',question:'❓'};
+  return items.map((i,idx)=>
+    idx===qi ? questionCommentHtml(i) :
     `<div class="activity-item"><span class="kind-badge" title="${esc(i.kind)}">${KIND_BADGE[i.kind]||'•'}</span>`+
     `<span class="mut" style="font-size:11px">${esc(i.ts||'')}${i.author?' · '+esc(i.author):''}</span>`+
     `<div>${esc(i.text)}</div></div>`
   ).join('');
+}
+function questionCommentHtml(i){
+  const opts=questionOptions(i.text);
+  const boxes=opts.map((o,n)=>
+    `<label class="qopt"><input type="checkbox" data-qopt="${n}"/> ${esc(o.value)}`+
+    `${o.recommended?' <span class="live">Recommended</span>':''}</label>`).join('');
+  return `<div class="activity-item"><span class="kind-badge" title="question">❓</span>`+
+    `<span class="mut" style="font-size:11px">${esc(i.ts||'')} · agent asks — waiting for your answer</span>`+
+    `<div class="blockedq" id="qcInteractive"><pre>${esc(i.text)}</pre>`+
+    `${boxes?`<div style="display:grid;gap:6px;margin-bottom:9px">${boxes}</div>`+
+      `<button class="primary" onclick="submitCheckedOptions()">Submit selected</button>`:''}`+
+    `<textarea id="answerBoxModal" rows="2" placeholder="Or type your own answer..." style="margin-top:8px"></textarea>`+
+    `<button onclick="submitModalAnswer()">Submit answer</button></div></div>`;
 }
 function renderTaskDetail(){
   const t=(BOARD.tasks||[]).find(x=>x.id===boardSel);
@@ -2950,7 +2959,6 @@ function renderTaskDetail(){
     </div>
     <input type="text" id="taskTitleInput" class="taskTitle" value="${esc(t.title)}"
       onblur="saveTaskField('${esc(t.id)}','title',this.value)"/>
-    <div id="taskQuestionBox" style="display:none"></div>
     <label>Workflow <span class="mut">(what the agent follows when this task runs)</span></label>
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
     <div class="row" style="margin-top:8px">
@@ -2994,7 +3002,6 @@ function renderTaskDetail(){
     </div>
     ${running?`<label>Run log <span class="mut">(live stdout/stderr tail)</span></label><div class="toolDoc runlog">${esc(BOARD.run_log||'(starting…)')}</div>`:''}
   `;
-  renderTaskQuestionBox();
   if(sameTask){
     panel.scrollTop=panelScroll;
     const nextReview=$('#reviewLog');

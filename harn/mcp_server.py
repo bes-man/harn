@@ -665,7 +665,7 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             task = tasks_mod.find(_env_dir(), task_id)
             if task is not None:
                 tasks_mod.add_comment(_env_dir(), task, question,
-                                      author="agent", kind="agent")
+                                      author="agent", kind="question")
         _log(f"asked the user: {question.splitlines()[0][:120]}"
              + (f" [→ skill: {skill}]" if skill else ""))
         # `harn watch` (or the run loop) turns this into an interactive Telegram
