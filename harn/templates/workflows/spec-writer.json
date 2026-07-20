@@ -64,9 +64,10 @@
       "kind": "step",
       "id": "step-draft-spec",
       "title": "Draft spec",
-      "body": "Write the task's Description via `update_task(task_id, description=...)` using exactly these headings, in this order: `## Problem`, `## Goal`, `## Scope`, `## Requirements`, `## Constraints & risks`, `## Acceptance criteria`. `## Acceptance criteria` is one observable, independently verifiable fact per line. If the task has `prds` set, also update the linked `harn_env/prd/<slug>.md` directly (edit the file, keep its existing Problem/Goal/Scope/Acceptance criteria/Open questions structure) so the global requirement isn't stranded in one task.",
+      "body": "If the prior Questions step is still waiting on an unanswered question, call `check_pending_answer()` and STOP for this turn without drafting anything — do not guess past a genuinely open question. Once every ambiguity is resolved (answered, or there never was one), write the task's Description via `update_task(task_id, description=...)` using exactly these headings, in this order: `## Problem`, `## Goal`, `## Scope`, `## Requirements`, `## Constraints & risks`, `## Acceptance criteria`. `## Acceptance criteria` is one observable, independently verifiable fact per line. If the task has `prds` set, also update the linked `harn_env/prd/<slug>.md` directly (edit the file, keep its existing Problem/Goal/Scope/Acceptance criteria/Open questions structure) so the global requirement isn't stranded in one task.",
       "required": [],
-      "tools": ["update_task"],
+      "tools": [],
+      "tools_recommended": ["update_task", "check_pending_answer"],
       "agent": "", "model": "", "effort": "", "temperature": "",
       "enabled": true
     },
@@ -74,9 +75,10 @@
       "kind": "step",
       "id": "step-lock-spec",
       "title": "Lock spec",
-      "body": "Call `lock_spec(task_id, done_when=..., approach=..., decisions=[...])` with the same acceptance criteria written in the Draft spec step, closing the clarification funnel. After this, the task is ready for the normal implementer pipeline to pick up via `get_next_task`.",
+      "body": "If the Description isn't drafted yet (the prior step is still waiting on a human answer), STOP for this turn — do not lock an incomplete spec. Once drafted, call `lock_spec(task_id, done_when=..., approach=..., decisions=[...])` with the same acceptance criteria written in the Draft spec step, closing the clarification funnel. After this, the task is ready for the normal implementer pipeline to pick up via `get_next_task`.",
       "required": [],
-      "tools": ["lock_spec"],
+      "tools": [],
+      "tools_recommended": ["lock_spec"],
       "agent": "", "model": "", "effort": "", "temperature": "",
       "enabled": true
     }
