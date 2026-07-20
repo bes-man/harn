@@ -51,7 +51,7 @@
       "title": "Questions to user",
       "body": "For every ambiguity still open after research/best-practices/risk analysis, call `ask_user(question, skill=...)` — highest-leverage question first, one at a time. Answers arrive via chat or Telegram automatically; do not proceed past a genuine ambiguity by guessing.",
       "required": [],
-      "tools": ["ask_user", "check_pending_answer", "answer_question"],
+      "tools": ["ask_user", "check_pending_answer"],
       "agent": "", "model": "", "effort": "", "temperature": "",
       "enabled": true
     },
