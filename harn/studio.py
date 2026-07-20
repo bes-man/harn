@@ -2913,7 +2913,7 @@ function renderTaskDetail(){
     <select onchange="assignWorkflow('${esc(t.id)}',this.value)">${wfOpts}</select>
     <div class="row" style="margin-top:8px">
       <button class="ghost" onclick="openTaskPlan('${esc(t.id)}')" title="Open this task's own copy of its plan — edits affect only this task">✎ Edit this task's plan</button>
-      <button class="ghost" onclick="FLOW_SEL_TASK_ID='${esc(t.id)}';showTab('flow')" title="Watch this task's flow execute">Open flow ▶</button>
+      <button class="ghost" onclick="FLOW_SEL_TASK_ID='${esc(t.id)}';showTab('flow');openRunHistory()" title="Watch this task's flow execute — opens straight into its run progress/agent activity feed, not the flow editor">Open flow ▶</button>
     </div>
     <div class="row" style="margin-top:12px;gap:8px">
       ${running
