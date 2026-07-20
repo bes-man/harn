@@ -335,3 +335,62 @@ def test_watch_tick_routes_telegram_command_and_replies(tmp_path, monkeypatch):
     monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
     loop.watch(env, tmp_path, _once=True)
     assert any("✅" in s for s in sent)
+
+
+def test_watch_tick_sends_immediate_ack_before_result_with_content(tmp_path, monkeypatch):
+    """A role run can take minutes — the human should hear "started" right
+    away (not just the final ✅/❌ once everything's done), and the final
+    reply should carry the task's actual content, not just a status word."""
+    env = _project(tmp_path)
+    t = tasks.create_task(env, "T", description="Some spec content here")
+    _plan(env, t.id)
+    _role_md(env, "analyst", status=t.status, oracle=False)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    sent = []
+
+    class FakeHIL:
+        def poll_commands(self, state_dir):
+            return [{"text": f"/analyst {t.id}", "message_id": 1}]
+
+        def poll_updates(self, state_dir):
+            return {"commands": self.poll_commands(state_dir), "documents": []}
+
+        def send(self, text, **kw):
+            sent.append(text)
+            return 1
+
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
+    loop.watch(env, tmp_path, _once=True)
+
+    assert len(sent) == 2
+    assert sent[0].startswith("🚀 Resuming") and t.id in sent[0]
+    assert sent[1].startswith(f"✅ {t.id}")
+    assert "Some spec content here" in sent[1]
+
+
+def test_watch_tick_ack_says_created_for_a_brand_new_task(tmp_path, monkeypatch):
+    env = _project(tmp_path)
+    _role_md(env, "analyst", status="todo", oracle=False)
+    _plan(env, "PRJ-001")  # plan keyed by the id the auto-counter will assign
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    sent = []
+
+    class FakeHIL:
+        def poll_commands(self, state_dir):
+            return [{"text": "/analyst Fix the thing", "message_id": 1}]
+
+        def poll_updates(self, state_dir):
+            return {"commands": self.poll_commands(state_dir), "documents": []}
+
+        def send(self, text, **kw):
+            sent.append(text)
+            return 1
+
+    monkeypatch.setattr(loop.TelegramHIL, "from_env", staticmethod(lambda *_: FakeHIL()))
+    loop.watch(env, tmp_path, _once=True)
+
+    assert sent[0].startswith("🚀 Created")

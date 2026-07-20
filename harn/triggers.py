@@ -36,10 +36,17 @@ def parse_command(text: str) -> tuple[str, str] | None:
 
 
 def dispatch_command(project_root: Path, env_dir: Path, command: str, arg: str,
-                     *, cfg: "config_mod.Config | None" = None) -> dict:
+                     *, cfg: "config_mod.Config | None" = None,
+                     on_task_ready=None) -> dict:
     """The one code path Telegram commands and `POST /api/agents/<name>/run`
     both call. `command` is a role's `command:` (or `name:`) field; `arg` is
     either an existing task id or free text for a brand-new task.
+
+    `on_task_ready(task_id, created)` — optional callback invoked once the
+    task is resolved (found or newly created), BEFORE the role actually runs.
+    The role run can take minutes; without this, a caller (e.g. the Telegram
+    handler) has nothing to say until the whole thing finishes, which reads
+    as "nothing happened" for as long as the run takes.
     """
     role = roles_mod.find(env_dir, command)
     if role is None:
@@ -49,6 +56,7 @@ def dispatch_command(project_root: Path, env_dir: Path, command: str, arg: str,
                 "error": f"usage: /{role.command} <task-id-or-description>"}
 
     first_token = arg.strip().split(None, 1)[0]
+    created = False
     if ids.is_tracker_key(first_token):
         task = tasks_mod.find(env_dir, first_token)
         if task is None:
@@ -60,6 +68,10 @@ def dispatch_command(project_root: Path, env_dir: Path, command: str, arg: str,
         if task.status != role.status:
             tasks_mod.set_status(task, role.status, env_dir)
         task_id = task.id
+        created = True
+
+    if on_task_ready:
+        on_task_ready(task_id, created)
 
     return roles_runner.run_role(project_root, env_dir, task_id, role.name, cfg=cfg)
 

@@ -2738,6 +2738,35 @@ def _progress_tail_lines(env_dir: Path) -> list[str]:
     return p.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
+_TG_RESULT_EXCERPT_CHARS = 1200
+
+
+def _telegram_result_reply(env_dir: Path, result: dict) -> str:
+    """The Telegram reply once a `/<command>` role run finishes.
+
+    A bare "✅ PRJ-001: todo" tells the human nothing about what the agent
+    actually produced — this pulls the task's `## Result` (or, if the role
+    never wrote one — e.g. spec-writer only edits `## Description` — the
+    description itself) so the reply carries real content, not just a status
+    word."""
+    if not result.get("ok"):
+        return f"❌ {result.get('error', 'run failed')}"
+    task_id = result.get("task_id", "")
+    lines = [f"✅ {task_id}: {result.get('status', '')}"]
+    if result.get("warning"):
+        lines.append(f"⚠️ {result['warning']}")
+    task = tasks.find(env_dir, task_id) if task_id else None
+    excerpt = ((task.result or task.description) if task else "").strip()
+    if excerpt:
+        if len(excerpt) > _TG_RESULT_EXCERPT_CHARS:
+            excerpt = excerpt[:_TG_RESULT_EXCERPT_CHARS].rstrip() + "\n…(truncated — see harn ui for the rest)"
+        lines.append("")
+        lines.append(excerpt)
+    if result.get("pr_url"):
+        lines.append(f"\nPR: {result['pr_url']}")
+    return "\n".join(lines)
+
+
 def _intake_document(project_root: Path, env_dir: Path, cfg: Config,
                       tg: TelegramHIL, doc: dict) -> dict:
     """Route one Telegram document/photo update through `intake.intake`.
@@ -2909,14 +2938,15 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
                     if not parsed:
                         continue
                     command, arg = parsed
+
+                    def _ack(task_id, created, _tg=tg, _cmd=command):
+                        verb = "Created" if created else "Resuming"
+                        _tg.send(f"🚀 {verb} {task_id} — starting /{_cmd}…")
+
                     result = triggers_mod.dispatch_command(
-                        project_root, env_dir, command, arg, cfg=cfg)
-                    reply_text = (
-                        f"✅ {result.get('task_id', '')}: {result.get('status', '')}"
-                        if result.get("ok")
-                        else f"❌ {result.get('error', 'run failed')}"
-                    )
-                    tg.send(reply_text)
+                        project_root, env_dir, command, arg, cfg=cfg,
+                        on_task_ready=_ack)
+                    tg.send(_telegram_result_reply(env_dir, result))
                 for doc in updates["documents"]:
                     try:
                         _intake_document(project_root, env_dir, cfg, tg, doc)
