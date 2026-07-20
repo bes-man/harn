@@ -1564,6 +1564,16 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
     if task is None:
         return {"ok": False, "error": f"no task '{task_id}'"}
 
+    # Unlike run()'s full multi-step cycle (which sets this on its own path),
+    # a role-dispatched run reaches every step through THIS function directly
+    # — without it, state.current_task stays None for the whole run, which
+    # breaks anything reading "which task is active right now" during a step
+    # (e.g. ask_user() attributing its question to the right task, or the
+    # Studio Retry button's stale-block auto-clear).
+    st = state.State.load(env_dir / "state")
+    st.current_task = task_id
+    st.save(env_dir / "state")
+
     plan = workflows.load_task_plan(env_dir, task_id) \
         or workflows.snapshot_for_task(env_dir, task_id, task.workflow)
     step = next((n for n in plan["nodes"]

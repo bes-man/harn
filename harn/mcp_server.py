@@ -654,6 +654,18 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         st = state_mod.State.load(state_dir)
         st.block(question)
         st.save(state_dir)
+        # Also post as a task comment — durable and visible in Studio's Board
+        # even if a LATER step's own block (e.g. a required-tool failure)
+        # overwrites BLOCKED.md/state.question before the human sees this one.
+        # Best-effort: state.current_task is unset for callers outside a task
+        # context (shouldn't happen in practice, but never let this break the
+        # actual question-asking).
+        task_id = st.current_task
+        if task_id:
+            task = tasks_mod.find(_env_dir(), task_id)
+            if task is not None:
+                tasks_mod.add_comment(_env_dir(), task, question,
+                                      author="agent", kind="agent")
         _log(f"asked the user: {question.splitlines()[0][:120]}"
              + (f" [→ skill: {skill}]" if skill else ""))
         # `harn watch` (or the run loop) turns this into an interactive Telegram
