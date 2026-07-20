@@ -2164,7 +2164,12 @@ _HTML = r"""<!DOCTYPE html>
   .skillgrid{display:flex;flex-wrap:wrap;gap:6px}
   .tog{font-size:12px;padding:4px 9px;border-radius:8px;cursor:pointer;
     background:var(--chip);border:1px solid var(--line);color:var(--muted);user-select:none}
-  .tog.on{background:var(--chipOn);border-color:#3a4f7a;color:#cdd7f5}
+  .tog.on{background:var(--chipOn);border-color:var(--accent);color:#cdd7f5;font-weight:600}
+  /* middle state of the off -> recommended -> required click cycle; dashed =
+     "recommended", same visual language as .chip.rec on the flow nodes.
+     Without this rule the state was invisible - the chip looked identical
+     to "off", so one click in three appeared to do nothing. */
+  .tog.rec{border-style:dashed;border-color:#3a4f7a;color:#aab6d8}
   .empty{color:var(--muted);padding:40px 10px;text-align:center}
   .skillrow{display:flex;align-items:center;gap:8px;padding:8px 6px;border-bottom:1px solid var(--line);cursor:pointer}
   .skillrow:hover{background:var(--panel2)}
