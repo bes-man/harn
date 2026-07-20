@@ -1199,6 +1199,10 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     events.emit(env_dir, "stage_end", task_id=task_id, stage=stage,
                 agent=adapter.name, ok=res.ok, step_title=step_title,
                 tok_in=res.input_tokens, tok_out=res.output_tokens,
+                # Of tok_in, how many were cache READS (~10x cheaper, re-fed
+                # context) — without this the UI can only show the raw sum,
+                # which reads as millions of "tokens" for a $2 step.
+                tok_cache=res.cache_read_tokens,
                 cost_usd=res.cost_usd, dur_ms=dur_ms, verdict=verdict,
                 summary=(lines[-1][:200] if lines else None))
     _record_task_turn_patch(project_root, env_dir, task_id, stage)

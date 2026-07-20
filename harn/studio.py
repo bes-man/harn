@@ -704,6 +704,7 @@ def progress_payload(env_dir: Path, task_id: str = "") -> dict:
             s["dur_ms"] = (s.get("dur_ms") or 0) + (e.get("dur_ms") or 0)
             s["tok_in"] = (s.get("tok_in") or 0) + (e.get("tok_in") or 0)
             s["tok_out"] = (s.get("tok_out") or 0) + (e.get("tok_out") or 0)
+            s["tok_cache"] = (s.get("tok_cache") or 0) + (e.get("tok_cache") or 0)
             if e.get("cost_usd") is not None:
                 s["cost_usd"] = round((s.get("cost_usd") or 0) + e["cost_usd"], 6)
             if e.get("verdict"):
@@ -722,6 +723,7 @@ def progress_payload(env_dir: Path, task_id: str = "") -> dict:
         "dur_ms": sum(s.get("dur_ms", 0) for s in stages.values()),
         "tok_in": sum(s.get("tok_in", 0) for s in stages.values()),
         "tok_out": sum(s.get("tok_out", 0) for s in stages.values()),
+        "tok_cache": sum(s.get("tok_cache", 0) for s in stages.values()),
         "cost_usd": round(sum(s.get("cost_usd", 0) for s in stages.values()), 6),
     }
     return {"run": last_run, "stages": stages, "totals": totals,
@@ -1990,6 +1992,7 @@ _HTML = r"""<!DOCTYPE html>
   .pdot.dot-done{border-color:#caa83a;color:#caa83a}
   .pdot.dot-complete{border-color:var(--accent2);color:var(--accent2)}
   .pdot.dot-active{border-color:var(--accent);color:var(--accent);animation:blink 1s ease-in-out infinite}
+  .pdot.dot-failed{border-color:var(--danger);color:var(--danger)}
   .runlog{max-height:200px;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
   /* Flow run sidebar: a compact flight-recorder timeline, not a console dump. */
   .run-progress{display:flex;flex-direction:column;gap:12px}
@@ -2126,7 +2129,7 @@ _HTML = r"""<!DOCTYPE html>
   .chip{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--chip);
     border:1px solid var(--line);color:var(--muted)}
   .chip.req{background:var(--chipOn);border-color:#3a4f7a;color:#cdd7f5}
-  .chip.rec{border-style:dashed}
+  .chip.rec{border:2px dashed #5a6c99}
   .node .tools{margin-top:7px;font-size:11px;color:var(--muted);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .toolbadge{padding:1px 2px;border-bottom:2px solid transparent;border-radius:2px}
@@ -2169,7 +2172,7 @@ _HTML = r"""<!DOCTYPE html>
      "recommended", same visual language as .chip.rec on the flow nodes.
      Without this rule the state was invisible - the chip looked identical
      to "off", so one click in three appeared to do nothing. */
-  .tog.rec{border-style:dashed;border-color:#3a4f7a;color:#aab6d8}
+  .tog.rec{border:2px dashed #5a6c99;padding:3px 8px;color:#aab6d8}
   .decisions{max-height:180px;overflow-y:auto}
   .decision-line{font-size:12px;line-height:1.5;padding:5px 0 5px 14px;position:relative;
     border-bottom:1px solid var(--line)}
@@ -2865,16 +2868,23 @@ async function submitNewTask(){
 }
 function renderPipelineDots(t){
   const running=BOARD.run&&BOARD.run.task_id===t.id;
-  if(!running) return '<span class="mut">not running — Launch to see live stages</span>';
-  // Every step id seen so far in this run's events (PROG.stages is keyed by
-  // step id, not a fixed pipeline name — steps are now arbitrary per-task).
-  const ids=Object.keys(PROG.stages||{});
-  if(!ids.length) return '<span class="mut">starting…</span>';
-  return ids.map(id=>{
-    const info=(PROG.stages||{})[id];
-    const cls=info?(info.status==='active'?'dot-active':info.status==='complete'?'dot-complete':'dot-done'):'dot-pending';
-    return `<span class="pdot ${cls}">${esc(id)}</span>`;
-  }).join('');
+  // Not running is NOT "nothing to show": a paused/blocked/finished task
+  // keeps its per-step outcome in step_results — render status + progress
+  // from that, so a task waiting on an answer still shows where it stands.
+  const results=t.step_results||{};
+  const ids=running?Object.keys(PROG.stages||{}):Object.keys(results);
+  if(!ids.length) return running
+    ? '<span class="mut">starting…</span>'
+    : '<span class="mut">not started yet — Launch to run</span>';
+  const statusOf=id=>String((running?((PROG.stages||{})[id]||{}).status
+                                    :(results[id]||{}).status)||'pending');
+  const CLS={active:'dot-active',running:'dot-active',complete:'dot-complete',
+             ok:'dot-complete',done:'dot-done',blocked:'dot-failed',failed:'dot-failed'};
+  const dots=ids.map(id=>
+    `<span class="pdot ${CLS[statusOf(id)]||'dot-pending'}" title="${esc(statusOf(id))}">${esc(id.replace(/^step-/,''))}</span>`).join('');
+  const done=ids.filter(id=>['ok','complete','done'].includes(statusOf(id))).length;
+  const pct=ids.length?Math.round(done/ids.length*100):0;
+  return `<div class="progress-track" style="margin:2px 0 8px"><div class="progress-fill" style="width:${pct}%"></div></div>${dots}`;
 }
 function renderActivityFeed(t){
   const items=[
@@ -3159,6 +3169,15 @@ async function deleteAttachment(taskId,name){
   await pollBoard();
 }
 function fmtDur(ms){ if(!ms) return '0s'; const s=Math.round(ms/1000); return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'; }
+function fmtTokN(n){ n=n||0; return n<1000?String(n):n<1e6?(n/1000).toFixed(1)+'k':(n/1e6).toFixed(2)+'M'; }
+// Honest token figure for a stage: cache READS (re-fed context, ~10x cheaper,
+// and ~90% of the raw sum on a normal agent turn) are split out instead of
+// being silently lumped in — "2.3M tok" for a $2 step was cache, not spend.
+function fmtTokSplit(info){
+  const fresh=(info.tok_in||0)-(info.tok_cache||0)+(info.tok_out||0);
+  const cache=info.tok_cache||0;
+  return fmtTokN(fresh)+(cache?` (+${fmtTokN(cache)} cached)`:'');
+}
 function fmtBytes(n){ if(!n) return '0B'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB'; }
 // Second-precision local clock time for one transcript entry's own `ts`
 // (e.g. "2026-07-13T16:09:45Z" -> "16:09:45" in the browser's local zone) --
@@ -3222,10 +3241,9 @@ function applyProgress(){
       return;
     }
     if(info&&(info.dur_ms||info.tok_in||info.tok_out)){
-      const tok=(info.tok_in||0)+(info.tok_out||0);
       const cost=info.cost_usd?` · $${info.cost_usd.toFixed(4)}`:'';
       if(!line){ line=document.createElement('div'); line.className='stat'; el.appendChild(line); }
-      line.textContent=`${fmtDur(info.dur_ms)} · ${tok} tok${cost}`;
+      line.textContent=`${fmtDur(info.dur_ms)} · ${fmtTokSplit(info)} tok${cost}`;
     } else if(line){ line.remove(); }
   });
   // Targeted live-refresh of an OPEN command step's "Last run output" box —
@@ -3513,12 +3531,15 @@ function renderRunHistory(){
       : `<button class="primary" onclick="resumeFrozenFlow()">▶ Resume</button>`;
   const rerun=task&&(task.baseline_ref||(task.task_patch_refs||[]).length)&&!activeForTask
     ? `<button class="ghost" onclick="rerunSidebarWorkflow()">↻ Rerun from scratch</button>`:'';
+  // The task modal is a global overlay, so this works straight from the Flow
+  // tab — the reverse of Board's "Open flow ▶" button.
+  const openTask=task?`<button class="ghost" onclick="openTaskModal('${esc(taskId)}')" title="Open this task's card (description, comments, pending questions)">☰ Open task</button>`:'';
   panel.innerHTML=`<div class="run-progress"><div class="run-progress-head">`+
     `<div class="run-progress-title"><strong>Run progress</strong>`+
     `<button class="icon-btn" onclick="closeRunHistory()" title="Close">✕</button></div>`+
     `<div class="run-progress-meta">${esc(taskId)} · ${complete}/${steps.length} complete${failed?' · '+failed+' need attention':''}</div>`+
     `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`+
-    `<div class="row" style="margin-top:10px">${action}${rerun}</div>`+
+    `<div class="row" style="margin-top:10px">${action}${rerun}${openTask}</div>`+
     `${RUN_HISTORY_ERROR?`<div class="mut" style="color:var(--danger);margin-top:7px">${esc(RUN_HISTORY_ERROR)}</div>`:''}</div>`+
     `<div class="progress-rail">${rows||(loadingPlan
       ?'<div class="empty">Loading this task\'s workflow…</div>'
@@ -3536,7 +3557,9 @@ function renderFlowTerminal(el){
   if(runningWhole){
     const t=PROG.totals||{};
     const runningTask=(BOARD.tasks||[]).find(x=>x.id===BOARD.run.task_id);
-    const tok=(t.tok_in||0)+(t.tok_out||0);
+    // The run-budget guard excludes cache reads (loop._RunSpend) — mirror
+    // that here so "X / cap tok" compares like with like.
+    const tok=(t.tok_in||0)-(t.tok_cache||0)+(t.tok_out||0);
     const cost=t.cost_usd? '$'+t.cost_usd.toFixed(4) : '—';
     const stage=PROG.active? `<span class="live">▶ ${esc(PROG.active)}</span>` : 'starting…';
     let budget='—';
@@ -4047,9 +4070,16 @@ function renderInsp(){
   if(tab==='skills'){ renderSkillEditor(); return; }
   const n=selNode; if(!n){ $('#insp').innerHTML='<div class="empty">Select a node to edit it.</div>'; return; }
   const isStep=n.kind==='step';
+  // Skills cycle exactly like tools (see cycleSkill): off -> recommended
+  // (skills_recommended, dashed) -> required (required, solid+bold) -> off.
   const toggles=skillNames().map(name=>{
-    const on=(n.required||[]).includes(name);
-    return `<span class="tog ${on?'on':''} ${on?usageBadgeClass(n.id,'skills',name):''}" onclick="toggleReq('${esc(name)}')">${esc(name)}</span>`;
+    const required=(n.required||[]).includes(name);
+    const recommended=(n.skills_recommended||[]).includes(name);
+    const cls=required?'on':(recommended?'rec':'');
+    const state=required?'required':(recommended?'recommended (optional)':'not used');
+    return `<span class="tog ${cls} ${required||recommended?usageBadgeClass(n.id,'skills',name):''}" `+
+      `title="${state}. Click to cycle: off → recommended → required." `+
+      `onclick="cycleSkill('${esc(name)}')">${esc(name)}</span>`;
   }).join('');
   const reqLinks=(n.required||[]).map(name=>`<a class="link" onclick="editSkill('${esc(name)}')">edit ${esc(name)} »</a>`).join(' · ');
   // Each tool cycles through 3 states by click (see cycleTool): off ->
@@ -4066,12 +4096,6 @@ function renderInsp(){
       `title="${esc(toolDoc(t))} — ${state}. Click to cycle: off → recommended → required." `+
       `onclick="cycleTool('${esc(t)}')">${esc(t)}</span>`;
   }).join('');
-  // Recommended skills (Task 1's `recommended:` tier) have no editing UI yet
-  // — surfaced here read-only, purely so their usage badge (Task 7) is
-  // visible somewhere; toggling them on/off is a separate, not-yet-built
-  // feature and out of this task's additive scope.
-  const recSkillChips=(n.skills_recommended||[]).map(name=>
-    `<span class="chip rec ${usageBadgeClass(n.id,'skills',name)}" title="recommended skill">${esc(name)}</span>`).join('');
   const toolMode=(n.tool_mode||'auto');
   const toolModeSelect=`<label>Tool mode</label>
     <select onchange="setStepField('tool_mode',this.value==='auto'?'':this.value)">
@@ -4185,11 +4209,9 @@ function renderInsp(){
     <label>Description / steps</label>
     ${bodyHtml(140)}
     ${isStep?`
-    <label>Skills required at this step <span class="mut">(click to toggle)</span></label>
+    <label>Skills at this step <span class="mut">(click to cycle: off → recommended → required)</span></label>
     <div class="skillgrid">${toggles||'<span class="mut">no skills yet</span>'}</div>
     <div style="margin-top:8px">${reqLinks}</div>
-    ${recSkillChips?`<label>Recommended skills <span class="mut">(surfaced, not force-loaded)</span></label>
-    <div class="skillgrid">${recSkillChips}</div>`:''}
     <label>Tools at this step <span class="mut">(click to cycle: off → recommended → required · add below)</span></label>
     <div class="skillgrid">${toolTogs||'<span class="mut">no tools yet</span>'}</div>
     <input type="text" placeholder="add a tool, press Enter" style="margin-top:8px"
@@ -4219,9 +4241,16 @@ function setEnabled(on){ if(!selNode)return; selNode.enabled=on; checkDirty(); r
 function setNewSession(on){ if(!selNode)return; selNode.new_session=on;
   if(!on) selNode.use_task_context=true; checkDirty(); renderInsp(); }
 function setUseTaskContext(on){ if(!selNode)return; selNode.use_task_context=on; checkDirty(); renderInsp(); }
-function toggleReq(name){
-  if(!selNode)return; selNode.required=selNode.required||[];
-  const k=selNode.required.indexOf(name); if(k>=0)selNode.required.splice(k,1); else selNode.required.push(name);
+// Same 3-state cycle as cycleTool, for skills: off -> recommended
+// (skills_recommended, dashed) -> required (required, blocks the step if
+// unused) -> off. Exactly one of the two lists ever holds a given name.
+function cycleSkill(name){
+  if(!selNode)return;
+  selNode.required=selNode.required||[]; selNode.skills_recommended=selNode.skills_recommended||[];
+  const req=selNode.required.indexOf(name), rec=selNode.skills_recommended.indexOf(name);
+  if(rec>=0){ selNode.skills_recommended.splice(rec,1); selNode.required.push(name); }
+  else if(req>=0){ selNode.required.splice(req,1); }
+  else{ selNode.skills_recommended.push(name); }
   checkDirty(); renderFlow();
 }
 // Cycles one tool through 3 states: off -> recommended (tools_recommended,
