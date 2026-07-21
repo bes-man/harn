@@ -316,11 +316,64 @@ def test_answer_route_calls_loop_answer_and_clears_the_block(tmp_path):
     st = state.State(current_task=task.id)
     st.block("Pick one.")
     st.save(state_dir)
-    result = studio.answer_payload(env, task.id, "Go with A.")
+    with patch("harn.studio.runner_mod.launch", return_value={"ok": True}):
+        result = studio.answer_payload(env, task.id, "Go with A.")
     assert result.get("ok") is True
     reloaded = state.State.load(state_dir)
     assert reloaded.phase != state.BLOCKED
     assert reloaded.last_answer == "Go with A."
+
+
+def test_answer_route_restarts_the_blocked_task(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id)
+    st.block("Pick one.")
+    st.save(state_dir)
+    with patch("harn.studio.runner_mod.launch", return_value={"ok": True}) as launch:
+        result = studio.answer_payload(env, "different-ui-task-id", "Go with A.")
+    launch.assert_called_once_with(env.parent, env, task.id)
+    assert result == {"ok": True, "task_id": task.id, "resumed": True}
+
+
+def test_answer_route_keeps_answer_when_resume_is_refused(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Do the thing")
+    state_dir = env / "state"
+    st = state.State(current_task=task.id)
+    st.block("Pick one.")
+    st.save(state_dir)
+    with patch(
+        "harn.studio.runner_mod.launch",
+        return_value={"ok": False, "error": "another run is already active"},
+    ):
+        result = studio.answer_payload(env, task.id, "Go with A.")
+    assert result == {
+        "ok": True,
+        "task_id": task.id,
+        "resumed": False,
+        "warning": "another run is already active",
+    }
+    reloaded = state.State.load(state_dir)
+    assert reloaded.last_answer == "Go with A."
+
+
+def test_answer_route_records_answer_without_current_task(tmp_path):
+    env = _env(tmp_path)
+    state_dir = env / "state"
+    st = state.State()
+    st.block("Pick one.")
+    st.save(state_dir)
+    with patch("harn.studio.runner_mod.launch") as launch:
+        result = studio.answer_payload(env, "ui-task-id", "Go with A.")
+    launch.assert_not_called()
+    assert result == {
+        "ok": True,
+        "resumed": False,
+        "warning": "no current task to resume",
+    }
+    assert state.State.load(state_dir).last_answer == "Go with A."
 
 
 def test_answer_payload_rejects_empty_text(tmp_path):

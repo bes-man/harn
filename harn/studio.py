@@ -909,9 +909,18 @@ def answer_payload(env_dir: Path, task_id: str, text: str) -> dict:
     logic is reimplemented here."""
     if not text.strip():
         return {"error": "answer text is empty"}
+    st = state_mod.State.load(env_dir / "state")
+    blocked_task_id = st.current_task
     from . import loop as loop_mod
     loop_mod.answer(env_dir, text, source="studio")
-    return {"ok": True}
+    if blocked_task_id is None:
+        return {"ok": True, "resumed": False,
+                "warning": "no current task to resume"}
+    result = runner_mod.launch(env_dir.parent, env_dir, blocked_task_id)
+    if result.get("ok"):
+        return {"ok": True, "task_id": blocked_task_id, "resumed": True}
+    return {"ok": True, "task_id": blocked_task_id, "resumed": False,
+            "warning": result.get("error", "resume failed")}
 
 
 def reset_step_attempts_payload(env_dir: Path, task_id: str, step_id: str) -> dict:
@@ -1943,7 +1952,7 @@ _HTML = r"""<!DOCTYPE html>
   .runbanner button{margin-left:auto}
   .blockedq{background:#3a2a10;border:1px solid var(--danger);padding:10px;
     border-radius:6px;margin-bottom:12px}
-  .blockedq pre{white-space:pre-wrap;max-height:200px;overflow-y:auto;
+  .blockedq pre{white-space:pre-wrap;
     font:12.5px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:8px 0}
   .blockedq textarea{width:100%;margin-top:6px;background:var(--panel);color:var(--text);
     border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit}
