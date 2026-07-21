@@ -2948,8 +2948,6 @@ function renderTaskDetail(){
   const panel=$('#taskDetailPanel');
   const sameTask=!!(t&&RENDERED_BOARD_DETAIL_TASK===t.id);
   const panelScroll=sameTask?panel.scrollTop:0;
-  const previousReview=sameTask?$('#reviewLog'):null;
-  const reviewScroll=previousReview?previousReview.scrollTop:0;
   if(!t){ panel.innerHTML='<div class="empty">Select a task.</div>'; BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey(); RENDERED_BOARD_DETAIL_TASK=null; return; }
   const running=BOARD.run&&BOARD.run.task_id===t.id;
   const busy=!!BOARD.run;   // some run (maybe a different task) is active
@@ -3035,7 +3033,7 @@ function renderTaskDetail(){
       <div class="toolDoc">${esc(t.scratchpad||'(empty)')}</div>
     </details>
     <label>Comments <span class="mut">(the conversation on this task — agent events inline, questions answerable right here)</span></label>
-    <div class="toolDoc" id="reviewLog" style="max-height:220px;overflow:auto;user-select:text">${renderActivityFeed(t)}</div>
+    <div class="toolDoc" id="reviewLog" style="user-select:text">${renderActivityFeed(t)}</div>
     <div class="row" style="gap:6px;margin-top:6px">
       <input type="text" id="commentInput" placeholder="Add a comment…" style="flex:1"/>
       <button class="ghost" onclick="postComment('${esc(t.id)}')">Post</button>
@@ -3044,8 +3042,6 @@ function renderTaskDetail(){
   `;
   if(sameTask){
     panel.scrollTop=panelScroll;
-    const nextReview=$('#reviewLog');
-    if(nextReview) nextReview.scrollTop=reviewScroll;
   }
   RENDERED_BOARD_DETAIL_TASK=t.id;
   BOARD_DETAIL_RENDER_KEY=boardDetailRenderKey();

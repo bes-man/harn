@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harn"
-version = "0.17.130"
+version = "0.17.131"
 description = "Agent-agnostic harness with a ralph-style feedback loop, on-demand skills and human-in-the-loop planning."
 requires-python = ">=3.10"
 dependencies = [

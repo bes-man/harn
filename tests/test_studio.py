@@ -485,12 +485,14 @@ def test_studio_step_editor_has_new_session_and_use_task_context_toggles():
     assert "newSessionOn?`" in html
 
 
-def test_studio_review_log_preserves_scroll_across_required_render():
+def test_studio_task_detail_preserves_scroll_across_required_render():
     html = studio._HTML
     assert 'id="reviewLog"' in html
-    assert "const reviewScroll=previousReview?previousReview.scrollTop:0" in html
-    assert "nextReview.scrollTop=reviewScroll" in html
+    # Comments scrolls with the rest of the task modal now, not on its own —
+    # so only the panel-level scroll position needs preserving across a
+    # required re-render.
     assert "panel.scrollTop=panelScroll" in html
+    assert "reviewScroll" not in html
 
 
 def test_studio_polling_discards_stale_responses():
