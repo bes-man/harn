@@ -2628,12 +2628,19 @@ async function pollBoard(){
     if(generation!==boardPollGeneration) return;
     renderRunHistoryIfChanged();
   }
-  if(tab!=='board') return;
-  // Don't rebuild the list out from under an open "＋ New task" form (even
-  // before the user has focused a field in it) or a half-typed value inside
-  // it — same guard pattern as the inspector re-render below.
-  const listChanged=boardListRenderKey()!==BOARD_LIST_RENDER_KEY;
-  if(listChanged && !NEW_TASK_OPEN && !DRAGGING && pollingCanReplace($('#listView'))) renderBoard();
+  // The task modal is a global overlay — reachable from the Flow tab too
+  // (Run progress -> "Open task") — so its live refresh below must run
+  // whenever it's open, not only on the Board tab.
+  const modalEl=$('#taskModal');
+  const modalOpen=!!(modalEl&&modalEl.style.display!=='none');
+  if(tab!=='board'&&!modalOpen) return;
+  if(tab==='board'){
+    // Don't rebuild the list out from under an open "＋ New task" form (even
+    // before the user has focused a field in it) or a half-typed value inside
+    // it — same guard pattern as the inspector re-render below.
+    const listChanged=boardListRenderKey()!==BOARD_LIST_RENDER_KEY;
+    if(listChanged && !NEW_TASK_OPEN && !DRAGGING && pollingCanReplace($('#listView'))) renderBoard();
+  }
   if(boardSel&&(BOARD.tasks||[]).some(t=>t.id===boardSel)){
     // Don't rebuild the inspector out from under an open <select> or a focused
     // input on this 1.5s tick — it would snap a dropdown shut mid-choice or
@@ -2711,7 +2718,12 @@ async function submitAnswer(selectedAnswer){
 }
 function selectTask(id){
   boardSel=id; BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
-  renderBoard(); renderTaskDetail(); pollBlockedQuestion();
+  renderBoard(); renderTaskDetail();
+  // The pending-question fetch is async — repaint the detail once it lands,
+  // or the interactive question block only appears on the next poll tick
+  // (and, when the modal was opened from the Flow tab, never — see the
+  // modal-open check in pollBoard).
+  pollBlockedQuestion().then(()=>renderTaskDetail());
 }
 // Tracks whether the "＋ New task" form is open, independent of DOM focus —
 // a click on "＋ New task" or "Create"/"Cancel" doesn't leave an INPUT/TEXTAREA/
