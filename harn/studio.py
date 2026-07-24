@@ -766,8 +766,9 @@ def board_payload(env_dir: Path) -> dict:
         {"name": s, "label": tasks_mod._STATUS_LABEL.get(s, s)}
         for s in tasks_mod.lifecycle(env_dir)
     ]
-    payload = {"tasks": ts, "run": run, "statuses": statuses}
-    if run:
+    payload = {"tasks": ts, "run": run, "statuses": statuses,
+               "last_run": runner_mod.last_run(env_dir)}
+    if run or payload["last_run"]:
         payload["run_log"] = runner_mod.log_tail(env_dir, 40)
     return payload
 
@@ -2150,7 +2151,7 @@ _HTML = r"""<!DOCTYPE html>
      for `.node.st-active` above rather than a new animation. */
   .badge-used{border-color:#2ecc71 !important}
   .badge-unused-recommended{border-color:#f1c40f !important}
-  .badge-unused-required{border-color:#e74c3c !important;animation:blink 1.2s ease-in-out infinite}
+  .badge-unused-required{border-color:#e74c3c !important}
   .grip{width:6px;cursor:col-resize;background:var(--line)}
   .grip:hover,.grip.act{background:var(--accent)}
   .insp{background:var(--panel);overflow:auto;padding:16px}
@@ -2591,7 +2592,7 @@ async function pollProgress(){
 }
 
 /* ---------- board tab: tasks + per-task workflow + launch/observe a run ---------- */
-let BOARD={tasks:[],run:null,run_log:''}, boardSel=null;
+let BOARD={tasks:[],run:null,last_run:null,run_log:''}, boardSel=null;
 let BOARD_LIST_RENDER_KEY=null;
 let BOARD_DETAIL_RENDER_KEY=null;
 let RENDERED_BOARD_DETAIL_TASK=null;
@@ -2625,6 +2626,7 @@ async function pollBoard(){
   BOARD=next;
   applyBoardStatuses(BOARD.statuses);
   if(BOARD.run&&BOARD.run.task_id) LAST_RUN_TASK=BOARD.run.task_id;   // remember for the run-history panel
+  if(BOARD.last_run&&BOARD.last_run.task_id) LAST_RUN_TASK=BOARD.last_run.task_id;
   // The blocked-question banner reflects per-ENV state (harn has one active
   // task at a time — see blocked_question_payload), not per-selected-task, so
   // it must poll on EVERY tab, not just Board — someone watching a run finish
@@ -3205,6 +3207,13 @@ function fmtClock(ts){
   const d=new Date(ts);
   return isNaN(d.getTime())?'':d.toLocaleTimeString([],{hour12:false});
 }
+function fmtDateTime(ts){
+  if(!ts) return '';
+  const d=new Date(typeof ts==='number'?ts*1000:ts);
+  return isNaN(d.getTime())?'':d.toLocaleString([],{
+    year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false
+  });
+}
 function hasRun(){ return PROG.run && Object.keys(PROG.stages||{}).length>0; }
 // The selected task's `step_results` entry for a step — the same data
 // `run_step()`/the engine write for BOTH agent and command steps, but only
@@ -3237,7 +3246,7 @@ function lastRunOutputBlock(n){
 }
 function applyProgress(){
   const st=PROG.stages||{};
-  const live=hasRun();   // only animate when a run actually has stages
+  const live=hasRun()&&!PROG.ended;   // only animate while the run executes
   document.querySelectorAll('.node').forEach(el=>{
     el.classList.remove('st-active','st-done','st-complete','st-pending');
     if(!live) return;
@@ -3418,7 +3427,7 @@ function rememberTranscriptOpen(stepId,details){
 }
 function transcriptEntryHtml(e,settled){
   const icon={message:'●',status:'◌',command:'›_',tool:'⚙',skill:'◆',file_change:'±',error:'!'}[e.kind]||'·';
-  const live=!settled&&(e.phase==='started'||e.phase==='updated');
+  const live=!!BOARD.run&&!settled&&(e.phase==='started'||e.phase==='updated');
   const clock=fmtClock(e.ts);
   return `<div class="transcript-entry ${esc(e.kind)} ${live?'live':''}" data-seq="${esc(e.seq)}">`+
     `<div class="transcript-entry-head">`+(clock?`<span class="mut">${esc(clock)}</span>`:'')+
@@ -3615,6 +3624,14 @@ function renderFlowTerminal(el){
     return;
   }
   const all=flowAllTasks();
+  const lastRun=BOARD.last_run;
+  const finishedAt=lastRun&&fmtDateTime(lastRun.finished_at);
+  const lastRunNotice=lastRun
+    ? `<div class="run-result ${lastRun.reason?'failed':''}">`+
+      `<b>${lastRun.reason?'Run stopped':'Last run finished'} · ${esc(lastRun.task_id||'task')}`+
+      `${finishedAt?' · '+esc(finishedAt):''}</b>`+
+      `${lastRun.reason?`<pre>${esc(lastRun.reason)}</pre>`:''}</div>`
+    : '';
   // Only LAUNCHABLE tasks belong in the picker — you can't start a task that's
   // already in review or done, so listing them (and then disabling Run with no
   // feedback) just looked like "Run does nothing". Show only runnable ones.
@@ -3624,6 +3641,7 @@ function renderFlowTerminal(el){
       ? 'No runnable task — every task is in review or done. Move one back to <b>To do</b> on the Board, or use <b>↻ Rerun from scratch</b> on a finished task, to launch it here.'
       : 'No tasks yet — create one, then come back here to launch it.';
     el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUN WORKFLOW</span></div>`+
+      lastRunNotice+
       `<div class="mut" style="font-size:11.5px">${msg}</div>`;
     return;
   }
@@ -3640,6 +3658,7 @@ function renderFlowTerminal(el){
   // picker (moved to review/done), so you can inspect what the agents did.
   const lastFinished=LAST_RUN_TASK&&(BOARD.tasks||[]).find(t=>t.id===LAST_RUN_TASK&&t.step_results&&Object.keys(t.step_results).length);
   el.innerHTML=`<div class="ttl run-launch" onclick="openRunHistory()"><span>▶ RUN WORKFLOW</span></div>
+    ${lastRunNotice}
     <div class="mut" style="font-size:11px">Runs the active workflow (<b>${esc(S.active||'default')}</b>) end-to-end against the task you pick.</div>
     <select id="flowTaskSel" onchange="FLOW_SEL_TASK_ID=this.value;renderFlow()">${opts}</select>
     <button class="primary" onclick="launchCurrentFlow()">▶ Run</button>

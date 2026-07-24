@@ -458,6 +458,16 @@ def test_studio_activity_entries_show_second_precision_launch_time():
     assert "fmtClock(e.ts)" in html
 
 
+def test_studio_run_result_shows_finished_date_and_stops_idle_animation():
+    html = studio._HTML
+    assert "function fmtDateTime(ts)" in html
+    assert "fmtDateTime(lastRun.finished_at)" in html
+    assert "const live=hasRun()&&!PROG.ended;" in html
+    assert "const live=!!BOARD.run&&!settled" in html
+    assert ".badge-unused-required{border-color:#e74c3c !important}" in html
+    assert ".badge-unused-required{border-color:#e74c3c !important;animation:" not in html
+
+
 def test_studio_step_editor_has_tool_mode_selector_and_cycle_tool():
     """Studio's per-step Tool mode control (auto/scoped) and the 3-state
     required/recommended/off tool cycle, backing mcp_server's per-step tool

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
-from harn import state, studio, tasks, workflows, ENV_DIRNAME
+from harn import runner, state, studio, tasks, workflows, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -16,6 +16,7 @@ def _env(tmp_path):
 def _fake_popen(pid=4242):
     proc = MagicMock()
     proc.pid = pid
+    proc.wait.return_value = 0
     return proc
 
 
@@ -27,6 +28,21 @@ def test_board_payload_lists_full_task_detail(tmp_path):
     row = payload["tasks"][0]
     assert row["id"] == t.id and row["status"] == "todo"
     assert "scratchpad" in row and "review_log" in row and "decisions" in row
+
+
+def test_board_payload_keeps_last_run_failure_visible_after_process_exits(tmp_path):
+    env = _env(tmp_path)
+    (env / "state").mkdir()
+    runner._last_run_path(env).write_text(
+        '{"task_id":"PRJ-001","exit_code":1,"reason":"Failed to authenticate"}',
+        encoding="utf-8",
+    )
+
+    payload = studio.board_payload(env)
+
+    assert payload["last_run"] == {
+        "task_id": "PRJ-001", "exit_code": 1, "reason": "Failed to authenticate"
+    }
 
 
 def test_board_payload_includes_step_usage_when_present(tmp_path):

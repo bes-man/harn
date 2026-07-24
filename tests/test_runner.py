@@ -9,7 +9,7 @@ import json
 import os
 from unittest.mock import patch, MagicMock
 
-from harn import runner, ENV_DIRNAME
+from harn import roles, runner, tasks, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -21,6 +21,7 @@ def _env(tmp_path):
 def _fake_popen(pid=99999):
     proc = MagicMock()
     proc.pid = pid
+    proc.wait.return_value = 0
     return proc
 
 
@@ -48,6 +49,28 @@ def test_launch_command_includes_task_and_project(tmp_path):
     assert "--task" in cmd and "PRJ-002" in cmd
     assert "--auto" in cmd
     assert str(tmp_path) in cmd
+
+
+def test_launch_resumes_task_through_its_claimed_role(tmp_path):
+    """A Studio relaunch must continue the role that originally blocked.
+
+    Otherwise a role-owned in-progress task is excluded by normal task
+    selection as claimed by another worker, and the runner exits as if the
+    board were empty.
+    """
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write the spec", task_id="PRJ-001")
+    task.status = tasks.IN_PROGRESS
+    task.claimed_by = "spec-writer"
+    tasks._save(task)
+    roles.save(env, {"name": "spec-writer", "status": tasks.IN_PROGRESS})
+
+    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
+         patch("harn.runner.os.kill"):
+        runner.launch(tmp_path, env, task.id)
+
+    cmd = m.call_args[0][0]
+    assert cmd[cmd.index("--as") + 1] == "spec-writer"
 
 
 def test_launch_step_includes_step_flag_not_auto(tmp_path):
@@ -145,6 +168,19 @@ def test_stop_with_no_active_run(tmp_path):
     env = _env(tmp_path)
     r = runner.stop(env)
     assert r["ok"] is False
+
+
+def test_record_completion_keeps_failed_step_reason(tmp_path):
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write spec", task_id="PRJ-001")
+    task.step_results["research"] = {
+        "status": "failed", "output": "Failed to authenticate: OAuth expired"
+    }
+    tasks._save(task)
+
+    runner._record_completion(env, {"task_id": task.id}, 1)
+
+    assert runner.last_run(env)["reason"] == "Failed to authenticate: OAuth expired"
 
 
 def test_log_tail_missing_file(tmp_path):
