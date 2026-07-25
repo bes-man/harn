@@ -661,6 +661,17 @@ def test_blocked_sidebar_restart_uses_full_workflow_reset_not_attempt_only_retry
     assert "retryBlockedStep" not in render
 
 
+def test_failed_step_gets_a_resume_button_at_the_end_of_its_own_transcript():
+    """Observed live: a failed step's Resume was only reachable from the
+    panel header, far above a long transcript — the human looking at the
+    actual error at the bottom of the feed had no way to act from there."""
+    html = studio._HTML
+    render = html[html.index("const renderRunStep=(n)=>"):
+                  html.index("const startedAt=n=>")]
+    assert "status==='failed'?`<div class=\"step-output\"><button class=\"primary\" `" in render
+    assert "onclick=\"launchTask('${esc(taskId)}',false)\">▶ Resume</button>" in render
+
+
 def test_sidebar_restart_warns_that_old_attempt_log_and_context_are_deleted():
     html = studio._HTML
     fn = html[html.index("async function rerunSidebarWorkflow()"):

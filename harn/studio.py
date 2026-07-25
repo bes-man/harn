@@ -3585,7 +3585,14 @@ function renderRunHistory(){
       `<details class="step-transcript" data-step-transcript="${esc(n.id)}" `+
         `ontoggle="rememberTranscriptOpen('${esc(n.id)}',this)" ${transcriptOpen?'open':''}>`+
         `<summary>Agent activity${transcriptCount?' · '+transcriptCount:''}</summary>`+
-        `${stepTranscriptHtml(n.id,out)}</details></div>`;
+        `${stepTranscriptHtml(n.id,out)}`+
+        // Resume right where the human is actually looking — at the END of
+        // this step's own event feed, not only in the panel header far
+        // above. Scoped to 'failed' (not 'blocked': that one's own action
+        // above is a destructive full restart, a different operation).
+        (status==='failed'?`<div class="step-output"><button class="primary" `+
+          `onclick="launchTask('${esc(taskId)}',false)">▶ Resume</button></div>`:'')+
+        `</details></div>`;
   };
   // CHRONOLOGY, not declared order. A step can legitimately run out of
   // declared sequence — most often a RETRY of an early step after later ones
