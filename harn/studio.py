@@ -1232,14 +1232,38 @@ def agents_payload(env_dir: Path) -> dict:
             "tools": [t.name for t in tools_mod.discover(env_dir)]}
 
 
+def column_owner(env_dir: Path, status: str, *, exclude: str = "") -> str | None:
+    """Which OTHER role already owns this board column, if any.
+
+    A role's `status` IS its column: `triggers.auto_scan` builds a
+    status → role map to decide who services a task that lands there. That map
+    can only hold one role per status, so a second role on the same column
+    doesn't share the work — it silently never runs, with nothing in the UI to
+    explain why. One agent per column keeps dispatch answerable.
+    """
+    for role in roles_mod.discover(env_dir):
+        if role.name != exclude and (role.status or "").strip() == status:
+            return role.name
+    return None
+
+
 def save_agent_payload(env_dir: Path, body: dict) -> dict:
     """`POST /api/agents/save` — create or update a role agent's .md file."""
-    if not (body.get("name") or "").strip():
+    name = (body.get("name") or "").strip()
+    status = (body.get("status") or "").strip()
+    if not name:
         return {"ok": False, "error": "name is required"}
-    if not (body.get("status") or "").strip():
+    if not status:
         return {"ok": False, "error": "status is required"}
+    owner = column_owner(env_dir, status, exclude=name)
+    if owner:
+        # Refused rather than saved-with-a-warning: a stored second owner is
+        # the broken state itself, and it would be invisible afterwards.
+        return {"ok": False,
+                "error": f"column '{status}' already belongs to agent '{owner}'",
+                "conflict": {"status": status, "owner": owner, "agent": name}}
     roles_mod.save(env_dir, body)
-    return {"ok": True, "name": body["name"]}
+    return {"ok": True, "name": name}
 
 
 def delete_agent_payload(env_dir: Path, body: dict) -> dict:
@@ -5109,6 +5133,50 @@ function renderAgents(){
   else $('#insp').innerHTML='<div class="empty">Select an agent to edit it.</div>'+renderAgentGenerateBox();
 }
 function selectAgent(i){ agentSel=i; AGENT_DRAFT=null; renderAgents(); }
+// One agent per column. Held in a variable rather than interpolated into the
+// button's onclick: an agent name is free text, and quoting it into an
+// attribute is how you get a name with an apostrophe silently breaking the
+// only button out of the dialog.
+let COLUMN_CONFLICT=null;
+function showColumnConflict(c){
+  COLUMN_CONFLICT=c;
+  closeColumnConflict();
+  // NOT <b>: `.run-result b` is display:block (it styles the card's title
+  // line), so a <b> mid-sentence breaks the paragraph across three lines and
+  // strands the trailing punctuation on its own.
+  const nm=s=>`<span style="font-weight:600;color:var(--text)">${esc(s)}</span>`;
+  const el=document.createElement('div');
+  el.className='modal-backdrop'; el.id='columnConflict';
+  el.onclick=e=>{ if(e.target===el) closeColumnConflict(); };
+  el.innerHTML=`<div class="modal-panel">`+
+    `<h2>Column already has an agent</h2>`+
+    `<div class="run-result failed">`+
+      `<b>⚠ “${esc(c.status)}” belongs to ${esc(c.owner)}</b>`+
+      `<div class="mut" style="margin-top:6px;line-height:1.5">`+
+        `A column dispatches exactly one agent. If two claim it, auto-dispatch `+
+        `picks one and the other simply never runs — with nothing on the board `+
+        `to show which. ${nm(c.agent)} was not saved.`+
+      `</div>`+
+      `<div class="mut" style="margin-top:6px;line-height:1.5">`+
+        `Free the column on ${nm(c.owner)} first, or give ${nm(c.agent)} its `+
+        `own column and chain them with ${nm('next status')}.`+
+      `</div>`+
+    `</div>`+
+    `<div class="row" style="margin-top:12px">`+
+      `<button class="primary" onclick="openConflictOwner()">Open ${esc(c.owner)}</button>`+
+      `<button class="ghost" onclick="closeColumnConflict()">Cancel</button>`+
+    `</div></div>`;
+  document.body.appendChild(el);
+}
+function closeColumnConflict(){
+  const el=$('#columnConflict'); if(el) el.remove();
+}
+function openConflictOwner(){
+  const owner=COLUMN_CONFLICT&&COLUMN_CONFLICT.owner;
+  closeColumnConflict();
+  const i=AGENTS.findIndex(a=>a.name===owner);
+  if(i>=0) selectAgent(i);
+}
 function addAgent(){
   let base='new-agent', n=base, i=2; while(AGENTS.some(a=>a.name===n)){ n=base+'-'+i; i++; }
   AGENTS.push({name:n, command:n, status:AGENT_STATUSES[0]||'', next_status:'', trigger:'manual',
@@ -5222,7 +5290,13 @@ async function saveAgent(i){
     name:a.name, command:a.command, status:a.status, next_status:a.next_status,
     trigger:a.trigger, oracle:a.oracle, isolation:a.isolation, secrets:a.secrets||[],
     agent:a.agent, model:a.model, workflow:a.workflow, body:a.body||''});
-  if(!r.ok){ if(st) st.textContent=r.error||'save failed'; return; }
+  if(!r.ok){
+    // A taken column is a design conflict, not a typo — a one-line status
+    // message under the form is too easy to miss when the consequence is
+    // "this agent will silently never run".
+    if(r.conflict){ if(st) st.textContent=''; showColumnConflict(r.conflict); return; }
+    if(st) st.textContent=r.error||'save failed'; return;
+  }
   // If Generate drafted a workflow too, persist it via the existing
   // flow-save path (POST /api/workflow) so the Flow canvas can open it —
   // never disturbs whichever preset the user currently has open.

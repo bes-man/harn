@@ -963,3 +963,21 @@ def test_an_interrupted_run_is_visible_even_when_no_step_failed(tmp_path):
     assert "const tailNotice=failed?'':lastRunNoticeHtml(taskId);" in html
     # …and it renders inside the rail, after the step rows.
     assert "'<div class=\"empty\">Waiting for the first step…</div>')}${tailNotice}</div>" in html
+
+
+def test_column_conflict_modal_does_not_use_b_inside_the_notice_body():
+    """`.run-result b` is display:block — it styles the card's TITLE line. A
+    <b> mid-sentence therefore breaks the paragraph across three lines and
+    strands the trailing punctuation (seen live), so inline emphasis inside
+    the card body uses a span instead."""
+    html = studio._HTML
+    fn = html[html.index("function showColumnConflict(c){"):
+              html.index("function closeColumnConflict(){")]
+    assert "const nm=s=>`<span style=\"font-weight:600;color:var(--text)\">" in fn
+    body = fn[fn.index('<div class="mut"'):]
+    assert "<b>" not in body
+    # The agent name is passed via a variable, never interpolated into the
+    # button's onclick — a name containing a quote would otherwise break the
+    # only way out of the dialog.
+    assert 'onclick="openConflictOwner()"' in fn
+    assert "COLUMN_CONFLICT=c;" in fn

@@ -107,7 +107,19 @@ def auto_scan(project_root: Path, env_dir: Path, *,
     auto_roles = [r for r in roles_mod.discover(env_dir) if r.trigger == "auto"]
     if not auto_roles:
         return None
-    by_status = {r.status: r for r in auto_roles}
+    # One role per column. A dict comprehension here silently let the LAST
+    # duplicate win, so a second role on the same column never ran and nothing
+    # said why. Studio refuses to create that state, but role files are plain
+    # .md a human can edit — so resolve it deterministically (first by the
+    # sorted filename `discover` already uses) and say so out loud.
+    by_status: dict[str, "roles_mod.Role"] = {}
+    for r in auto_roles:
+        if r.status in by_status:
+            print(f"[harn] watch: column {r.status!r} is claimed by more than one "
+                  f"auto agent ({by_status[r.status].name}, {r.name}) — using "
+                  f"{by_status[r.status].name!r}. Give each column one agent.")
+            continue
+        by_status[r.status] = r
     for task in sorted(tasks_mod.load_tasks(env_dir), key=lambda t: (t.priority, t.id)):
         role = by_status.get(task.status)
         if role is None or task.claimed_by:

@@ -376,3 +376,71 @@ def test_two_role_chain_walks_custom_pipeline_and_writes_result(tmp_path, monkey
 
     final = tasks.find(env, t.id)
     assert final.status == "done"
+
+
+# --- one agent per column -------------------------------------------------- #
+
+def test_saving_a_second_agent_onto_a_taken_column_is_refused(tmp_path):
+    """A role's `status` IS its column, and auto_scan's status→role map holds
+    exactly one. A second owner doesn't share the work — it silently never
+    runs, with nothing in the UI to explain why. Refused rather than saved
+    with a warning: the stored second owner IS the broken state."""
+    from harn import studio
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    studio.save_agent_payload(env, {"name": "reviewer", "status": "review",
+                                    "command": "review"})
+
+    r = studio.save_agent_payload(env, {"name": "tester", "status": "review",
+                                        "command": "test"})
+
+    assert r["ok"] is False
+    assert r["conflict"] == {"status": "review", "owner": "reviewer",
+                             "agent": "tester"}
+    assert roles.find(env, "tester") is None          # nothing was written
+    assert roles.find(env, "reviewer").status == "review"
+
+
+def test_an_agent_can_be_resaved_on_its_own_column(tmp_path):
+    """The uniqueness check must exclude the agent being edited, or nobody
+    could ever save a change to an agent that already has a column."""
+    from harn import studio
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    studio.save_agent_payload(env, {"name": "reviewer", "status": "review",
+                                    "command": "review"})
+
+    r = studio.save_agent_payload(env, {"name": "reviewer", "status": "review",
+                                        "command": "recheck"})
+
+    assert r["ok"] is True
+    assert roles.find(env, "reviewer").command == "recheck"
+
+
+def test_auto_scan_picks_one_owner_deterministically_when_files_collide(tmp_path):
+    """Studio refuses to create a duplicate, but role files are plain .md a
+    human can edit. The old dict comprehension let the LAST one silently win;
+    dispatch must be answerable, so first-by-sorted-filename wins."""
+    from harn import triggers
+    env = tmp_path / ENV_DIRNAME
+    (env / "agents").mkdir(parents=True)
+    for name in ("aaa", "zzz"):
+        (env / "agents" / f"{name}.md").write_text(
+            f"---\nname: {name}\ncommand: {name}\nstatus: review\n"
+            "trigger: auto\n---\n", encoding="utf-8")
+
+    seen = {}
+    def fake_dispatch(pr, ed, command, task_id, cfg=None):
+        seen["command"] = command
+        return {"ok": True}
+    original = triggers.dispatch_command
+    triggers.dispatch_command = fake_dispatch
+    try:
+        t = tasks.create_task(env, "Needs review")
+        t.status = "review"
+        tasks._save(t)
+        triggers.auto_scan(tmp_path, env)
+    finally:
+        triggers.dispatch_command = original
+
+    assert seen["command"] == "aaa"
