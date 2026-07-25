@@ -151,3 +151,113 @@ def test_watch_skips_already_reconciled(tmp_path, monkeypatch):
 
     loop.watch(env, tmp_path, _once=True, _sleep=lambda s: None)
     assert calls["n"] == 0  # already reconciled → not re-run
+
+
+class RecordingAdapter:
+    name = "fake"
+    def __init__(self):
+        self.calls = []
+    def available(self):
+        return True
+    def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                temperature=None):
+        self.calls.append({"prompt": prompt})
+        return AgentResult(ok=True, text="done")
+
+
+# --- resuming after a Telegram/auto answer -------------------------------- #
+# Regression: a block raised by a process that had ALREADY EXITED by the time
+# watch() noticed it (the attempt-cap block returns immediately rather than
+# waiting in-process the way a genuine ask_user block does) left `answer()`'s
+# own promise -- "resume on next `harn run`" -- unfulfilled. Nothing else was
+# ever going to make that next run happen: a human answered in Telegram
+# (including pressing "Decide for me") and the UI never moved.
+
+class _FakeHILAnswers:
+    """Mimics TelegramHIL.await_answer's contract without any network."""
+    def __init__(self, reply, source):
+        self._reply, self._source = reply, source
+    def await_answer(self, question, **kw):
+        return self._reply, self._source
+    def poll_updates(self, state_dir):
+        return {"commands": [], "documents": []}
+    def wait_for_reply(self, text, **kw):
+        return None   # the run this triggers reaches the review gate too;
+                       # None here means "not answered" -> falls back to CLI
+
+
+def _blocked_task_with_no_active_run(env, tmp_path, *, claimed_by=None):
+    from harn import state, workflows
+    t = make_task(env, "PRJ-001", status=tasks.IN_PROGRESS)
+    if claimed_by:
+        t.claimed_by = claimed_by
+        tasks._save(t)
+    workflows.save_task_plan(env, t.id, {"preamble": "", "nodes": [
+        {"kind": "step", "id": "step-1", "title": "Step 1", "enabled": True},
+    ]})
+    detail = "Step 'Step 1' (step-1) stopped after 2 unsuccessful attempts…"
+    (env / "state").mkdir(parents=True, exist_ok=True)
+    state.blocked_marker(env / "state").write_text(detail, encoding="utf-8")
+    st = state.State.load(env / "state")
+    st.current_task = t.id
+    st.block(detail)
+    st.save(env / "state")
+    return t
+
+
+def test_decide_for_me_resumes_a_task_whose_process_already_exited(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
+        '[notify]\nwait_for_reply = true\nhil_channel = "telegram"\n', encoding="utf-8")
+    t = _blocked_task_with_no_active_run(env, tmp_path)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop.TelegramHIL, "from_env",
+                       staticmethod(lambda *_: _FakeHILAnswers(None, "auto")))
+
+    loop.watch(env, tmp_path, _once=True, _sleep=lambda s: None)
+
+    # The task actually ran again -- not just recorded an answer nobody acts on.
+    assert len(fake.calls) >= 1
+    fresh = tasks.find(env, t.id)
+    assert fresh.step_results.get("step-1", {}).get("status") == "ok"
+
+
+def test_decide_for_me_uses_the_claimed_role_when_the_task_has_one(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    (env / "harn.toml").write_text(
+        '[harn]\nagent = "fake"\n[feedback]\ntest_cmd = ""\n'
+        '[notify]\nwait_for_reply = true\nhil_channel = "telegram"\n', encoding="utf-8")
+    (env / "agents").mkdir(parents=True, exist_ok=True)
+    from harn import roles
+    roles.save(env, {"name": "spec-writer", "command": "spec",
+                     "status": tasks.IN_PROGRESS, "trigger": "manual"})
+    t = _blocked_task_with_no_active_run(env, tmp_path, claimed_by="spec-writer")
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop.TelegramHIL, "from_env",
+                       staticmethod(lambda *_: _FakeHILAnswers(None, "auto")))
+
+    loop.watch(env, tmp_path, _once=True, _sleep=lambda s: None)
+
+    assert len(fake.calls) >= 1
+    fresh = tasks.find(env, t.id)
+    assert fresh.claimed_by == "spec-writer"
+
+
+def test_resume_after_answer_is_a_noop_when_a_run_is_still_active(tmp_path, monkeypatch):
+    """A block from a STILL-ALIVE process (genuine ask_user, waiting
+    in-process) must not be double-run just because watch() also saw the
+    marker -- that process's own poll will continue it on its own."""
+    env = _env(tmp_path)
+    t = _blocked_task_with_no_active_run(env, tmp_path)
+    from harn import runstate
+    runstate.begin(env, t.id, pid=__import__("os").getpid())
+
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    from harn.config import Config
+    loop._resume_after_answer(tmp_path, env, t.id, cfg=Config.load(env))
+
+    assert fake.calls == []

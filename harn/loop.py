@@ -2794,6 +2794,39 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
         progress.log(env_dir, f"promoted answer into skill '{skill}'")
 
 
+def _resume_after_answer(project_root: Path, env_dir: Path, task_id: str | None,
+                         *, cfg: Config) -> None:
+    """After recording an answer, continue the task ourselves if nothing else
+    already is — needed specifically for a block raised by a process that had
+    already EXITED by the time `watch()` noticed it (the attempt-cap block
+    returns immediately rather than waiting in-process the way a genuine
+    `ask_user` block does). `answer()`'s own docstring says it plainly:
+    "resume on next `harn run`" — for that kind of block, nothing else was
+    ever going to make that next run happen.
+
+    A block from a still-alive process needs no help here: that process's own
+    `_handle_block` poll notices the same cleared marker and continues on its
+    own, and `runner.active()` reports it as running — so this is a no-op for
+    that case. Launching here too would run the task twice.
+    """
+    if not task_id:
+        return
+    from . import runner as runner_mod
+    if runner_mod.active(env_dir) is not None:
+        return
+    task = tasks.find(env_dir, task_id)
+    if task is None or task.status in (tasks.DONE, tasks.REVIEW):
+        return
+    print(f"[harn] watch: resuming '{task_id}' after the answer…")
+    if task.claimed_by:
+        from . import roles as roles_mod, roles_runner as roles_runner_mod
+        role = roles_mod.find(env_dir, task.claimed_by)
+        if role is not None:
+            roles_runner_mod.run_role(project_root, env_dir, task_id, role.name, cfg=cfg)
+            return
+    run(project_root, env_dir, only_task=task_id)
+
+
 def _progress_tail_lines(env_dir: Path) -> list[str]:
     p = env_dir / "state" / "PROGRESS.md"
     if not p.exists():
@@ -2923,17 +2956,24 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
             st = state.State.load(state_dir)
             st.block(question)
             st.save(state_dir)
+            blocked_task = st.current_task
             reply, reply_src = _await_answer(env_dir, cfg, st.current_task or "(chat)",
                                              question)
             if reply_src == "telegram" and reply is not None:
                 answer(env_dir, reply, source="telegram")
                 print("[harn] watch: answered via Telegram.")
+                _resume_after_answer(project_root, env_dir, blocked_task, cfg=cfg)
             elif reply_src == "chat":
                 print("[harn] watch: answered in chat.")
+                # Answered from inside a live chat-agent session — that
+                # session (not watch()) is the one that continues, exactly
+                # the way `_handle_block`'s in-process "resumed" already
+                # works. Relaunching here too would run the task twice.
             elif reply_src == "auto":
                 answer(env_dir, "You pressed 'Decide for me'. " + _AUTO_BUTTON_NOTE,
                        source="auto")
                 print("[harn] watch: delegated to the agent.")
+                _resume_after_answer(project_root, env_dir, blocked_task, cfg=cfg)
             else:
                 notify(f"[harn] Agent needs your input:\n{question}")
             handled_q = question
