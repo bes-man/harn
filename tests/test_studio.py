@@ -981,3 +981,19 @@ def test_column_conflict_modal_does_not_use_b_inside_the_notice_body():
     # only way out of the dialog.
     assert 'onclick="openConflictOwner()"' in fn
     assert "COLUMN_CONFLICT=c;" in fn
+
+
+def test_the_latest_attempt_is_labeled_when_a_step_actually_retried():
+    """Prior attempts collapse into a labeled "Attempt N" <details> block —
+    but the LATEST attempt used to render with no label at all, just an
+    unlabeled feed under the collapsed prior one(s). A step that hit the
+    2-attempt block cap then visually showed only ONE labeled attempt
+    ("Attempt 1"), even though the block message said two happened — the
+    second one was there, just unlabeled."""
+    html = studio._HTML
+    fn = html[html.index("function stepTranscriptHtml(stepId,legacyOutput){"):
+              html.index("function runtimeStepStatus(")]
+    assert "const currentLabel=attempts.length>1" in fn
+    assert "`<div class=\"attempt-label\">Attempt ${latest} (latest)</div>`" in fn
+    assert "return `${prior}${currentLabel}<div class=\"transcript-feed\">${current}</div>`;" in fn
+    assert ".attempt-label{" in html

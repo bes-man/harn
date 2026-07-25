@@ -2211,6 +2211,7 @@ _HTML = r"""<!DOCTYPE html>
   .transcript-entry pre{margin:0;white-space:pre-wrap;word-break:break-word;font:11px/1.5 ui-monospace,Menlo,monospace;color:#cbd2df;max-height:260px;overflow:auto}
   .transcript-entry.message pre,.transcript-entry.status pre{font-family:inherit;font-size:11.5px}
   .prior-attempts{margin-top:7px}.prior-attempts summary{cursor:pointer;color:var(--muted);font-size:10px}
+  .attempt-label{margin-top:7px;color:var(--muted);font-size:10px;letter-spacing:.3px}
   .transcript-empty{padding:8px 0;color:var(--muted);font-size:11px;font-style:italic}
   .attgrid{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
   .attcard{position:relative;width:96px;background:var(--panel2);border:1px solid var(--line);
@@ -3695,7 +3696,15 @@ function stepTranscriptHtml(stepId,legacyOutput){
     `<details class="prior-attempts"><summary>Attempt ${attempt}</summary><div class="transcript-feed">`+
     transcriptEntriesHtml(entries.filter(e=>(Number(e.attempt)||1)===attempt))+
     `</div></details>`).join('');
-  return `${prior}<div class="transcript-feed">${current}</div>`;
+  // The latest attempt used to render with NO label at all — only the
+  // collapsed prior ones said "Attempt N", so a step that actually retried
+  // (e.g. hit the 2-attempt block cap) showed one labeled "Attempt 1" plus
+  // an unlabeled feed underneath, reading as if only one attempt happened
+  // even though the block message said two. Only shown when there's more
+  // than one attempt — a normal single-try step stays exactly as before.
+  const currentLabel=attempts.length>1
+    ? `<div class="attempt-label">Attempt ${latest} (latest)</div>` : '';
+  return `${prior}${currentLabel}<div class="transcript-feed">${current}</div>`;
 }
 function runtimeStepStatus(stepId,ledgerStatus){
   const live=(PROG.stages||{})[stepId];
