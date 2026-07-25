@@ -506,9 +506,9 @@ def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button(
     assert ".run-result.blocked{" in html
     assert ".run-result.failed{" in html
     # The same notice also renders in the Run progress SIDE PANEL
-    # (renderRunHistory), scoped to that panel's own task — not just the
-    # RUN WORKFLOW terminal node on the canvas.
-    assert "lastRunNoticeHtml(taskId)+" in html
+    # (renderRunHistory), at the end of the failed/blocked step's own
+    # transcript — not just the RUN WORKFLOW terminal node on the canvas.
+    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId):'')" in html
     assert "lastRun:BOARD.last_run||null," in html
 
 
@@ -664,12 +664,13 @@ def test_blocked_sidebar_restart_uses_full_workflow_reset_not_attempt_only_retry
 def test_failed_step_gets_a_resume_button_at_the_end_of_its_own_transcript():
     """Observed live: a failed step's Resume was only reachable from the
     panel header, far above a long transcript — the human looking at the
-    actual error at the bottom of the feed had no way to act from there."""
+    actual error at the bottom of the feed had no way to act from there.
+    It reuses lastRunNoticeHtml verbatim (same ghost-styled card) rather
+    than a bespoke button, so the same action looks the same everywhere."""
     html = studio._HTML
     render = html[html.index("const renderRunStep=(n)=>"):
                   html.index("const startedAt=n=>")]
-    assert "status==='failed'?`<div class=\"step-output\"><button class=\"primary\" `" in render
-    assert "onclick=\"launchTask('${esc(taskId)}',false)\">▶ Resume</button>" in render
+    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId):'')" in render
 
 
 def test_sidebar_restart_warns_that_old_attempt_log_and_context_are_deleted():
@@ -802,6 +803,32 @@ def test_run_sidebar_preserves_nested_transcript_scroll():
     assert "const nestedScroll=new Map()" in html
     assert "panel.querySelectorAll('[data-run-scroll]')" in html
     assert "el.scrollTop=nestedScroll.get(el.dataset.runScroll)" in html
+
+
+def test_run_progress_head_is_pinned_and_opening_scrolls_to_the_end():
+    """The header (title/close, progress bar, action buttons) stays pinned
+    at the top of the sidebar instead of scrolling away with a long
+    transcript, and every fresh open of the panel jumps straight to the
+    latest event — polling re-renders while the human is reading mid-scroll
+    must NOT do that, so the jump is a one-shot flag consumed on render."""
+    html = studio._HTML
+    assert ".run-progress-head{position:sticky;top:-16px" in html
+    assert "let RUN_HISTORY_SCROLL_TO_END=false;" in html
+    assert "RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false; RUN_HISTORY_SCROLL_TO_END=true;" in html
+    # #insp is the innerHTML target but has no overflow of its own — its
+    # parent (class="insp") is the real scroll container. #insp.scrollTop was
+    # a silent no-op (confirmed live), so scroll read/write must go through
+    # that parent, not #insp itself.
+    assert "const scroller=panel.parentElement||panel;" in html
+    assert "const previousScroll=scroller.scrollTop;" in html
+    render = html[html.index("panel.innerHTML=`<div class=\"run-progress\">"):
+                  html.index("RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();")]
+    # openRunHistory() renders a "Loading…" placeholder before its real
+    # content arrives — the flag must survive that empty render (steps.length
+    # is 0) and only fire once there's something to scroll to.
+    assert "if(RUN_HISTORY_SCROLL_TO_END&&steps.length){" in render
+    assert "scroller.scrollTop=scroller.scrollHeight;" in render
+    assert "scroller.scrollTop=previousScroll;" in render
 
 
 def test_flow_history_prefers_completed_task_with_step_results_after_reload():

@@ -2005,13 +2005,21 @@ _HTML = r"""<!DOCTYPE html>
   .pdot.dot-failed{border-color:var(--danger);color:var(--danger)}
   .runlog{max-height:200px;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
   /* Flow run sidebar: a compact flight-recorder timeline, not a console dump. */
-  .run-progress{display:flex;flex-direction:column;gap:12px}
-  .run-progress-head{padding:12px;border:1px solid #3a4150;border-radius:12px;
+  .run-progress{display:flex;flex-direction:column;gap:10px}
+  /* Pinned to the top of #insp (position:sticky, not fixed — stays inside the
+     panel's own scroll container) so it survives scrolling through a long
+     transcript instead of scrolling away with it. The negative margins pull
+     it flush with #insp's own 16px padding so it reads as one solid bar
+     spanning the panel edge-to-edge while stuck, not a floating card with
+     gutters on each side. Kept deliberately short (compact 8px padding, no
+     wasted lines) since it now permanently occupies screen space. */
+  .run-progress-head{position:sticky;top:-16px;z-index:3;margin:-16px -16px 0;
+    padding:8px 16px;border-bottom:1px solid #3a4150;
     background:linear-gradient(135deg,#202538 0%,#191d27 70%)}
   .run-progress-title{display:flex;align-items:center;justify-content:space-between;gap:10px}
-  .run-progress-title strong{font-size:14px;letter-spacing:.1px}
-  .run-progress-meta{font:11px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-top:4px}
-  .progress-track{height:5px;border-radius:999px;background:#11141b;overflow:hidden;margin-top:10px}
+  .run-progress-title strong{font-size:13px;letter-spacing:.1px}
+  .run-progress-meta{font:11px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-top:2px}
+  .progress-track{height:4px;border-radius:999px;background:#11141b;overflow:hidden;margin-top:7px}
   .progress-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .25s ease}
   .progress-rail{position:relative;padding-left:22px}
   .progress-rail::before{content:'';position:absolute;left:7px;top:12px;bottom:12px;width:2px;background:#303644}
@@ -3365,6 +3373,11 @@ function renderRunLogPanel(){
 let RUN_HISTORY_OPEN=false, RUN_HISTORY_PLAN=null;   // {taskId, nodes}
 let RUN_HISTORY_MODE='preview';
 let RUN_HISTORY_ERROR='';
+// Set right before a fresh openRunHistory() render so renderRunHistory()
+// jumps the panel to the end instead of restoring scrollTop — every other
+// re-render (polling ticks while the human is mid-scroll reading) must NOT
+// yank them back down, so this is consumed and cleared after one use.
+let RUN_HISTORY_SCROLL_TO_END=false;
 let RUN_TRANSCRIPT={taskId:null,cursor:0,entries:[]};
 let RUN_HISTORY_RENDER_KEY=null;
 const TRANSCRIPT_OPEN_STEPS=new Set();
@@ -3389,7 +3402,7 @@ function historyTaskId(){
 }
 async function openRunHistory(){
   const taskId=historyTaskId();
-  RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false;
+  RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false; RUN_HISTORY_SCROLL_TO_END=true;
   if(RUN_TRANSCRIPT.taskId!==taskId){
     RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
     TRANSCRIPT_OPEN_STEPS.clear();
@@ -3528,7 +3541,13 @@ function renderRunHistoryIfChanged(){
 function renderRunHistory(){
   const taskId=historyTaskId();
   if(!taskId){ $('#insp').innerHTML='<div class="empty">No run to show yet — launch a task.</div>'; return; }
-  const panel=$('#insp'); const previousScroll=panel.scrollTop;
+  const panel=$('#insp');
+  // #insp is the innerHTML target, but it has no overflow of its own — its
+  // PARENT (class="insp") is the actual scroll container (confirmed live:
+  // #insp's scrollTop was always 0/a no-op, so "preserve scroll on re-
+  // render" never actually worked). Read/write scroll position there.
+  const scroller=panel.parentElement||panel;
+  const previousScroll=scroller.scrollTop;
   const nestedScroll=new Map();
   panel.querySelectorAll('[data-run-scroll]').forEach(el=>nestedScroll.set(el.dataset.runScroll,el.scrollTop));
   panel.querySelectorAll('details[data-step-transcript]').forEach(d=>{
@@ -3588,10 +3607,15 @@ function renderRunHistory(){
         `${stepTranscriptHtml(n.id,out)}`+
         // Resume right where the human is actually looking — at the END of
         // this step's own event feed, not only in the panel header far
-        // above. Scoped to 'failed' (not 'blocked': that one's own action
-        // above is a destructive full restart, a different operation).
-        (status==='failed'?`<div class="step-output"><button class="primary" `+
-          `onclick="launchTask('${esc(taskId)}',false)">▶ Resume</button></div>`:'')+
+        // above. Reuses lastRunNoticeHtml verbatim (same card, same ghost
+        // button) instead of a bespoke button — a bare "primary" button here
+        // read as a different control from the identical-purpose card that
+        // used to sit at the top of the panel, when it's the same action.
+        // Shown for 'blocked' too (alongside its own "restart from scratch"
+        // button above, a distinct destructive action) so the waiting-for-
+        // answer question and its resume button are visible at the end of
+        // the transcript, not only in a card that no longer exists up top.
+        ((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId):'')+
         `</details></div>`;
   };
   // CHRONOLOGY, not declared order. A step can legitimately run out of
@@ -3632,13 +3656,23 @@ function renderRunHistory(){
     `<button class="icon-btn" onclick="closeRunHistory()" title="Close">✕</button></div>`+
     `<div class="run-progress-meta">${esc(taskId)} · ${complete}/${steps.length} complete${failed?' · '+failed+' need attention':''}</div>`+
     `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`+
-    `<div class="row" style="margin-top:10px">${action}${rerun}${openTask}</div>`+
+    `<div class="row" style="margin-top:7px">${action}${rerun}${openTask}</div>`+
     `${RUN_HISTORY_ERROR?`<div class="mut" style="color:var(--danger);margin-top:7px">${esc(RUN_HISTORY_ERROR)}</div>`:''}`+
-    lastRunNoticeHtml(taskId)+`</div>`+
+    `</div>`+
     `<div class="progress-rail">${rows||(loadingPlan
       ?'<div class="empty">Loading this task\'s workflow…</div>'
       :'<div class="empty">Waiting for the first step…</div>')}</div></div>`;
-  panel.scrollTop=previousScroll;
+  // openRunHistory() renders once immediately (a "Loading…" placeholder,
+  // before its task_plan fetch resolves) and again once real steps arrive —
+  // consuming the flag on that first, empty render would scroll to the
+  // bottom of nothing and leave the real content sitting at the top once it
+  // lands. Keep the flag armed until there's something to scroll to.
+  if(RUN_HISTORY_SCROLL_TO_END&&steps.length){
+    RUN_HISTORY_SCROLL_TO_END=false;
+    scroller.scrollTop=scroller.scrollHeight;
+  }else if(!RUN_HISTORY_SCROLL_TO_END){
+    scroller.scrollTop=previousScroll;
+  }
   panel.querySelectorAll('[data-run-scroll]').forEach(el=>{
     if(nestedScroll.has(el.dataset.runScroll))el.scrollTop=nestedScroll.get(el.dataset.runScroll);
   });
