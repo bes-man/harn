@@ -452,10 +452,35 @@ def test_studio_activity_entries_show_second_precision_launch_time():
     task, every Agent activity entry looked the same age -- no way to see
     WHEN each tool call/message actually fired, only their relative order.
     Each entry's own `ts` (already second-precision from transcript.append)
-    must now render as a local HH:MM:SS clock next to it."""
+    must render a local timestamp next to it — DATE included, not just
+    HH:MM:SS: a step's attempts can span days (blocked overnight, resumed
+    later), and clock-only stamps made entries from different days
+    indistinguishable."""
     html = studio._HTML
-    assert "function fmtClock(ts)" in html
-    assert "fmtClock(e.ts)" in html
+    assert "function fmtEntryStamp(ts)" in html
+    assert "fmtEntryStamp(e.ts)" in html
+
+
+def test_studio_transcript_drops_streaming_duplicate_of_its_own_completed_entry():
+    """Observed live: a streaming 'updated' chunk followed by a 'completed'
+    entry carrying the EXACT SAME text rendered as two back-to-back blocks
+    with identical content — read as a chronology/duplication bug. Only the
+    completed entry (the real end-of-message timestamp) should render.
+
+    The pairing match must tolerate two real-world mismatches between an
+    "updated"/streaming record and its own terminal "completed"/"failed"
+    twin: title CASING (observed live: "Claude" vs "claude", adapter.name
+    lowercase) and KIND (loop.py's on_event tags the same turn's own output
+    "message" on success but "error" on failure — an exact-kind compare left
+    a failed turn's streaming chunk permanently undeduped against its own
+    error/failed entry)."""
+    html = studio._HTML
+    assert "dup:!!(supersededBy&&supersededBy.text===entry.text)" in html
+    assert ".filter(x=>!x.dup)" in html
+    assert "const sameTitle=(a,b)=>String(a||'').toLowerCase()===String(b||'').toLowerCase();" in html
+    assert "sameTitle(later.title,entry.title)" in html
+    assert "const sameKind=(a,b)=>a===b||(['message','error'].includes(a)&&['message','error'].includes(b));" in html
+    assert "sameKind(later.kind,entry.kind)" in html
 
 
 def test_studio_run_result_shows_finished_date_and_stops_idle_animation():

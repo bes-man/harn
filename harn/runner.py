@@ -47,14 +47,23 @@ def last_run(env_dir: Path) -> dict | None:
 
 
 def _failure_reason(env_dir: Path, task_id: str) -> str:
-    """Return the newest failed step's human-readable output, if any."""
+    """Return the newest failed step's human-readable output, prefixed with
+    that step's own title — a bare error message left the human unable to
+    tell WHICH step it came from (observed live: the failure was on an
+    early, already-"complete"-looking step, several steps before the one the
+    human was actually looking at)."""
     from . import tasks as tasks_mod
+    from . import workflows as workflows_mod
     task = tasks_mod.find(env_dir, task_id)
     if task is None:
         return ""
-    for result in reversed(list(task.step_results.values())):
+    for step_id, result in reversed(list(task.step_results.items())):
         if result.get("status") == "failed":
-            return str(result.get("output") or "").strip()
+            text = str(result.get("output") or "").strip()
+            plan = workflows_mod.load_task_plan(env_dir, task_id) or {}
+            title = next((n.get("title") for n in plan.get("nodes", [])
+                         if n.get("id") == step_id), None)
+            return f"{title or step_id}: {text}" if text else ""
     return ""
 
 

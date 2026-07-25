@@ -3204,14 +3204,15 @@ function fmtTokSplit(info){
   return fmtTokN(fresh)+(cache?` (+${fmtTokN(cache)} cached)`:'');
 }
 function fmtBytes(n){ if(!n) return '0B'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB'; }
-// Second-precision local clock time for one transcript entry's own `ts`
-// (e.g. "2026-07-13T16:09:45Z" -> "16:09:45" in the browser's local zone) --
-// lets a human see exactly when each Agent activity item actually fired,
-// not just its relative order in the feed.
-function fmtClock(ts){
+// Compact date+time for a single transcript entry — a step's attempts can
+// legitimately span days (a task blocked overnight, then resumed), and
+// clock-only timestamps made entries from different days indistinguishable.
+function fmtEntryStamp(ts){
   if(!ts) return '';
   const d=new Date(ts);
-  return isNaN(d.getTime())?'':d.toLocaleTimeString([],{hour12:false});
+  if(isNaN(d.getTime())) return '';
+  const date=d.toLocaleDateString([],{month:'2-digit',day:'2-digit'});
+  return date+' '+d.toLocaleTimeString([],{hour12:false});
 }
 function fmtDateTime(ts){
   if(!ts) return '';
@@ -3434,20 +3435,40 @@ function rememberTranscriptOpen(stepId,details){
 function transcriptEntryHtml(e,settled){
   const icon={message:'●',status:'◌',command:'›_',tool:'⚙',skill:'◆',file_change:'±',error:'!'}[e.kind]||'·';
   const live=!!BOARD.run&&!settled&&(e.phase==='started'||e.phase==='updated');
-  const clock=fmtClock(e.ts);
+  const stamp=fmtEntryStamp(e.ts);
   return `<div class="transcript-entry ${esc(e.kind)} ${live?'live':''}" data-seq="${esc(e.seq)}">`+
-    `<div class="transcript-entry-head">`+(clock?`<span class="mut">${esc(clock)}</span>`:'')+
+    `<div class="transcript-entry-head">`+(stamp?`<span class="mut">${esc(stamp)}</span>`:'')+
     `<span>${icon}</span><b>${esc(e.title||e.kind)}</b>`+
     `<span>${esc(e.phase||'')}</span></div>`+
     (e.text?`<pre data-run-scroll="${esc(e.seq)}">${esc(e.text)}</pre>`:'')+`</div>`;
 }
 function transcriptEntriesHtml(entries){
+  // Title casing isn't a stable identity signal across an entry's own
+  // lifecycle — observed live: a streaming "updated" record titled "Claude"
+  // superseded by its own "completed" record titled "claude" (adapter.name,
+  // lowercase). An exact-match compare here silently failed to recognize
+  // them as the same logical event, so the streaming duplicate never
+  // resolved to settled/deduped.
+  const sameTitle=(a,b)=>String(a||'').toLowerCase()===String(b||'').toLowerCase();
+  // loop.py's on_event() tags an agent turn's own final output "message" on
+  // success but "error" on failure (see _run_turn) — the SAME logical piece
+  // of text, streamed as "message"/updated, then re-emitted terminally as
+  // "error"/failed once the turn is known to have failed. An exact kind
+  // match missed that pairing entirely (observed live: an "updated" message
+  // chunk left undeduped against its own "error"/failed twin).
+  const sameKind=(a,b)=>a===b||(['message','error'].includes(a)&&['message','error'].includes(b));
   return entries.map((entry,index)=>{
-    const settled=(entry.phase==='started'||entry.phase==='updated')&&entries.slice(index+1).some(later=>
-      later.attempt===entry.attempt&&later.kind===entry.kind&&later.title===entry.title&&
+    const supersededBy=(entry.phase==='started'||entry.phase==='updated')&&entries.slice(index+1).find(later=>
+      later.attempt===entry.attempt&&sameKind(later.kind,entry.kind)&&sameTitle(later.title,entry.title)&&
       (!entry.item_id||later.item_id===entry.item_id)&&['completed','failed'].includes(later.phase));
-    return transcriptEntryHtml(entry,settled);
-  }).join('');
+    return {entry, settled:!!supersededBy,
+      // A streaming "updated" chunk that carries the EXACT SAME text as its
+      // own later "completed" entry is a duplicate of it, not a distinct
+      // moment — observed live as the same paragraph rendered twice in a
+      // row. Drop it; the completed entry (with the real end timestamp)
+      // is what actually happened.
+      dup:!!(supersededBy&&supersededBy.text===entry.text)};
+  }).filter(x=>!x.dup).map(x=>transcriptEntryHtml(x.entry,x.settled)).join('');
 }
 function stepTranscriptHtml(stepId,legacyOutput){
   if(RUN_HISTORY_MODE==='preview')return '<div class="transcript-empty">Starts when this flow runs.</div>';

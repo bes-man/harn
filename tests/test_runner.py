@@ -171,8 +171,15 @@ def test_stop_with_no_active_run(tmp_path):
 
 
 def test_record_completion_keeps_failed_step_reason(tmp_path):
+    """The reason is prefixed with the FAILED STEP'S OWN TITLE — a bare error
+    message left no way to tell which step (of possibly several already
+    marked complete) it actually came from."""
+    from harn import workflows
     env = _env(tmp_path)
     task = tasks.create_task(env, "Write spec", task_id="PRJ-001")
+    workflows.save_task_plan(env, task.id, {"preamble": "", "nodes": [
+        {"kind": "step", "id": "research", "title": "Research"},
+    ]})
     task.step_results["research"] = {
         "status": "failed", "output": "Failed to authenticate: OAuth expired"
     }
@@ -180,7 +187,7 @@ def test_record_completion_keeps_failed_step_reason(tmp_path):
 
     runner._record_completion(env, {"task_id": task.id}, 1)
 
-    assert runner.last_run(env)["reason"] == "Failed to authenticate: OAuth expired"
+    assert runner.last_run(env)["reason"] == "Research: Failed to authenticate: OAuth expired"
 
 
 def test_record_completion_reports_blocked_not_failed(tmp_path):
@@ -228,7 +235,7 @@ def test_record_completion_ignores_block_for_a_different_task(tmp_path):
 
     result = runner.last_run(env)
     assert "blocked" not in result
-    assert result["reason"] == "real failure"
+    assert result["reason"] == "research: real failure"
 
 
 def test_log_tail_missing_file(tmp_path):
