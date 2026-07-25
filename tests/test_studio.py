@@ -983,17 +983,33 @@ def test_column_conflict_modal_does_not_use_b_inside_the_notice_body():
     assert "COLUMN_CONFLICT=c;" in fn
 
 
-def test_the_latest_attempt_is_labeled_when_a_step_actually_retried():
-    """Prior attempts collapse into a labeled "Attempt N" <details> block —
-    but the LATEST attempt used to render with no label at all, just an
-    unlabeled feed under the collapsed prior one(s). A step that hit the
-    2-attempt block cap then visually showed only ONE labeled attempt
-    ("Attempt 1"), even though the block message said two happened — the
-    second one was there, just unlabeled."""
+def test_the_latest_attempt_is_labeled_and_actually_toggleable():
+    """Prior attempts collapse into a labeled, clickable "Attempt N"
+    <details> block — but the LATEST attempt used to render with no label at
+    all, just an unlabeled feed under the collapsed prior one(s). A step
+    that hit the 2-attempt block cap then visually showed only ONE labeled
+    attempt ("Attempt 1"), even though the block message said two happened.
+
+    A first fix added a label, but as plain text — it then LOOKED like the
+    prior attempts' clickable "▶ Attempt N" toggle (same position, same
+    "Attempt N" wording) but wasn't one, so clicking it did nothing
+    (reported live). It's a real <details>/<summary> now, same element as
+    prior attempts, just defaulted open — genuinely collapsible, not a
+    lookalike."""
     html = studio._HTML
     fn = html[html.index("function stepTranscriptHtml(stepId,legacyOutput){"):
               html.index("function runtimeStepStatus(")]
-    assert "const currentLabel=attempts.length>1" in fn
-    assert "`<div class=\"attempt-label\">Attempt ${latest} (latest)</div>`" in fn
-    assert "return `${prior}${currentLabel}<div class=\"transcript-feed\">${current}</div>`;" in fn
-    assert ".attempt-label{" in html
+    assert "if(attempts.length<=1) return `${prior}<div class=\"transcript-feed\">${current}</div>`;" in fn
+    assert "return `${prior}<details class=\"prior-attempts\" open>`+" in fn
+    assert "`<summary>Attempt ${latest} (latest)</summary>`+" in fn
+
+
+def test_closing_a_running_or_blocked_steps_transcript_stays_closed():
+    """Regression: TRANSCRIPT_CLOSED_STEPS recorded the close correctly, but
+    running/failed/blocked forced `open` UNCONDITIONALLY on every render —
+    so closing a blocked step's "Agent activity" popped back open on the
+    very next poll tick (~1.5s) no matter how many times it was closed."""
+    html = studio._HTML
+    fn = html[html.index("const status=runtimeStepStatus(n.id,normalized(r.status));"):
+              html.index("const stamp=fmtEntryStamp(r.started);")]
+    assert "const transcriptOpen=TRANSCRIPT_CLOSED_STEPS.has(n.id)?false:(" in fn

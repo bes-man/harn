@@ -2211,7 +2211,6 @@ _HTML = r"""<!DOCTYPE html>
   .transcript-entry pre{margin:0;white-space:pre-wrap;word-break:break-word;font:11px/1.5 ui-monospace,Menlo,monospace;color:#cbd2df;max-height:260px;overflow:auto}
   .transcript-entry.message pre,.transcript-entry.status pre{font-family:inherit;font-size:11.5px}
   .prior-attempts{margin-top:7px}.prior-attempts summary{cursor:pointer;color:var(--muted);font-size:10px}
-  .attempt-label{margin-top:7px;color:var(--muted);font-size:10px;letter-spacing:.3px}
   .transcript-empty{padding:8px 0;color:var(--muted);font-size:11px;font-style:italic}
   .attgrid{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
   .attcard{position:relative;width:96px;background:var(--panel2);border:1px solid var(--line);
@@ -3700,11 +3699,16 @@ function stepTranscriptHtml(stepId,legacyOutput){
   // collapsed prior ones said "Attempt N", so a step that actually retried
   // (e.g. hit the 2-attempt block cap) showed one labeled "Attempt 1" plus
   // an unlabeled feed underneath, reading as if only one attempt happened
-  // even though the block message said two. Only shown when there's more
-  // than one attempt — a normal single-try step stays exactly as before.
-  const currentLabel=attempts.length>1
-    ? `<div class="attempt-label">Attempt ${latest} (latest)</div>` : '';
-  return `${prior}${currentLabel}<div class="transcript-feed">${current}</div>`;
+  // even though the block message said two. A first fix added a label as
+  // plain text — which then LOOKED like the prior attempts' clickable
+  // "▶ Attempt N" toggle but wasn't one, so clicking it did nothing. It's a
+  // real <details> now, same as prior attempts, just defaulted open. Only
+  // wrapped at all when there's more than one attempt — a normal single-try
+  // step stays exactly as before (a bare feed, no toggle to click).
+  if(attempts.length<=1) return `${prior}<div class="transcript-feed">${current}</div>`;
+  return `${prior}<details class="prior-attempts" open>`+
+    `<summary>Attempt ${latest} (latest)</summary>`+
+    `<div class="transcript-feed">${current}</div></details>`;
 }
 function runtimeStepStatus(stepId,ledgerStatus){
   const live=(PROG.stages||{})[stepId];
@@ -3792,8 +3796,14 @@ function renderRunHistory(){
     const metric=r.tokens?`${r.tokens} tok`:'';
     const transcriptCount=(RUN_HISTORY_MODE==='execution'&&RUN_TRANSCRIPT.taskId===taskId?RUN_TRANSCRIPT.entries:[])
       .filter(e=>e.step_id===n.id).length;
-    const transcriptOpen=status==='running'||status==='failed'||status==='blocked'||
-      TRANSCRIPT_OPEN_STEPS.has(n.id)||((transcriptCount||out)&&!TRANSCRIPT_CLOSED_STEPS.has(n.id));
+    // An explicit close must win over auto-open, always — it used to only
+    // suppress the "has content" auto-open, so a running/failed/blocked step
+    // popped itself back open on the very next poll tick (~1.5s) no matter
+    // how many times the human closed it, since those three statuses forced
+    // `open` unconditionally.
+    const transcriptOpen=TRANSCRIPT_CLOSED_STEPS.has(n.id)?false:(
+      status==='running'||status==='failed'||status==='blocked'||
+      TRANSCRIPT_OPEN_STEPS.has(n.id)||transcriptCount||out);
     const stamp=fmtEntryStamp(r.started);
     return `<div class="run-step ${status}${isNext?' next-up':''}">`+
       `<div class="run-step-top"><span class="run-step-num">${index+1}</span>`+
