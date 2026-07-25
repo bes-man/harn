@@ -94,6 +94,48 @@ def test_answer_resets_the_attempt_cap_for_the_current_task(tmp_path, monkeypatc
     assert task.step_results["step-001"]["attempts"] == 0
 
 
+class AlwaysAuthFailsAdapter:
+    """Stands in for the live incident this guards against: the adapter's own
+    call fails outright (expired CLI auth, network error, crash) -- not a
+    question, not failing tests, not missing tool usage. `run_turn` returns
+    normally (no exception) but with `ok=False`."""
+    name = "fake"
+    def __init__(self):
+        self.calls = []
+    def available(self):
+        return True
+    def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                temperature=None):
+        self.calls.append({"prompt": prompt})
+        return AgentResult(ok=False,
+                           text="Failed to authenticate: OAuth session expired "
+                                "and could not be refreshed")
+
+
+def test_failed_agent_turn_blocks_after_the_attempt_cap_not_marked_ok(tmp_path, monkeypatch):
+    """Regression for a live incident: loop.run()'s main step loop never
+    checked `result.ok` -- an adapter that failed outright on every attempt
+    (expired CLI auth) got ledgered as "ok" (with the error text AS the
+    output) and the loop sailed through the rest of the workflow the same
+    way, ending with the task silently submitted for review having done
+    nothing. run_step()/roles_runner (the role-dispatched resume path)
+    already checked this correctly -- this was the one path that didn't."""
+    env, t = _project(tmp_path)
+    fake = AlwaysAuthFailsAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: [])
+
+    loop.run(tmp_path, env)
+    task = tasks.find(env, t.id)
+    # Blocked after the attempt cap -- NOT "ok", and NOT left "running".
+    assert task.step_results["step-001"]["status"] == "blocked"
+    assert task.step_results["step-001"]["attempts"] == 2
+    assert len(fake.calls) == 2
+    # The task never got anywhere near being submitted for review.
+    assert task.status != tasks.REVIEW
+    assert state.State.load(env / "state").phase == state.BLOCKED
+
+
 def test_studio_retry_resets_only_the_requested_step_attempts(tmp_path, monkeypatch):
     from harn import studio
     env, t = _project(tmp_path)

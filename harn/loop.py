@@ -2477,6 +2477,46 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 progress.log(env_dir, f"{task.id}: {title} used {result.usage_str()}",
                              agent=step_adapter.name)
 
+            # 0) Did the agent turn itself fail to run at all (auth expired,
+            # network error, adapter crash — NOT a question, NOT failing
+            # tests)? Every check below this point assumes the turn actually
+            # produced a real result; without this, a hard failure fell
+            # straight through to the "step done" ledgering further down and
+            # got recorded as "ok" — confirmed live: an expired CLI auth
+            # session made every remaining step "succeed" with the literal
+            # error text as its output, and the task got submitted for
+            # review having done nothing. `run_step()`/roles_runner (the
+            # role-dispatched resume path) already check `result.ok`
+            # correctly; this loop was the one path that didn't.
+            if not result.ok:
+                detail = (result.text or "agent turn failed").strip()
+                if not auto:
+                    task.step_results[sid] = {**task.step_results.get(sid, {}),
+                                              "status": "failed",
+                                              "ended": tasks._now_iso(),
+                                              "output": detail[-2000:]}
+                    tasks._save(task)
+                    print(f"[harn] {task.id} · {title}: agent turn failed — "
+                          f"{detail[:300]}")
+                    # Re-selects this same step next iteration (still not
+                    # "ok"); the persisted attempt cap above blocks it after
+                    # _MAX_STEP_ATTEMPTS instead of retrying forever.
+                    continue
+                # Auto mode never mutates task files, so there's no bounded
+                # per-step retry ledger to lean on here (unlike the missing-
+                # required-usage case, which just accepts and moves on) —
+                # stop the whole run instead of silently treating a step
+                # that never ran as done, same as an over-budget run stops
+                # regardless of auto (_block_on_budget).
+                state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+                st.block(detail)
+                st.save(state_dir)
+                events.emit(env_dir, "block", task_id=task.id, stage=sid,
+                            detail=detail[:300])
+                print(f"[harn] {task.id} · {title}: agent turn failed — "
+                      f"{detail[:300]}")
+                return _run_end(env_dir, st)
+
             # 1) Did the agent block on a question? (re-runs the SAME step)
             b = _handle_block(env_dir, cfg, st, state_dir, task, auto=auto)
             if b == "resumed":
