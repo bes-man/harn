@@ -720,7 +720,7 @@ def test_resume_remains_non_destructive():
 
 def test_run_history_renders_before_waiting_for_task_plan():
     html = studio._HTML
-    fn = html[html.index("async function openRunHistory(opts)"):
+    fn = html[html.index("async function openRunHistory()"):
               html.index("function renderRunHistory()")]
     assert fn.index("renderRunHistory();") < fn.index("await (await fetch(api('/api/task_plan?")
     assert "RUN_HISTORY_PLAN={taskId, nodes:null};" in fn
@@ -735,7 +735,7 @@ def test_finished_task_gets_execution_mode_not_preview():
     # placeholder — so the execution-mode check must also look at the
     # selected task's own historical fields, not only the live BOARD.run.
     html = studio._HTML
-    fn = html[html.index("async function openRunHistory(opts)"):
+    fn = html[html.index("async function openRunHistory()"):
               html.index("function renderRunHistory()")]
     assert "taskHasRunHistory" in fn
     assert "historyTask.step_results" in fn
@@ -829,10 +829,9 @@ def test_run_progress_head_is_pinned_and_opening_scrolls_to_the_end():
     html = studio._HTML
     assert ".run-progress-head{position:sticky;top:-16px" in html
     assert "let RUN_HISTORY_SCROLL_TO_END=false;" in html
-    open_fn = html[html.index("async function openRunHistory(opts){"):
+    open_fn = html[html.index("async function openRunHistory(){"):
                    html.index("if(RUN_TRANSCRIPT.taskId!==taskId){")]
-    assert "if(opts.restore){ RUN_HISTORY_SCROLL_TO_END=false; }" in open_fn
-    assert "else{ RUN_HISTORY_SCROLL_TO_END=true; RUN_HISTORY_RESTORE_SCROLL=null; }" in open_fn
+    assert "RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false; RUN_HISTORY_SCROLL_TO_END=true;" in open_fn
     # #insp is the innerHTML target but has no overflow of its own — its
     # parent (class="insp") is the real scroll container. #insp.scrollTop was
     # a silent no-op (confirmed live), so scroll read/write must go through
@@ -841,45 +840,56 @@ def test_run_progress_head_is_pinned_and_opening_scrolls_to_the_end():
     assert "const previousScroll=scroller.scrollTop;" in html
     render = html[html.index("panel.innerHTML=`<div class=\"run-progress\">"):
                   html.index("RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();")]
-    # openRunHistory() renders a "Loading…" placeholder before its real
-    # content arrives — the flag must survive that empty render (steps.length
-    # is 0) and only fire once there's something to scroll to.
-    assert "if(RUN_HISTORY_SCROLL_TO_END&&steps.length){" in render
+    # openRunHistory() renders a "Loading…" placeholder before its real plan
+    # arrives — the flag must survive that render and only fire once the
+    # real plan is in. steps.length alone doesn't detect "placeholder": while
+    # loading, steps falls back to Object.keys(step_results) — i.e. already-
+    # completed steps only (e.g. 6 of a real 7-step plan) — which is
+    # non-zero and so looked "ready" even though steps that haven't run yet
+    # were still missing (regressed live: consumed the flag against that
+    # incomplete 6-step placeholder, landing at ITS bottom, then the real
+    # 7-step render arrived with the flag already spent). loadingPlan
+    # (planNodes===null) is the signal that actually means "still fetching".
+    assert "if(RUN_HISTORY_SCROLL_TO_END&&!loadingPlan){" in render
     assert "scroller.scrollTop=scroller.scrollHeight;" in render
     assert "scroller.scrollTop=previousScroll;" in render
 
 
-def test_flow_panel_scroll_survives_a_real_page_reload():
-    """A re-render (poll tick) already preserved scroll in-session — but a
-    genuine browser reload wipes all JS state, so without persistence the
-    human always lands back at the top (or wherever "fresh open" puts them)
-    after an F5, not where they'd actually scrolled to. sessionStorage
-    bridges that gap: saved on scroll, consumed once on the next load()."""
+def test_flow_panel_reopens_on_reload_but_still_jumps_to_the_end():
+    """A real browser reload wipes all JS state, so without persistence the
+    Run progress panel drops back to "select a node" and the human has to
+    reopen it themselves. Which task's panel was open is remembered
+    (sessionStorage) so a reload reopens it automatically — but reopening is
+    still an OPEN: it jumps to the latest event same as any other open.
+
+    An earlier version also tried to restore the exact old scroll pixel —
+    that regressed live: sessionStorage doesn't expire until the tab closes,
+    so a reload could land on a stale offset left over from a completely
+    unrelated prior visit instead of the run's actual current end. Restoring
+    a remembered pixel is a worse default than "always land on the latest
+    action", so only the task id is remembered now, not a scroll position."""
     html = studio._HTML
-    assert "function flowPanelStorageKey(){ return 'harn.flowPanelScroll.'+ENV; }" in html
-    assert "function saveFlowPanelScroll(){" in html
-    assert "sessionStorage.setItem(flowPanelStorageKey(), JSON.stringify({taskId, scrollTop:scroller.scrollTop}));" in html
-    assert "function loadFlowPanelScroll(){" in html
-    assert "function clearFlowPanelScroll(){" in html
-    # Bound directly to the real scroll container (class="insp"), not #insp —
-    # scroll events don't bubble, and #insp itself never scrolls.
-    assert "document.querySelector('.insp').addEventListener('scroll', saveFlowPanelScroll, {passive:true});" in html
-    # Closing the panel forgets the offset — reopening later is a fresh
-    # "jump to end", not a stale restore of wherever it was last closed.
-    assert "function closeRunHistory(){ RUN_HISTORY_OPEN=false; clearFlowPanelScroll(); renderInsp(); }" in html
-    load_fn = html[html.index("async function load(){"): html.index("async function load(){")+1400]
-    assert "const flowRestore=loadFlowPanelScroll();" in load_fn
-    assert "FLOW_SEL_TASK_ID=flowRestore.taskId;" in load_fn
-    assert "RUN_HISTORY_RESTORE_SCROLL=flowRestore.scrollTop;" in load_fn
-    assert "await openRunHistory({restore:true});" in load_fn
-    # Restore takes priority over "scroll to end" but only once real content
-    # is there to scroll within — same one-shot-armed-until-ready pattern as
-    # RUN_HISTORY_SCROLL_TO_END, so it can't fire against an empty placeholder.
-    render = html[html.index("panel.innerHTML=`<div class=\"run-progress\">"):
-                  html.index("RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();")]
-    assert "}else if(RUN_HISTORY_RESTORE_SCROLL!=null&&steps.length){" in render
-    assert "scroller.scrollTop=RUN_HISTORY_RESTORE_SCROLL;" in render
-    assert "RUN_HISTORY_RESTORE_SCROLL=null;" in render
+    assert "function flowPanelStorageKey(){ return 'harn.flowPanelTask.'+ENV; }" in html
+    assert "function saveFlowPanelTask(){" in html
+    assert "sessionStorage.setItem(flowPanelStorageKey(), taskId);" in html
+    assert "function loadFlowPanelTask(){" in html
+    # Closing the panel forgets it — reopening later is a fresh "jump to
+    # end", not a stale reopen of whatever was last closed.
+    assert "function closeRunHistory(){ RUN_HISTORY_OPEN=false; saveFlowPanelTask(); renderInsp(); }" in html
+    load_fn = html[html.index("async function load(){"): html.index("loadConfig(); pollProgress();")]
+    assert "const flowTaskId=loadFlowPanelTask();" in load_fn
+    assert "FLOW_SEL_TASK_ID=flowTaskId;" in load_fn
+    # renderFlow() (builds the canvas) must run BEFORE openRunHistory() opens
+    # the panel — the other order regressed live: renderFlow()'s own tail
+    # also calls renderRunHistory() whenever RUN_HISTORY_OPEN is true, and
+    # that second, redundant render's stale previousScroll silently undid
+    # the scroll-to-end openRunHistory() had just applied.
+    render_idx = load_fn.index("renderFlow();")
+    open_idx = load_fn.index("await openRunHistory();")
+    assert render_idx < open_idx
+    # No leftover scroll-restoring machinery from the reverted approach.
+    assert "RUN_HISTORY_RESTORE_SCROLL" not in html
+    assert "saveFlowPanelScroll" not in html
 
 
 def test_flow_history_prefers_completed_task_with_step_results_after_reload():

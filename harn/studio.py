@@ -2481,14 +2481,24 @@ async function load(){
   await ensureModelsLoaded();
   renderWorkflows();
   // A real browser reload loses all JS state — if the Run progress panel was
-  // open for a task, put the human back exactly where they scrolled to
-  // instead of making them reopen it (and land at the end again).
-  const flowRestore=loadFlowPanelScroll();
-  if(flowRestore&&flowRestore.taskId&&(BOARD.tasks||[]).some(t=>t.id===flowRestore.taskId)){
-    FLOW_SEL_TASK_ID=flowRestore.taskId;
-    RUN_HISTORY_RESTORE_SCROLL=flowRestore.scrollTop;
-    await openRunHistory({restore:true});
+  // open for a task, reopen it instead of dropping the human back at "select
+  // a node". Reopening is still an OPEN: it jumps to the latest event same
+  // as any other open (openRunHistory), it does not try to recreate the
+  // exact old scroll pixel — a stale remembered offset from a completely
+  // different prior visit is worse than just landing on the actual end.
+  const flowTaskId=loadFlowPanelTask();
+  if(flowTaskId&&(BOARD.tasks||[]).some(t=>t.id===flowTaskId)){
+    FLOW_SEL_TASK_ID=flowTaskId;
+    // renderFlow() FIRST (builds the canvas nodes/edges), openRunHistory()
+    // LAST — renderFlow()'s own tail also calls renderRunHistory() whenever
+    // RUN_HISTORY_OPEN is true, so doing it the other way round let that
+    // second, redundant render's stale previousScroll silently undo the
+    // scroll-to-end that openRunHistory() had just applied (confirmed live:
+    // the panel reopened on reload but landed mid-feed, not at the end).
+    // RUN_HISTORY_OPEN is still false during this renderFlow() call, so its
+    // own tail harmlessly falls through to renderInsp() instead.
     renderFlow();
+    await openRunHistory();
   }else{
     render();
   }
@@ -3391,26 +3401,26 @@ let RUN_HISTORY_ERROR='';
 // re-render (polling ticks while the human is mid-scroll reading) must NOT
 // yank them back down, so this is consumed and cleared after one use.
 let RUN_HISTORY_SCROLL_TO_END=false;
-// A pending scroll offset to apply once, restored from sessionStorage after
-// an actual browser reload (F5) — distinct from RUN_HISTORY_SCROLL_TO_END:
-// a fresh, human-initiated "Open flow" jumps to the end, but a reload should
-// put the human back exactly where they were, not at the end again.
-let RUN_HISTORY_RESTORE_SCROLL=null;
-function flowPanelStorageKey(){ return 'harn.flowPanelScroll.'+ENV; }
-function saveFlowPanelScroll(){
-  if(!RUN_HISTORY_OPEN) return;
-  const taskId=historyTaskId();
-  const scroller=$('#insp')&&$('#insp').parentElement;
-  if(!taskId||!scroller) return;
-  try{ sessionStorage.setItem(flowPanelStorageKey(), JSON.stringify({taskId, scrollTop:scroller.scrollTop})); }
-  catch(e){}
+// Remember which task's Run progress panel was open so a real browser
+// reload (F5, which wipes all JS state) reopens it instead of dropping the
+// human back at "select a node" — but a reopen is still an OPEN: it jumps
+// to the latest event same as any other open, it does not try to restore
+// the exact old scroll pixel. (An earlier version stored and restored the
+// precise scrollTop too; in practice that meant reload could reopen at a
+// stale, unrelated offset — e.g. left over from a completely different
+// prior visit — instead of the run's actual current end. "Always land on
+// the latest action" beats "remember a pixel".)
+function flowPanelStorageKey(){ return 'harn.flowPanelTask.'+ENV; }
+function saveFlowPanelTask(){
+  const taskId=RUN_HISTORY_OPEN&&historyTaskId();
+  try{
+    if(taskId) sessionStorage.setItem(flowPanelStorageKey(), taskId);
+    else sessionStorage.removeItem(flowPanelStorageKey());
+  }catch(e){}
 }
-function loadFlowPanelScroll(){
-  try{ return JSON.parse(sessionStorage.getItem(flowPanelStorageKey())||'null'); }
+function loadFlowPanelTask(){
+  try{ return sessionStorage.getItem(flowPanelStorageKey()); }
   catch(e){ return null; }
-}
-function clearFlowPanelScroll(){
-  try{ sessionStorage.removeItem(flowPanelStorageKey()); }catch(e){}
 }
 let RUN_TRANSCRIPT={taskId:null,cursor:0,entries:[]};
 let RUN_HISTORY_RENDER_KEY=null;
@@ -3434,15 +3444,10 @@ function historyTaskId(){
   return (BOARD.run&&BOARD.run.task_id) ||
     (RUN_HISTORY_MODE==='execution'&&LAST_RUN_TASK) || flowSelectedTaskId();
 }
-async function openRunHistory(opts){
-  opts=opts||{};
+async function openRunHistory(){
   const taskId=historyTaskId();
-  RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false;
-  // A reload restore already knows where to land (RUN_HISTORY_RESTORE_SCROLL,
-  // set by the caller) — every other open is a fresh human action and should
-  // jump to the end.
-  if(opts.restore){ RUN_HISTORY_SCROLL_TO_END=false; }
-  else{ RUN_HISTORY_SCROLL_TO_END=true; RUN_HISTORY_RESTORE_SCROLL=null; }
+  RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false; RUN_HISTORY_SCROLL_TO_END=true;
+  saveFlowPanelTask();
   if(RUN_TRANSCRIPT.taskId!==taskId){
     RUN_TRANSCRIPT={taskId,cursor:0,entries:[]};
     TRANSCRIPT_OPEN_STEPS.clear();
@@ -3703,19 +3708,21 @@ function renderRunHistory(){
       ?'<div class="empty">Loading this task\'s workflow…</div>'
       :'<div class="empty">Waiting for the first step…</div>')}</div></div>`;
   // openRunHistory() renders once immediately (a "Loading…" placeholder,
-  // before its task_plan fetch resolves) and again once real steps arrive —
-  // consuming the flag on that first, empty render would scroll to the
-  // bottom of nothing and leave the real content sitting at the top once it
-  // lands. Keep the flag armed until there's something to scroll to. Same
-  // reasoning for RUN_HISTORY_RESTORE_SCROLL (a reload-restored offset, one
-  // priority step below "jump to end" — a fresh open always wins).
-  if(RUN_HISTORY_SCROLL_TO_END&&steps.length){
+  // before its task_plan fetch resolves) and again once the real plan
+  // arrives — consuming the flag on that first render would scroll to a
+  // WRONG bottom and leave the real content sitting mid-page once the real
+  // plan lands. steps.length alone doesn't detect "placeholder": while the
+  // plan is loading, steps falls back to Object.keys(step_results) — i.e.
+  // already-completed steps only, e.g. 6 of a real 7-step plan — which is
+  // non-zero and so looks "ready" even though it's missing steps that
+  // haven't run yet (confirmed live: consumed the flag against a 6-step
+  // placeholder, then the real 7-step render arrived with the flag already
+  // spent). loadingPlan (planNodes===null) is the one signal that actually
+  // distinguishes "still fetching" from "here's the real plan".
+  if(RUN_HISTORY_SCROLL_TO_END&&!loadingPlan){
     RUN_HISTORY_SCROLL_TO_END=false;
     scroller.scrollTop=scroller.scrollHeight;
-  }else if(RUN_HISTORY_RESTORE_SCROLL!=null&&steps.length){
-    scroller.scrollTop=RUN_HISTORY_RESTORE_SCROLL;
-    RUN_HISTORY_RESTORE_SCROLL=null;
-  }else if(!RUN_HISTORY_SCROLL_TO_END&&RUN_HISTORY_RESTORE_SCROLL==null){
+  }else if(!RUN_HISTORY_SCROLL_TO_END){
     scroller.scrollTop=previousScroll;
   }
   panel.querySelectorAll('[data-run-scroll]').forEach(el=>{
@@ -3723,7 +3730,7 @@ function renderRunHistory(){
   });
   RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();
 }
-function closeRunHistory(){ RUN_HISTORY_OPEN=false; clearFlowPanelScroll(); renderInsp(); }
+function closeRunHistory(){ RUN_HISTORY_OPEN=false; saveFlowPanelTask(); renderInsp(); }
 // The last UI-launched run's outcome (runner._record_completion), shared by
 // the RUN WORKFLOW terminal node and the Run progress side panel — a run
 // stopping should never be a dead end in either place. `filterTaskId`, when
@@ -5166,12 +5173,6 @@ window.addEventListener('pointermove',e=>{
   document.documentElement.style.setProperty('--insp-w',w+'px');
 });
 window.addEventListener('pointerup',()=>{ if(rs){ $('#grip').classList.remove('act'); rs=null; } });
-// Persist the Run progress panel's scroll offset so a real browser reload
-// (not just a re-render) restores where the human left off, rather than
-// reopening at the end again. scroll doesn't bubble, so this must be bound
-// directly to the actual scroll container (class="insp" — see renderRunHistory,
-// #insp is only its innerHTML target, not the element that scrolls).
-document.querySelector('.insp').addEventListener('scroll', saveFlowPanelScroll, {passive:true});
 
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 window.addEventListener('beforeunload',e=>{ if(dirty){e.preventDefault();e.returnValue='';} });
