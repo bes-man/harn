@@ -19,9 +19,15 @@ from . import loop as loop_mod
 from . import prhost
 from . import roles as roles_mod
 from . import secrets_store
+from . import state as state_mod
 from . import tasks as tasks_mod
 from . import trackers as trackers_mod
 from . import workflows as workflows_mod
+
+# Statuses that mean "this step's turn already succeeded" — _run_steps skips
+# straight past them on a resumed/re-dispatched role run instead of
+# re-running the LLM turn from scratch every single time.
+_STEP_DONE_STATUSES = {"ok", "complete", "done"}
 
 
 def _step_ids_for(env_dir: Path, task: "tasks_mod.Task", workflow_name: str) -> list[str]:
@@ -31,10 +37,35 @@ def _step_ids_for(env_dir: Path, task: "tasks_mod.Task", workflow_name: str) -> 
 
 def _run_steps(project_root: Path, env_dir: Path, task_id: str,
                step_ids: list[str], role_note: str) -> dict:
+    """Run every step in order — but a role run is dispatched fresh on EACH
+    trigger (a Telegram /command, the Studio Resume button, an auto-resume
+    after answering a question), and without the two checks below it redid
+    the whole workflow from step 1 every time: wasting real tokens re-running
+    already-`ok` steps, and — observed live — aborting a resume entirely when
+    a step that had already succeeded happened to fail on re-run (a transient
+    CLI auth error), even though the actually-pending step was several steps
+    further along.
+    """
+    task = tasks_mod.find(env_dir, task_id)
+    done_ids = {sid for sid, r in (task.step_results if task else {}).items()
+               if isinstance(r, dict) and r.get("status") in _STEP_DONE_STATUSES}
     for sid in step_ids:
+        if sid in done_ids:
+            continue
         result = loop_mod.run_step(project_root, env_dir, task_id, sid, role_note=role_note)
         if not result.get("ok"):
             return {"ok": False, "error": f"step {sid!r} failed", "step": result}
+        # A step can succeed as a TURN (the agent called ask_user and ended
+        # cleanly) while leaving the task genuinely blocked on a human
+        # answer. Running the next step's turn anyway just burns tokens on
+        # "still waiting" turns that can't make progress — stop the chain
+        # here; the next trigger (another /command, Resume, or the
+        # answer-triggered auto-resume) picks up cleanly since this step is
+        # now recorded done_ids-eligible.
+        st = state_mod.State.load(env_dir / "state")
+        if st.phase == state_mod.BLOCKED:
+            return {"ok": False, "error": "blocked — waiting on a human answer",
+                    "blocked": True, "step": result}
     return {"ok": True}
 
 
@@ -116,9 +147,9 @@ def run_role(project_root: Path, env_dir: Path, task_id: str, role_name: str,
 
     if not run_result.get("ok"):
         events_mod.emit(env_dir, "stage_end", task_id=task.id, stage="role_run",
-                        role=role.name, ok=False)
+                        role=role.name, ok=False, blocked=run_result.get("blocked", False))
         return {"ok": False, "error": run_result.get("error", "role run failed"),
-                "warning": warning}
+                "warning": warning, "blocked": run_result.get("blocked", False)}
 
     task = tasks_mod.find(env_dir, task.id)
     verdict = "PASS"

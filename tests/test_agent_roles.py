@@ -177,6 +177,62 @@ def test_run_role_unknown_task(tmp_path):
     assert result["ok"] is False
 
 
+# --- resuming a role run: skip completed steps, stop when blocked ---------- #
+
+def test_run_role_skips_steps_already_recorded_ok(tmp_path, monkeypatch):
+    """A role re-dispatched after an interruption (another Telegram command,
+    the Studio Resume button, an answer-triggered auto-resume) must pick up
+    where it left off, not re-run every step from the start — that both
+    wastes tokens and, observed live, can abort an otherwise-fine resume when
+    an ALREADY-SUCCEEDED step happens to fail on re-run (a transient CLI auth
+    error), even though the actually-pending step was further along."""
+    env, t = _project(tmp_path, n_steps=2)
+    _role_md(env, "analyst", status=t.status, oracle=False)
+    task = tasks.find(env, t.id)
+    task.step_results["step-000001"] = {"status": "ok", "output": "done earlier"}
+    tasks._save(task)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    result = roles_runner.run_role(tmp_path, env, t.id, "analyst")
+
+    assert result["ok"] is True
+    assert len(fake.calls) == 1, "only the not-yet-done step should run"
+    assert "do part 1" not in fake.calls[0]["prompt"]
+
+
+def test_run_role_stops_chain_when_a_step_leaves_the_task_blocked(tmp_path, monkeypatch):
+    """A step can succeed AS A TURN (the agent called ask_user and ended
+    cleanly) while leaving the task genuinely blocked on a human answer.
+    Running the next step's turn anyway can't make progress and just burns
+    tokens — the chain must stop as soon as the task is blocked."""
+    from harn import state as state_mod
+
+    env, t = _project(tmp_path, n_steps=2)
+    _role_md(env, "analyst", status=t.status)
+
+    class BlockingThenRecordingAdapter(RecordingAdapter):
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                    temperature=None):
+            if not self.calls:
+                state_dir = env / "state"
+                st = state_mod.State.load(state_dir)
+                st.current_task = t.id
+                st.block("Which option — A or B?")
+                st.save(state_dir)
+            return super().run_turn(prompt, cwd, timeout=timeout, model=model,
+                                    effort=effort, temperature=temperature)
+
+    fake = BlockingThenRecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    result = roles_runner.run_role(tmp_path, env, t.id, "analyst")
+
+    assert result["ok"] is False
+    assert result.get("blocked") is True
+    assert len(fake.calls) == 1, "the second step must not run while blocked"
+
+
 def test_successful_run_transitions_to_next_status(tmp_path, monkeypatch):
     env, t = _project(tmp_path)
     (env / "harn.toml").write_text(

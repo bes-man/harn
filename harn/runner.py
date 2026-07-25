@@ -59,7 +59,19 @@ def _failure_reason(env_dir: Path, task_id: str) -> str:
 
 
 def _record_completion(env_dir: Path, info: dict, exit_code: int) -> None:
+    from . import state as state_mod
     result = {**info, "exit_code": exit_code, "finished_at": time.time()}
+    # Blocked-on-a-question is not a failure — it's the funnel doing its job.
+    # Check it FIRST: a role run that stops here can leave an EARLIER step's
+    # stale "failed" output in step_results (e.g. today's retry-exhausted
+    # attempt before a human unblocked it), which would otherwise paint an
+    # already-resolved problem as this run's outcome.
+    st = state_mod.State.load(env_dir / "state")
+    if st.phase == state_mod.BLOCKED and st.current_task == info.get("task_id"):
+        result["blocked"] = True
+        result["reason"] = st.question or "Waiting on your answer."
+        _last_run_path(env_dir).write_text(json.dumps(result), encoding="utf-8")
+        return
     reason = _failure_reason(env_dir, str(info.get("task_id") or ""))
     if reason:
         result["reason"] = reason

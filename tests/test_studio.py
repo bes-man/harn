@@ -468,6 +468,19 @@ def test_studio_run_result_shows_finished_date_and_stops_idle_animation():
     assert ".badge-unused-required{border-color:#e74c3c !important;animation:" not in html
 
 
+def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button():
+    """A run that stopped because the agent is waiting on a human answer
+    (last_run.blocked) must read differently from an actual failure, and
+    offer a Resume button right in the RUN WORKFLOW sidebar — not only
+    inside the separate Run History panel."""
+    html = studio._HTML
+    assert "lastRun.blocked?'⏳ Waiting for your answer'" in html
+    assert "lastRun.blocked?'blocked':lastRun.reason?'failed':''" in html
+    assert "onclick=\"launchTask('${esc(lastRun.task_id)}',false)\">▶ Resume</button>" in html
+    assert ".run-result.blocked{" in html
+    assert ".run-result.failed{" in html
+
+
 def test_studio_step_editor_has_tool_mode_selector_and_cycle_tool():
     """Studio's per-step Tool mode control (auto/scoped) and the 3-state
     required/recommended/off tool cycle, backing mcp_server's per-step tool

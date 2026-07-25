@@ -183,6 +183,54 @@ def test_record_completion_keeps_failed_step_reason(tmp_path):
     assert runner.last_run(env)["reason"] == "Failed to authenticate: OAuth expired"
 
 
+def test_record_completion_reports_blocked_not_failed(tmp_path):
+    """A run that stops because the agent asked a genuine question (state is
+    BLOCKED for this task) is not a failure — observed live conflating the
+    two: a role run that stopped waiting for a human answer showed a stale
+    failed-step reason from an earlier, already-resolved retry instead of
+    'waiting on your answer'."""
+    from harn import state as state_mod
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write spec", task_id="PRJ-001")
+    # A stale failure from an earlier attempt must NOT leak into this run's
+    # reported reason once the task is genuinely just waiting on a human.
+    task.step_results["research"] = {
+        "status": "failed", "output": "stale failure from a prior attempt"
+    }
+    tasks._save(task)
+    state_dir = env / "state"
+    st = state_mod.State(current_task=task.id)
+    st.block("Which option — A or B?")
+    st.save(state_dir)
+
+    runner._record_completion(env, {"task_id": task.id}, 1)
+
+    result = runner.last_run(env)
+    assert result["blocked"] is True
+    assert result["reason"] == "Which option — A or B?"
+
+
+def test_record_completion_ignores_block_for_a_different_task(tmp_path):
+    """The BLOCKED state is per-env, not per-task — a run for task A must not
+    be reported as 'blocked' just because some OTHER task is the one
+    currently waiting on an answer."""
+    from harn import state as state_mod
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write spec", task_id="PRJ-001")
+    task.step_results["research"] = {"status": "failed", "output": "real failure"}
+    tasks._save(task)
+    state_dir = env / "state"
+    st = state_mod.State(current_task="PRJ-999")
+    st.block("Unrelated question")
+    st.save(state_dir)
+
+    runner._record_completion(env, {"task_id": task.id}, 1)
+
+    result = runner.last_run(env)
+    assert "blocked" not in result
+    assert result["reason"] == "real failure"
+
+
 def test_log_tail_missing_file(tmp_path):
     env = _env(tmp_path)
     assert runner.log_tail(env) == ""

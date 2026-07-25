@@ -2128,6 +2128,12 @@ _HTML = r"""<!DOCTYPE html>
   /* The terminal heading is a shortcut to the detailed per-step run panel. */
   .node.terminal .run-launch{cursor:pointer}
   .node.terminal .run-launch:hover{color:var(--accent2)}
+  .run-result{margin-top:10px;padding:9px 10px;border-radius:6px;font-size:12px;
+    background:var(--panel2);border:1px solid var(--line)}
+  .run-result b{display:block;font-size:11.5px}
+  .run-result pre{white-space:pre-wrap;font:12px/1.5 inherit;margin:6px 0 0}
+  .run-result.failed{background:#3a1a1a;border-color:var(--danger)}
+  .run-result.blocked{background:#3a2a10;border-color:#caa83a}
   /* stepbtns (▶/↻) sit further left of the enable/disable toggle, right:34
      onward, ~48px wide — the title needs enough reserved padding to never sit
      under them, on every wrapped line, not just the first. */
@@ -3626,11 +3632,18 @@ function renderFlowTerminal(el){
   const all=flowAllTasks();
   const lastRun=BOARD.last_run;
   const finishedAt=lastRun&&fmtDateTime(lastRun.finished_at);
+  // "blocked" (the agent asked a genuine question and is waiting on you) is
+  // NOT a failure — distinct styling/copy, and a Resume button right here
+  // instead of only inside Run History, so a stopped run is never a dead end.
+  const lastRunTitle=lastRun&&(lastRun.blocked?'⏳ Waiting for your answer'
+    :lastRun.reason?'⚠ Run stopped':'✓ Last run finished');
   const lastRunNotice=lastRun
-    ? `<div class="run-result ${lastRun.reason?'failed':''}">`+
-      `<b>${lastRun.reason?'Run stopped':'Last run finished'} · ${esc(lastRun.task_id||'task')}`+
+    ? `<div class="run-result ${lastRun.blocked?'blocked':lastRun.reason?'failed':''}">`+
+      `<b>${lastRunTitle} · ${esc(lastRun.task_id||'task')}`+
       `${finishedAt?' · '+esc(finishedAt):''}</b>`+
-      `${lastRun.reason?`<pre>${esc(lastRun.reason)}</pre>`:''}</div>`
+      `${lastRun.reason?`<pre>${esc(lastRun.reason)}</pre>`:''}`+
+      `${lastRun.task_id?`<button class="ghost" style="margin-top:6px" `+
+        `onclick="launchTask('${esc(lastRun.task_id)}',false)">▶ Resume</button>`:''}</div>`
     : '';
   // Only LAUNCHABLE tasks belong in the picker — you can't start a task that's
   // already in review or done, so listing them (and then disabling Run with no
