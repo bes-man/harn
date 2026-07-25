@@ -3491,6 +3491,7 @@ function runHistoryRenderKey(){
   const task=(BOARD.tasks||[]).find(x=>x.id===taskId)||null;
   return JSON.stringify({taskId,task,plan:RUN_HISTORY_PLAN,mode:RUN_HISTORY_MODE,
     error:RUN_HISTORY_ERROR,progress:PROG,transcript:RUN_TRANSCRIPT,
+    lastRun:BOARD.last_run||null,
     open:[...TRANSCRIPT_OPEN_STEPS],closed:[...TRANSCRIPT_CLOSED_STEPS]});
 }
 function renderRunHistoryIfChanged(){
@@ -3572,7 +3573,8 @@ function renderRunHistory(){
     `<div class="run-progress-meta">${esc(taskId)} · ${complete}/${steps.length} complete${failed?' · '+failed+' need attention':''}</div>`+
     `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`+
     `<div class="row" style="margin-top:10px">${action}${rerun}${openTask}</div>`+
-    `${RUN_HISTORY_ERROR?`<div class="mut" style="color:var(--danger);margin-top:7px">${esc(RUN_HISTORY_ERROR)}</div>`:''}</div>`+
+    `${RUN_HISTORY_ERROR?`<div class="mut" style="color:var(--danger);margin-top:7px">${esc(RUN_HISTORY_ERROR)}</div>`:''}`+
+    lastRunNoticeHtml(taskId)+`</div>`+
     `<div class="progress-rail">${rows||(loadingPlan
       ?'<div class="empty">Loading this task\'s workflow…</div>'
       :'<div class="empty">Waiting for the first step…</div>')}</div></div>`;
@@ -3583,6 +3585,27 @@ function renderRunHistory(){
   RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();
 }
 function closeRunHistory(){ RUN_HISTORY_OPEN=false; renderInsp(); }
+// The last UI-launched run's outcome (runner._record_completion), shared by
+// the RUN WORKFLOW terminal node and the Run progress side panel — a run
+// stopping should never be a dead end in either place. `filterTaskId`, when
+// given, hides the notice unless it's about that specific task (the side
+// panel is scoped to one task; the terminal node shows it regardless, since
+// it names the task itself).
+function lastRunNoticeHtml(filterTaskId){
+  const lastRun=BOARD.last_run;
+  if(!lastRun||(filterTaskId&&lastRun.task_id!==filterTaskId)) return '';
+  const finishedAt=fmtDateTime(lastRun.finished_at);
+  // "blocked" (the agent asked a genuine question and is waiting on you) is
+  // NOT a failure — distinct styling/copy from an actual failed run.
+  const title=lastRun.blocked?'⏳ Waiting for your answer'
+    :lastRun.reason?'⚠ Run stopped':'✓ Last run finished';
+  return `<div class="run-result ${lastRun.blocked?'blocked':lastRun.reason?'failed':''}">`+
+    `<b>${title} · ${esc(lastRun.task_id||'task')}`+
+    `${finishedAt?' · '+esc(finishedAt):''}</b>`+
+    `${lastRun.reason?`<pre>${esc(lastRun.reason)}</pre>`:''}`+
+    `${lastRun.task_id?`<button class="ghost" style="margin-top:6px" `+
+      `onclick="launchTask('${esc(lastRun.task_id)}',false)">▶ Resume</button>`:''}</div>`;
+}
 function renderFlowTerminal(el){
   const runningWhole=BOARD.run&&!BOARD.run.stage;
   const runningStage=BOARD.run&&BOARD.run.stage;
@@ -3630,21 +3653,7 @@ function renderFlowTerminal(el){
     return;
   }
   const all=flowAllTasks();
-  const lastRun=BOARD.last_run;
-  const finishedAt=lastRun&&fmtDateTime(lastRun.finished_at);
-  // "blocked" (the agent asked a genuine question and is waiting on you) is
-  // NOT a failure — distinct styling/copy, and a Resume button right here
-  // instead of only inside Run History, so a stopped run is never a dead end.
-  const lastRunTitle=lastRun&&(lastRun.blocked?'⏳ Waiting for your answer'
-    :lastRun.reason?'⚠ Run stopped':'✓ Last run finished');
-  const lastRunNotice=lastRun
-    ? `<div class="run-result ${lastRun.blocked?'blocked':lastRun.reason?'failed':''}">`+
-      `<b>${lastRunTitle} · ${esc(lastRun.task_id||'task')}`+
-      `${finishedAt?' · '+esc(finishedAt):''}</b>`+
-      `${lastRun.reason?`<pre>${esc(lastRun.reason)}</pre>`:''}`+
-      `${lastRun.task_id?`<button class="ghost" style="margin-top:6px" `+
-        `onclick="launchTask('${esc(lastRun.task_id)}',false)">▶ Resume</button>`:''}</div>`
-    : '';
+  const lastRunNotice=lastRunNoticeHtml();
   // Only LAUNCHABLE tasks belong in the picker — you can't start a task that's
   // already in review or done, so listing them (and then disabling Run with no
   // feedback) just looked like "Run does nothing". Show only runnable ones.

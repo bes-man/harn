@@ -474,11 +474,17 @@ def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button(
     offer a Resume button right in the RUN WORKFLOW sidebar — not only
     inside the separate Run History panel."""
     html = studio._HTML
+    assert "function lastRunNoticeHtml(filterTaskId)" in html
     assert "lastRun.blocked?'⏳ Waiting for your answer'" in html
     assert "lastRun.blocked?'blocked':lastRun.reason?'failed':''" in html
     assert "onclick=\"launchTask('${esc(lastRun.task_id)}',false)\">▶ Resume</button>" in html
     assert ".run-result.blocked{" in html
     assert ".run-result.failed{" in html
+    # The same notice also renders in the Run progress SIDE PANEL
+    # (renderRunHistory), scoped to that panel's own task — not just the
+    # RUN WORKFLOW terminal node on the canvas.
+    assert "lastRunNoticeHtml(taskId)+" in html
+    assert "lastRun:BOARD.last_run||null," in html
 
 
 def test_studio_step_editor_has_tool_mode_selector_and_cycle_tool():
