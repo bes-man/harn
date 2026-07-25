@@ -2,7 +2,6 @@
 labels, comments, partial task updates, drag-triggered launch gating."""
 from __future__ import annotations
 
-from harn import config as config_mod
 from harn import studio, tasks, workflows, ENV_DIRNAME
 
 
@@ -87,20 +86,6 @@ def test_hil_answer_recorded_as_comment(tmp_path):
     loop.answer(env, "use postgres", source="telegram")
     reloaded = tasks.find(env, t.id)
     assert any(c.kind == "hil" and c.text == "use postgres" for c in reloaded.comments)
-
-
-def test_launch_on_drag_in_progress_defaults_false(tmp_path):
-    env = _env(tmp_path)
-    cfg = config_mod.Config.load(env)
-    assert cfg.launch_on_drag_in_progress is False
-
-
-def test_launch_on_drag_in_progress_true_from_toml(tmp_path):
-    env = _env(tmp_path)
-    (env / "harn.toml").write_text(
-        "[board]\nlaunch_on_drag_in_progress = true\n", encoding="utf-8")
-    cfg = config_mod.Config.load(env)
-    assert cfg.launch_on_drag_in_progress is True
 
 
 def test_update_task_payload_changes_only_submitted_fields(tmp_path):
@@ -192,30 +177,85 @@ def test_studio_html_has_dragging_guard_in_poll_board():
     assert "/api/tasks/status" in studio._HTML   # drop still uses the existing route
 
 
-def test_drag_drop_into_in_progress_only_launches_when_setting_enabled(tmp_path, monkeypatch):
+def test_drag_drop_into_in_progress_launches_the_same_as_the_dropdown(tmp_path, monkeypatch):
+    """A card's launch behavior must not depend on HOW it arrived on a
+    column — drag and the status dropdown go through the exact same route
+    and must produce the exact same effect. `launch_on_drag_in_progress`
+    (a separate opt-in just for drag) was removed for exactly this reason:
+    a column either dispatches on arrival or it doesn't, regardless of
+    gesture."""
     env = _env(tmp_path)
     t = tasks.create_task(env, "T")
     studio.set_task_workflow(env, {"task_id": t.id, "workflow": ""})
     launched = {"n": 0}
-    def fake_launch(pr, ed, task_id, *, auto=False):
+    def fake_launch(pr, ed, task_id, *, auto=False, step=None, rerun=False, as_role=None):
         launched["n"] += 1
         return {"ok": True, "pid": 1, "task_id": task_id, "auto": auto}
     monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
 
-    r = studio.set_task_status_payload(
-        env, {"task_id": t.id, "status": "in_progress", "source": "drag"})
-    assert r["ok"] is True
-    assert launched["n"] == 0          # default false: no launch
+    r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "in_progress"})
+    assert r["ok"] is True and r["launched"] is True
+    assert launched["n"] == 1
     assert tasks.find(env, t.id).status == "in_progress"
 
-    (env / "harn.toml").write_text(
-        "[board]\nlaunch_on_drag_in_progress = true\n", encoding="utf-8")
-    t2 = tasks.create_task(env, "T2")
-    studio.set_task_workflow(env, {"task_id": t2.id, "workflow": ""})
-    r2 = studio.set_task_status_payload(
-        env, {"task_id": t2.id, "status": "in_progress", "source": "drag"})
-    assert r2["ok"] is True
-    assert launched["n"] == 1          # now enabled: launches
+
+def test_dropping_onto_a_column_with_an_owning_agent_dispatches_that_agent(tmp_path, monkeypatch):
+    """The general case this replaces the in_progress special-case with: ANY
+    column with an owning role dispatches that role the moment a task lands
+    on it — via `as_role`, so the run claims the task and picks up the
+    role's own workflow, the same as a Telegram /command would."""
+    env = _env(tmp_path)
+    (env / "agents").mkdir(parents=True, exist_ok=True)
+    from harn import roles
+    roles.save(env, {"name": "reviewer", "command": "review", "status": "review",
+                     "trigger": "manual"})
+    t = tasks.create_task(env, "Needs review")
+
+    seen = {}
+    def fake_launch(pr, ed, task_id, *, auto=False, step=None, rerun=False, as_role=None):
+        seen["as_role"] = as_role
+        return {"ok": True, "pid": 1, "task_id": task_id, "auto": auto}
+    monkeypatch.setattr(studio.runner_mod, "launch", fake_launch)
+
+    r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "review"})
+
+    assert r["ok"] is True and r["launched"] is True
+    assert seen["as_role"] == "reviewer"
+    assert tasks.find(env, t.id).status == "review"
+
+
+def test_column_owner_dispatch_ignores_workflow_confirmation(tmp_path, monkeypatch):
+    """A role-owned column assigns its OWN workflow on the way in
+    (roles_runner.run_role) — it must not be gated behind
+    `workflow_confirmed`, which only guards the no-owner in_progress path."""
+    env = _env(tmp_path)
+    (env / "agents").mkdir(parents=True, exist_ok=True)
+    from harn import roles
+    roles.save(env, {"name": "reviewer", "command": "review", "status": "review",
+                     "trigger": "manual"})
+    t = tasks.create_task(env, "Needs review")
+    assert t.workflow_confirmed is False
+
+    monkeypatch.setattr(studio.runner_mod, "launch",
+                        lambda *a, **k: {"ok": True, "pid": 1, "task_id": t.id})
+    r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "review"})
+    assert r["ok"] is True
+
+
+def test_a_refused_column_owner_launch_rolls_the_status_back(tmp_path, monkeypatch):
+    env = _env(tmp_path)
+    (env / "agents").mkdir(parents=True, exist_ok=True)
+    from harn import roles
+    roles.save(env, {"name": "reviewer", "command": "review", "status": "review",
+                     "trigger": "manual"})
+    t = tasks.create_task(env, "Needs review")
+
+    monkeypatch.setattr(studio.runner_mod, "launch",
+                        lambda *a, **k: {"ok": False, "error": "busy"})
+    r = studio.set_task_status_payload(env, {"task_id": t.id, "status": "review"})
+
+    assert r["ok"] is False
+    assert tasks.find(env, t.id).status == "todo"     # rolled back, not stranded
 
 
 def test_dropdown_status_change_still_launches_unconditionally(tmp_path, monkeypatch):

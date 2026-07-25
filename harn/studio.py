@@ -1108,16 +1108,25 @@ def create_task_payload(env_dir: Path, payload: dict) -> dict:
 
 
 def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
-    """Move a task to a new lifecycle status (drag-drop on the board).
+    """Move a task to a new lifecycle status (drag-drop or dropdown, both go
+    through here identically — a column doesn't dispatch differently
+    depending on how the card arrived).
 
-    Moving TO `in_progress` requires the task's flow to already be confirmed
-    (`workflow_confirmed`, set by `set_task_workflow` — see its docstring) and
-    atomically auto-launches a run for it via `runner_mod.launch`, the same
-    call `launch_task` makes; if that launch refuses (e.g. another run is
-    already active) the status change is rolled back so the task never ends
-    up stuck at `in_progress` with nothing actually running. This route never
-    touches `review_log` or calls `accept`/`request_changes` — it is a raw
-    `tasks_mod.set_status` only.
+    A column with an owning agent (`column_owner_role` — the same lookup
+    `triggers.auto_scan` uses) dispatches THAT agent the moment a task lands
+    on it, via `runner_mod.launch(..., as_role=owner.name)`: the run happens
+    `--as` that role, so it claims the task and picks up its own workflow the
+    same way `roles_runner.run_role` always has, not the generic default. A
+    column with no owning role but named `in_progress` keeps the older,
+    simpler behavior for projects that never defined a role at all — the
+    task's own already-confirmed workflow, no `--as`.
+
+    Either way the launch is atomic with the status move: if `runner_mod
+    .launch` refuses (another run active, spawn failed), the status change is
+    rolled back so the task never ends up sitting on a column with nothing
+    actually running behind it. This route never touches `review_log` or
+    calls `accept`/`request_changes` — it is a raw `tasks_mod.set_status`
+    (plus, conditionally, a launch).
     """
     task_id = (payload.get("task_id") or "").strip()
     new_status = (payload.get("status") or "").strip()
@@ -1129,22 +1138,34 @@ def set_task_status_payload(env_dir: Path, payload: dict) -> dict:
     active = runner_mod.active(env_dir)
     if active and active.get("task_id") == task_id:
         return {"ok": False, "error": "a run is active for this task — stop it first"}
-    if new_status == tasks_mod.IN_PROGRESS and (
-        payload.get("source") != "drag" or Config.load(env_dir).launch_on_drag_in_progress
-    ):
+
+    owner = column_owner_role(env_dir, new_status)
+    if owner is not None:
+        return _move_and_launch(env_dir, task, new_status,
+                                lambda: runner_mod.launch(
+                                    env_dir.parent, env_dir, task_id,
+                                    auto=False, as_role=owner.name))
+    if new_status == tasks_mod.IN_PROGRESS:
         if not task.workflow_confirmed:
             return {"ok": False,
                     "error": "pick a flow for this task before starting it"}
-        prior_status = task.status
-        tasks_mod.set_status(task, new_status, env_dir)
-        result = runner_mod.launch(env_dir.parent, env_dir, task_id, auto=False)
-        if not result.get("ok"):
-            tasks_mod.set_status(task, prior_status, env_dir)   # roll back — atomic with launch
-            return {"ok": False, "error": result.get("error", "launch failed")}
-        return {"ok": True, "task_id": task_id, "status": new_status,
-                "launched": True}
+        return _move_and_launch(env_dir, task, new_status,
+                                lambda: runner_mod.launch(
+                                    env_dir.parent, env_dir, task_id, auto=False))
     tasks_mod.set_status(task, new_status, env_dir)
     return {"ok": True, "task_id": task_id, "status": new_status}
+
+
+def _move_and_launch(env_dir: Path, task, new_status: str, do_launch) -> dict:
+    """set_status + launch as one atomic step: a launch refusal rolls the
+    status back so a task never sits on a column with nothing running."""
+    prior_status = task.status
+    tasks_mod.set_status(task, new_status, env_dir)
+    result = do_launch()
+    if not result.get("ok"):
+        tasks_mod.set_status(task, prior_status, env_dir)
+        return {"ok": False, "error": result.get("error", "launch failed")}
+    return {"ok": True, "task_id": task.id, "status": new_status, "launched": True}
 
 
 def task_plan_payload(env_dir: Path, task_id: str) -> dict:
@@ -1232,19 +1253,24 @@ def agents_payload(env_dir: Path) -> dict:
             "tools": [t.name for t in tools_mod.discover(env_dir)]}
 
 
-def column_owner(env_dir: Path, status: str, *, exclude: str = "") -> str | None:
-    """Which OTHER role already owns this board column, if any.
-
-    A role's `status` IS its column: `triggers.auto_scan` builds a
-    status → role map to decide who services a task that lands there. That map
-    can only hold one role per status, so a second role on the same column
-    doesn't share the work — it silently never runs, with nothing in the UI to
-    explain why. One agent per column keeps dispatch answerable.
+def column_owner_role(env_dir: Path, status: str, *, exclude: str = ""):
+    """The role that owns this board column, if any — the same lookup
+    `triggers.auto_scan` does, and the one both the one-agent-per-column
+    guard and drop-to-dispatch key off. A role's `status` IS its column: that
+    map can only hold one entry per status, so a second role on the same
+    column doesn't share the work, it silently never runs.
     """
     for role in roles_mod.discover(env_dir):
         if role.name != exclude and (role.status or "").strip() == status:
-            return role.name
+            return role
     return None
+
+
+def column_owner(env_dir: Path, status: str, *, exclude: str = "") -> str | None:
+    """Which OTHER role already owns this board column, if any (name only —
+    see `column_owner_role` for the full Role)."""
+    role = column_owner_role(env_dir, status, exclude=exclude)
+    return role.name if role else None
 
 
 def save_agent_payload(env_dir: Path, body: dict) -> dict:
@@ -3001,7 +3027,7 @@ async function onColDrop(e,status){
   const priorStatus=t.status;
   t.status=status;             // optimistic move
   renderBoard();
-  const r=await post_('/api/tasks/status',{task_id:taskId,status,source:'drag'});
+  const r=await post_('/api/tasks/status',{task_id:taskId,status});
   if(!r.ok){
     t.status=priorStatus;      // roll back
     renderBoard();

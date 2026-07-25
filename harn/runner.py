@@ -127,11 +127,16 @@ def active(env_dir: Path) -> dict | None:
 
 def launch(project_root: Path, env_dir: Path, task_id: str, *,
            auto: bool = False, step: str | None = None,
-           rerun: bool = False) -> dict:
+           rerun: bool = False, as_role: str | None = None) -> dict:
     """Start `harn run --task <task_id>` in the background — the whole task
     loop by default, or exactly ONE step (`step=...`, optionally `rerun=True`
     to first restore that step's git checkpoint) for the studio UI's per-step
     Run/Rerun controls.
+
+    `as_role`, when given, is authoritative: the caller already knows which
+    role should own this run (e.g. the board column the task just landed on)
+    and that decision is not second-guessed here. Omitted, the existing
+    resumption inference below applies instead.
 
     Refuses if a run is already active for this project (single-runner-at-a-
     time — see module docstring). stdout/stderr go to state/ui_run.log so the
@@ -158,6 +163,8 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
             cmd.append("--rerun")
     elif auto:
         cmd.append("--auto")
+    elif as_role:
+        cmd += ["--as", as_role]
     else:
         # A role runner stamps its name on the task while it works.  A later
         # generic `harn run --task` cannot select that task: its claim belongs
