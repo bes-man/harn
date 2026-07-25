@@ -499,7 +499,7 @@ def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button(
     offer a Resume button right in the RUN WORKFLOW sidebar — not only
     inside the separate Run History panel."""
     html = studio._HTML
-    assert "function lastRunNoticeHtml(filterTaskId)" in html
+    assert "function lastRunNoticeHtml(filterTaskId, opts)" in html
     assert "lastRun.blocked?'⏳ Waiting for your answer'" in html
     assert "lastRun.blocked?'blocked':lastRun.reason?'failed':''" in html
     assert "onclick=\"launchTask('${esc(lastRun.task_id)}',false)\">▶ Resume</button>" in html
@@ -508,7 +508,7 @@ def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button(
     # The same notice also renders in the Run progress SIDE PANEL
     # (renderRunHistory), at the end of the failed/blocked step's own
     # transcript — not just the RUN WORKFLOW terminal node on the canvas.
-    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId):'')" in html
+    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId,{compact:true}):'')" in html
     assert "lastRun:BOARD.last_run||null," in html
 
 
@@ -666,11 +666,26 @@ def test_failed_step_gets_a_resume_button_at_the_end_of_its_own_transcript():
     panel header, far above a long transcript — the human looking at the
     actual error at the bottom of the feed had no way to act from there.
     It reuses lastRunNoticeHtml verbatim (same ghost-styled card) rather
-    than a bespoke button, so the same action looks the same everywhere."""
+    than a bespoke button, so the same action looks the same everywhere.
+    Passed compact:true — the transcript entry directly above already
+    printed this exact failure text, so the card must not repeat it
+    (observed live: the reason showed up twice, once in the failed
+    transcript entry and again verbatim in the card right below it)."""
     html = studio._HTML
     render = html[html.index("const renderRunStep=(n)=>"):
                   html.index("const startedAt=n=>")]
-    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId):'')" in render
+    assert "((status==='failed'||status==='blocked')?lastRunNoticeHtml(taskId,{compact:true}):'')" in render
+
+
+def test_last_run_notice_compact_mode_omits_the_repeated_reason_text():
+    html = studio._HTML
+    fn = html[html.index("function lastRunNoticeHtml(filterTaskId, opts)"):
+              html.index("function lastRunNoticeHtml(filterTaskId, opts)")+1500]
+    assert "opts=opts||{};" in fn
+    assert "(lastRun.reason&&!opts.compact)?`<pre>${esc(lastRun.reason)}</pre>`:''" in fn
+    # The header notice (RUN WORKFLOW terminal node) is unaffected — it has no
+    # transcript above it, so it still needs the full reason text.
+    assert 'lastRunNotice=lastRunNoticeHtml();' in html or "lastRunNoticeHtml()" in html
 
 
 def test_sidebar_restart_warns_that_old_attempt_log_and_context_are_deleted():
@@ -705,7 +720,7 @@ def test_resume_remains_non_destructive():
 
 def test_run_history_renders_before_waiting_for_task_plan():
     html = studio._HTML
-    fn = html[html.index("async function openRunHistory()"):
+    fn = html[html.index("async function openRunHistory(opts)"):
               html.index("function renderRunHistory()")]
     assert fn.index("renderRunHistory();") < fn.index("await (await fetch(api('/api/task_plan?")
     assert "RUN_HISTORY_PLAN={taskId, nodes:null};" in fn
@@ -720,7 +735,7 @@ def test_finished_task_gets_execution_mode_not_preview():
     # placeholder — so the execution-mode check must also look at the
     # selected task's own historical fields, not only the live BOARD.run.
     html = studio._HTML
-    fn = html[html.index("async function openRunHistory()"):
+    fn = html[html.index("async function openRunHistory(opts)"):
               html.index("function renderRunHistory()")]
     assert "taskHasRunHistory" in fn
     assert "historyTask.step_results" in fn
@@ -814,7 +829,10 @@ def test_run_progress_head_is_pinned_and_opening_scrolls_to_the_end():
     html = studio._HTML
     assert ".run-progress-head{position:sticky;top:-16px" in html
     assert "let RUN_HISTORY_SCROLL_TO_END=false;" in html
-    assert "RUN_HISTORY_OPEN=true; VIEWING_RUN_LOG=false; RUN_HISTORY_SCROLL_TO_END=true;" in html
+    open_fn = html[html.index("async function openRunHistory(opts){"):
+                   html.index("if(RUN_TRANSCRIPT.taskId!==taskId){")]
+    assert "if(opts.restore){ RUN_HISTORY_SCROLL_TO_END=false; }" in open_fn
+    assert "else{ RUN_HISTORY_SCROLL_TO_END=true; RUN_HISTORY_RESTORE_SCROLL=null; }" in open_fn
     # #insp is the innerHTML target but has no overflow of its own — its
     # parent (class="insp") is the real scroll container. #insp.scrollTop was
     # a silent no-op (confirmed live), so scroll read/write must go through
@@ -829,6 +847,39 @@ def test_run_progress_head_is_pinned_and_opening_scrolls_to_the_end():
     assert "if(RUN_HISTORY_SCROLL_TO_END&&steps.length){" in render
     assert "scroller.scrollTop=scroller.scrollHeight;" in render
     assert "scroller.scrollTop=previousScroll;" in render
+
+
+def test_flow_panel_scroll_survives_a_real_page_reload():
+    """A re-render (poll tick) already preserved scroll in-session — but a
+    genuine browser reload wipes all JS state, so without persistence the
+    human always lands back at the top (or wherever "fresh open" puts them)
+    after an F5, not where they'd actually scrolled to. sessionStorage
+    bridges that gap: saved on scroll, consumed once on the next load()."""
+    html = studio._HTML
+    assert "function flowPanelStorageKey(){ return 'harn.flowPanelScroll.'+ENV; }" in html
+    assert "function saveFlowPanelScroll(){" in html
+    assert "sessionStorage.setItem(flowPanelStorageKey(), JSON.stringify({taskId, scrollTop:scroller.scrollTop}));" in html
+    assert "function loadFlowPanelScroll(){" in html
+    assert "function clearFlowPanelScroll(){" in html
+    # Bound directly to the real scroll container (class="insp"), not #insp —
+    # scroll events don't bubble, and #insp itself never scrolls.
+    assert "document.querySelector('.insp').addEventListener('scroll', saveFlowPanelScroll, {passive:true});" in html
+    # Closing the panel forgets the offset — reopening later is a fresh
+    # "jump to end", not a stale restore of wherever it was last closed.
+    assert "function closeRunHistory(){ RUN_HISTORY_OPEN=false; clearFlowPanelScroll(); renderInsp(); }" in html
+    load_fn = html[html.index("async function load(){"): html.index("async function load(){")+1400]
+    assert "const flowRestore=loadFlowPanelScroll();" in load_fn
+    assert "FLOW_SEL_TASK_ID=flowRestore.taskId;" in load_fn
+    assert "RUN_HISTORY_RESTORE_SCROLL=flowRestore.scrollTop;" in load_fn
+    assert "await openRunHistory({restore:true});" in load_fn
+    # Restore takes priority over "scroll to end" but only once real content
+    # is there to scroll within — same one-shot-armed-until-ready pattern as
+    # RUN_HISTORY_SCROLL_TO_END, so it can't fire against an empty placeholder.
+    render = html[html.index("panel.innerHTML=`<div class=\"run-progress\">"):
+                  html.index("RUN_HISTORY_RENDER_KEY=runHistoryRenderKey();")]
+    assert "}else if(RUN_HISTORY_RESTORE_SCROLL!=null&&steps.length){" in render
+    assert "scroller.scrollTop=RUN_HISTORY_RESTORE_SCROLL;" in render
+    assert "RUN_HISTORY_RESTORE_SCROLL=null;" in render
 
 
 def test_flow_history_prefers_completed_task_with_step_results_after_reload():
