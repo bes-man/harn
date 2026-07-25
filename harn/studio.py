@@ -2033,6 +2033,11 @@ _HTML = r"""<!DOCTYPE html>
   .run-step-num{font:10px/20px ui-monospace,Menlo,monospace;text-align:center;border:1px solid var(--line);border-radius:6px;color:var(--muted)}
   .run-step-name{font-size:12.5px;font-weight:650;line-height:1.35}
   .run-step-state{font:10px/1.4 ui-monospace,Menlo,monospace;text-transform:uppercase;letter-spacing:.45px;color:var(--muted)}
+  /* the step a Resume would start from — "you are here" in the workflow */
+  .run-step.next-up{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .next-badge{font:9.5px/1.4 ui-monospace,Menlo,monospace;text-transform:uppercase;
+    letter-spacing:.5px;color:#0b0d12;background:var(--accent);border-radius:4px;
+    padding:1px 5px;margin-left:6px;vertical-align:middle}
   .run-step-usage{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 2px 30px}
   .usage-pill{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid #424957;color:#aeb6c5;background:#202530}
   .usage-pill::before{display:inline-block;margin-right:4px;font-size:9px}
@@ -3544,11 +3549,18 @@ function renderRunHistory(){
     const visualState=(tier||'pending').replaceAll('_','-');
     return `<span class="usage-pill ${kind} usage-${esc(visualState)}">${esc(name)}</span>`;
   };
-  const complete=steps.filter(n=>['ok','complete','done'].includes(normalized((results[n.id]||{}).status))).length;
+  const isDone=n=>['ok','complete','done'].includes(normalized((results[n.id]||{}).status));
+  const complete=steps.filter(isDone).length;
   const failed=steps.filter(n=>['failed','blocked'].includes(normalized((results[n.id]||{}).status))).length;
   const pct=steps.length?Math.round((complete/steps.length)*100):0;
+  // The step a Resume would actually start from: the first not-yet-complete
+  // one in DECLARED order (that's the order roles_runner._run_steps walks,
+  // skipping already-ok steps). Marking it answers "where is this workflow
+  // right now / what happens if I hit Resume" without reading every card.
+  const nextStep=steps.find(n=>!isDone(n));
   const renderRunStep=(n)=>{
     const index=steps.indexOf(n);
+    const isNext=nextStep&&n.id===nextStep.id&&!(BOARD.run&&BOARD.run.task_id===taskId);
     const r=results[n.id]||{};
     const status=runtimeStepStatus(n.id,normalized(r.status));
     const usage=r.usage||{};
@@ -3562,10 +3574,12 @@ function renderRunHistory(){
       .filter(e=>e.step_id===n.id).length;
     const transcriptOpen=status==='running'||status==='failed'||status==='blocked'||
       TRANSCRIPT_OPEN_STEPS.has(n.id)||((transcriptCount||out)&&!TRANSCRIPT_CLOSED_STEPS.has(n.id));
-    return `<div class="run-step ${status}">`+
+    const stamp=fmtEntryStamp(r.started);
+    return `<div class="run-step ${status}${isNext?' next-up':''}">`+
       `<div class="run-step-top"><span class="run-step-num">${index+1}</span>`+
-      `<span class="run-step-name">${esc(n.title||n.id)}</span>`+
-      `<span class="run-step-state">${esc(status)}${metric?' · '+esc(metric):''}</span></div>`+
+      `<span class="run-step-name">${esc(n.title||n.id)}`+
+      `${isNext?' <span class="next-badge">next up</span>':''}</span>`+
+      `<span class="run-step-state">${stamp?esc(stamp)+' · ':''}${esc(status)}${metric?' · '+esc(metric):''}</span></div>`+
       (pills?`<div class="run-step-usage">${pills}</div>`:'')+
       (status==='blocked'?`<div class="step-output"><button class="ghost" onclick="rerunSidebarWorkflow()">↻ Restart flow from scratch</button></div>`:'')+
       `<details class="step-transcript" data-step-transcript="${esc(n.id)}" `+
@@ -3573,7 +3587,25 @@ function renderRunHistory(){
         `<summary>Agent activity${transcriptCount?' · '+transcriptCount:''}</summary>`+
         `${stepTranscriptHtml(n.id,out)}</details></div>`;
   };
-  const rows=executionPlanGroups(steps).map(group=>group.kind==='wave'
+  // CHRONOLOGY, not declared order. A step can legitimately run out of
+  // declared sequence — most often a RETRY of an early step after later ones
+  // already ran (observed live: Research retried a day after Draft spec had
+  // run, so its failure rendered at the very TOP of the rail even though it
+  // was the last thing that actually happened). Groups are sorted by their
+  // earliest start; parallel waves stay atomic (sorting individual steps
+  // would tear a wave apart), and steps that never ran keep declared order
+  // at the end — that tail IS the "what's left to do" queue.
+  const startedAt=n=>(results[n.id]||{}).started||'';
+  const groupStart=g=>g.steps.map(startedAt).filter(Boolean).sort()[0]||'';
+  const ordered=executionPlanGroups(steps).map((g,i)=>({g,i}))
+    .sort((a,b)=>{
+      const sa=groupStart(a.g), sb=groupStart(b.g);
+      if(sa&&sb) return sa<sb?-1:sa>sb?1:a.i-b.i;
+      if(sa) return -1;          // ran before anything that never ran
+      if(sb) return 1;
+      return a.i-b.i;            // both unrun → declared order (the queue)
+    }).map(x=>x.g);
+  const rows=ordered.map(group=>group.kind==='wave'
     ? `<div class="run-wave"><div class="run-wave-label">∥ parallel · ${esc(group.id)}</div>`+
       group.steps.map(renderRunStep).join('')+`</div>`
     : group.steps.map(renderRunStep).join('')).join('');

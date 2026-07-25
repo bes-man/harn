@@ -167,7 +167,14 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
             "step": step, "rerun": bool(rerun), "started_at": time.time()}
     _pid_path(env_dir).write_text(json.dumps(info), encoding="utf-8")
     def reap() -> None:
-        _record_completion(env_dir, info, proc.wait())
+        # Telemetry-grade: this is a detached daemon thread with no caller to
+        # report to, so any exception here (json.dumps hitting an
+        # unserializable value, a disk error) must never propagate — the
+        # subprocess is already reaped either way.
+        try:
+            _record_completion(env_dir, info, proc.wait())
+        except Exception:
+            pass
     threading.Thread(target=reap, daemon=True).start()
     return {"ok": True, **info}
 

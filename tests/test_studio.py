@@ -601,7 +601,7 @@ def test_flow_sidebar_renders_visual_step_timeline_and_usage_states():
     html = studio._HTML
     assert 'class="run-progress"' in html
     assert 'class="progress-rail"' in html
-    assert 'class="run-step ${status}"' in html
+    assert 'class="run-step ${status}${isNext?\' next-up\':\'\'}"' in html
     assert "usagePill('skill'" in html
     assert "usagePill('tool'" in html
     assert "usage-used" in html
@@ -655,7 +655,7 @@ def test_launch_clears_transcript_again_after_server_confirms_clean_restart():
 def test_blocked_sidebar_restart_uses_full_workflow_reset_not_attempt_only_retry():
     html = studio._HTML
     render = html[html.index("const renderRunStep=(n)=>"):
-                  html.index("const rows=executionPlanGroups")]
+                  html.index("const startedAt=n=>")]
     assert "Restart flow from scratch" in render
     assert "rerunSidebarWorkflow()" in render
     assert "retryBlockedStep" not in render

@@ -5,8 +5,8 @@ caps, and Telegram command polling honoring the chat_id trust boundary."""
 from __future__ import annotations
 
 import harn.telegram as tg
-from harn import loop, roles, roles_runner, scaffold, studio, tasks, triggers, \
-    ENV_DIRNAME
+from harn import config, loop, roles, roles_runner, scaffold, studio, tasks, \
+    triggers, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from harn.telegram import TelegramHIL
 import subprocess
@@ -275,6 +275,131 @@ def test_auto_scan_skips_tasks_that_hit_attempts_cap(tmp_path, monkeypatch):
     result = triggers.auto_scan(tmp_path, env)
     assert result is None
     assert fake.calls == []
+
+
+# --- resume_scan: retry unfinished-but-unblocked work ---------------------- #
+
+def _claimed_unfinished(env, tmp_path, *, role="analyst"):
+    """A task mid-workflow: claimed by `role`, step 1 done, step 2 pending."""
+    t = tasks.create_task(env, "Half done")
+    _plan(env, t.id, n_steps=2)
+    t.status = tasks.IN_PROGRESS
+    t.claimed_by = role
+    t.step_results["step-000001"] = {"status": "ok"}
+    tasks._save(t)
+    _role_md(env, role, status=tasks.IN_PROGRESS, oracle=False)
+    return t
+
+
+def test_resume_scan_relaunches_an_unfinished_unblocked_task(tmp_path, monkeypatch):
+    """The self-healing path for TRANSIENT faults (rate limit, expired CLI
+    session, network blip): without it a task sits stopped mid-workflow until
+    a human notices — observed live, PRJ-001 sat overnight after its CLI's
+    OAuth session expired, with several steps still pending."""
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    result = triggers.resume_scan(tmp_path, env)
+
+    assert result is not None and result["ok"] is True
+    assert result["task_id"] == t.id
+    assert len(fake.calls) == 1, "only the not-yet-done step should run"
+
+
+def test_resume_scan_skips_a_task_blocked_on_a_human_answer(tmp_path, monkeypatch):
+    """A pending question is a BLOCKER, not a transient fault — retrying it
+    can't make progress and would just burn tokens on 'still waiting' turns."""
+    from harn import state as state_mod
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+    st = state_mod.State(current_task=t.id)
+    st.block("Which option — A or B?")
+    st.save(env / "state")
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    assert triggers.resume_scan(tmp_path, env) is None
+    assert fake.calls == []
+
+
+def test_resume_scan_skips_fully_finished_and_unclaimed_tasks(tmp_path, monkeypatch):
+    env = _project(tmp_path)
+    done = tasks.create_task(env, "All done")
+    _plan(env, done.id, n_steps=2)
+    done.status = tasks.IN_PROGRESS
+    done.claimed_by = "analyst"
+    done.step_results = {"step-000001": {"status": "ok"}, "step-000002": {"status": "ok"}}
+    tasks._save(done)
+    unclaimed = tasks.create_task(env, "Nobody's")
+    _plan(env, unclaimed.id, n_steps=2)
+    _role_md(env, "analyst", status=tasks.IN_PROGRESS, oracle=False)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    assert triggers.resume_scan(tmp_path, env) is None
+    assert fake.calls == []
+
+
+def test_resume_scan_never_races_an_active_run(tmp_path, monkeypatch):
+    env = _project(tmp_path)
+    _claimed_unfinished(env, tmp_path)
+    monkeypatch.setattr(triggers.runner_mod, "active", lambda ed: {"task_id": "OTHER"})
+    assert triggers.resume_scan(tmp_path, env) is None
+
+
+def test_resume_scan_clears_the_spent_per_step_attempt_cap(tmp_path, monkeypatch):
+    """The per-step cap (_MAX_STEP_ATTEMPTS=2) is spent IN FULL by a single
+    run, so gating scheduled resumes on it would allow exactly one retry and
+    then never again — useless for the case this feature exists for: a rate
+    limit or expired session lasting hours. A scheduled resume happens against
+    a possibly-changed world, so it clears those counters (same reasoning
+    loop.answer() already applies when a human intervenes) and relies on its
+    own budget instead."""
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+    t.step_results["step-000002"] = {"status": "failed", "attempts": loop._MAX_STEP_ATTEMPTS}
+    tasks._save(t)
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    result = triggers.resume_scan(tmp_path, env)
+
+    assert result is not None and result["ok"] is True
+    assert len(fake.calls) == 1
+
+
+def test_resume_scan_gives_up_after_its_own_budget_without_progress(tmp_path, monkeypatch):
+    """Bounded so a permanently broken task can't retry forever — but the
+    budget RESETS on real progress, so a task that keeps advancing keeps
+    earning retries."""
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+
+    class FailingAdapter(RecordingAdapter):
+        """Stands in for the transient fault this feature exists for (rate
+        limit / expired session): the step keeps failing, so the task never
+        progresses and the budget must eventually stop the retries."""
+        def run_turn(self, prompt, cwd, timeout=1800, *, model=None, effort=None,
+                    temperature=None):
+            self.calls.append({"prompt": prompt})
+            return AgentResult(ok=False, text="rate limit")
+
+    monkeypatch.setattr(loop, "get_adapter", lambda n: FailingAdapter())
+    cfg = config.Config.load(env)
+    cfg.resume_max_attempts = 2
+
+    assert triggers.resume_scan(tmp_path, env, cfg=cfg) is not None
+    assert triggers.resume_scan(tmp_path, env, cfg=cfg) is not None
+    assert triggers.resume_scan(tmp_path, env, cfg=cfg) is None, "budget spent"
+
+    # Real progress (the stuck step finally completed) refills the budget.
+    fresh = tasks.find(env, t.id)
+    fresh.step_results["step-000002"] = {"status": "ok"}
+    tasks._save(fresh)
+    _plan(env, t.id, n_steps=3)
+    assert triggers.resume_scan(tmp_path, env, cfg=cfg) is not None
 
 
 # --- Telegram command polling: trust boundary ----------------------------- #

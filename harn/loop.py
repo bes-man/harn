@@ -2851,6 +2851,10 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
     seen_lines = len(_progress_tail_lines(env_dir))
     last_progress_time = time.time()
     idle_notified = False
+    # Start the resume clock at "now", not 0: a watch restart shouldn't
+    # immediately relaunch whatever was left unfinished — give the human the
+    # normal interval to intervene first.
+    last_resume_check = time.time()
 
     while True:
         # 1) Live status feed — echo new PROGRESS lines as they appear.
@@ -2970,6 +2974,25 @@ def watch(env_dir: Path, project_root: Path | None = None, *, poll_s: int = 3,
                         except Exception:
                             pass
             triggers_mod.auto_scan(project_root, env_dir, cfg=cfg)
+
+        # 5) Scheduled resume: every `[loop] resume_check_minutes` (default 30,
+        #    0 = off), relaunch ONE unfinished-but-UNBLOCKED task. This is the
+        #    self-healing path for TRANSIENT faults — a provider rate limit, an
+        #    expired CLI session, a network blip — which otherwise leave a task
+        #    stopped mid-workflow indefinitely. A task waiting on a human answer
+        #    is deliberately excluded (that's a blocker, not a fault); see
+        #    triggers.resume_scan for the full eligibility rules.
+        resume_every = cfg.resume_check_minutes * 60
+        if resume_every and time.time() - last_resume_check >= resume_every:
+            last_resume_check = time.time()
+            try:
+                resumed = triggers_mod.resume_scan(project_root, env_dir, cfg=cfg)
+            except Exception as exc:            # never let a retry kill the tick
+                print(f"[harn] watch: resume check failed: {exc}")
+                resumed = None
+            if resumed:
+                print(f"[harn] watch: resumed {resumed.get('task_id', '?')} "
+                      f"(unfinished, not blocked)")
 
         if _once:
             return

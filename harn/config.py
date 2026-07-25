@@ -93,7 +93,8 @@ DEFAULTS: dict = {
              "oracle": True, "oracle_agent": "",
              "design": True, "auto_reconcile": True,
              "max_cost_usd": 3.0, "max_tokens": 400000,
-             "turn_timeout_seconds": 1800},
+             "turn_timeout_seconds": 1800,
+             "resume_check_minutes": 30, "resume_max_attempts": 8},
     "browser": {"enabled": False, "app_cmd": "", "app_url": "",
                 "ready_timeout_s": 60},
     "code_search": {"semble": True, "socraticcode": True},
@@ -179,6 +180,17 @@ class Config:
     # Per-turn subprocess timeout handed to adapter.run_turn (0 = the
     # adapter's own 1800s default). Caps a single turn's blast radius.
     turn_timeout_seconds: int = 1800
+    # `harn watch` re-launches an unfinished, UNBLOCKED task this often
+    # (0 = never). The point is transient, self-healing failures — a rate
+    # limit, an expired CLI session, a network blip — which otherwise leave
+    # a task stopped mid-workflow until a human notices. A task waiting on a
+    # human answer is NOT retried (that's a blocker, not a transient fault).
+    resume_check_minutes: int = 30
+    # How many scheduled resumes a task gets WITHOUT making progress before
+    # harn stops retrying it (8 × 30min ≈ 4h of cover for a long rate limit).
+    # The counter resets the moment a step completes, so a task that keeps
+    # advancing keeps earning retries — only a truly stuck one runs out.
+    resume_max_attempts: int = 8
     # harn ui supervises an owned `harn mcp --http` child on this port.
     mcp_ui_supervise: bool = True
     mcp_ui_port: int = 8765
@@ -297,6 +309,8 @@ class Config:
             max_cost_usd=_nonneg_float(data["loop"].get("max_cost_usd", 3.0)),
             max_tokens=_nonneg_int(data["loop"].get("max_tokens", 400000)),
             turn_timeout_seconds=_nonneg_int(data["loop"].get("turn_timeout_seconds", 1800)),
+            resume_check_minutes=_nonneg_int(data["loop"].get("resume_check_minutes", 30)),
+            resume_max_attempts=_nonneg_int(data["loop"].get("resume_max_attempts", 8)),
             mcp_ui_supervise=bool(data["mcp"].get("ui_supervise", True)),
             mcp_ui_port=_nonneg_int(data["mcp"].get("ui_port", 8765)),
             mcp_tool_reload_seconds=_nonneg_int(data["mcp"].get("tool_reload_seconds", 2)),
