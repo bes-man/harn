@@ -1,15 +1,20 @@
 """Background per-task launches from the studio UI (harn/runner.py).
 
-subprocess.Popen is mocked throughout — these tests verify the PID-file
+subprocess.Popen is mocked throughout — these tests verify the run-record
 lifecycle and single-runner-at-a-time guard, not that `harn run` itself works
-(that's loop.py's job, covered elsewhere)."""
+(that's loop.py's job, covered elsewhere).
+
+Liveness lives in `runstate`, so tests that need a fake pid to look alive
+patch `harn.runstate.os.kill`, not runner's."""
 from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from unittest.mock import patch, MagicMock
 
-from harn import roles, runner, tasks, ENV_DIRNAME
+from harn import roles, runner, runstate, tasks, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -33,7 +38,7 @@ def test_no_run_active_initially(tmp_path):
 def test_launch_writes_pid_file_and_returns_info(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(4242)), \
-         patch("harn.runner.os.kill"):   # pretend pid 4242 stays alive
+         patch("harn.runstate.os.kill"):   # pretend pid 4242 stays alive
         r = runner.launch(tmp_path, env, "PRJ-001", auto=False)
         assert r["ok"] is True and r["pid"] == 4242 and r["task_id"] == "PRJ-001"
         cur = runner.active(env)
@@ -43,7 +48,7 @@ def test_launch_writes_pid_file_and_returns_info(tmp_path):
 def test_launch_command_includes_task_and_project(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         runner.launch(tmp_path, env, "PRJ-002", auto=True)
     cmd = m.call_args[0][0]
     assert "--task" in cmd and "PRJ-002" in cmd
@@ -66,7 +71,7 @@ def test_launch_resumes_task_through_its_claimed_role(tmp_path):
     roles.save(env, {"name": "spec-writer", "status": tasks.IN_PROGRESS})
 
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         runner.launch(tmp_path, env, task.id)
 
     cmd = m.call_args[0][0]
@@ -76,7 +81,7 @@ def test_launch_resumes_task_through_its_claimed_role(tmp_path):
 def test_launch_step_includes_step_flag_not_auto(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         r = runner.launch(tmp_path, env, "PRJ-003", step="step-000001", auto=True)
     cmd = m.call_args[0][0]
     assert "--step" in cmd and "step-000001" in cmd
@@ -88,7 +93,7 @@ def test_launch_step_includes_step_flag_not_auto(tmp_path):
 def test_launch_step_rerun_includes_rerun_flag(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         r = runner.launch(tmp_path, env, "PRJ-004", step="step-000002", rerun=True)
     cmd = m.call_args[0][0]
     assert "--step" in cmd and "step-000002" in cmd and "--rerun" in cmd
@@ -104,7 +109,7 @@ def test_launch_sets_pythonunbuffered_so_the_log_updates_live(tmp_path):
     # by spawning a real subprocess with/without this env var.
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         runner.launch(tmp_path, env, "PRJ-010")
     assert m.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
 
@@ -112,7 +117,7 @@ def test_launch_sets_pythonunbuffered_so_the_log_updates_live(tmp_path):
 def test_active_reports_step_info(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(555)), \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         runner.launch(tmp_path, env, "PRJ-005", step="step-000003")
         cur = runner.active(env)
         assert cur["step"] == "step-000003"
@@ -121,7 +126,7 @@ def test_active_reports_step_info(tmp_path):
 def test_launch_refuses_when_already_active(tmp_path):
     env = _env(tmp_path)
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(111)), \
-         patch("harn.runner.os.kill"):
+         patch("harn.runstate.os.kill"):
         runner.launch(tmp_path, env, "PRJ-001")
         r2 = runner.launch(tmp_path, env, "PRJ-002")
     assert r2["ok"] is False and "already active" in r2["error"]
@@ -133,35 +138,46 @@ def test_launch_rejects_empty_task_id(tmp_path):
     assert r["ok"] is False
 
 
-def test_active_cleans_up_stale_pid_file(tmp_path):
+def test_active_reaps_a_run_whose_process_is_gone(tmp_path):
+    """A record left behind by a process that died (SIGKILL, power cut) must
+    not hold the single-runner lock: `active` reconciles it to CRASHED, which
+    is terminal, so the next launch is allowed."""
     env = _env(tmp_path)
-    (env / "state" / "ui_run.pid").write_text(
-        json.dumps({"pid": 999999999, "task_id": "PRJ-001", "auto": False,
-                    "started_at": 0}), encoding="utf-8")
+    runstate.save(env, runstate.Run(status=runstate.RUNNING, task_id="PRJ-001",
+                                    pid=999999999, started_at=0, updated_at=0))
     assert runner.active(env) is None
-    assert not (env / "state" / "ui_run.pid").exists()
+    assert runstate.load(env).status == runstate.CRASHED
 
 
 def test_active_survives_a_real_live_process(tmp_path):
     """Use THIS test process's own pid as a real, guaranteed-alive pid instead
     of mocking os.kill, to exercise the real liveness check."""
     env = _env(tmp_path)
-    (env / "state" / "ui_run.pid").write_text(
-        json.dumps({"pid": os.getpid(), "task_id": "PRJ-009", "auto": False,
-                    "started_at": 0}), encoding="utf-8")
+    runstate.save(env, runstate.Run(status=runstate.RUNNING, task_id="PRJ-009",
+                                    pid=os.getpid(), started_at=time.time(),
+                                    updated_at=time.time()))
     cur = runner.active(env)
     assert cur is not None and cur["task_id"] == "PRJ-009"
 
 
-def test_stop_kills_and_clears_pid_file(tmp_path):
+def test_stop_kills_and_releases_the_runner(tmp_path):
     env = _env(tmp_path)
-    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(555)), \
-         patch("harn.runner.os.kill") as mk:
+    # `wait()` must BLOCK for this to be the scenario under test: the default
+    # fake returns instantly, so the reaper thread would settle the record as
+    # DONE before stop() ever ran, and we'd be asserting against a run that
+    # had already finished on its own rather than one being stopped.
+    still_running = threading.Event()
+    proc = _fake_popen(555)
+    proc.wait.side_effect = lambda: (still_running.wait(5), 0)[1]
+    with patch("harn.runner.subprocess.Popen", return_value=proc), \
+         patch("harn.runstate.os.kill"), patch("harn.runner.os.kill") as mk:
         runner.launch(tmp_path, env, "PRJ-003")
         r = runner.stop(env)
+        still_running.set()
     assert r["ok"] is True and r["task_id"] == "PRJ-003"
     mk.assert_any_call(555, 15)
-    assert not (env / "state" / "ui_run.pid").exists()
+    assert runstate.load(env).status == runstate.STOPPED
+    assert runner.active(env) is None
 
 
 def test_stop_with_no_active_run(tmp_path):
@@ -248,3 +264,30 @@ def test_log_tail_returns_last_lines(tmp_path):
     (env / "state" / "ui_run.log").write_text("\n".join(f"line{i}" for i in range(100)))
     tail = runner.log_tail(env, n=5)
     assert tail.splitlines() == [f"line{i}" for i in range(95, 100)]
+
+
+def test_a_finished_run_frees_the_runner_even_if_its_process_lingers(tmp_path):
+    """The exact incident this lifecycle rework exists for.
+
+    A `harn run` finished its work and then hung (a Telegram retry loop). Its
+    process stayed alive, so the old pid-file check reported "a run is active"
+    indefinitely and Studio refused every launch, while the board showed the
+    task as `todo` with all steps `pending` — a dead end with no way out.
+
+    The run now releases the slot the moment its WORK is over (cli's `finally`),
+    independently of when the process happens to exit. Uses this test's own pid
+    so the process is genuinely, verifiably alive throughout.
+    """
+    from harn import cli
+    env = _env(tmp_path)
+    rs_begin = runstate.begin(env, "PRJ-001", pid=os.getpid())
+    assert rs_begin["ok"] is True
+    assert runner.active(env) is not None          # occupied while working
+
+    cli._release_run_slot(env, 0)                  # work over; process lives on
+
+    assert runstate.pid_alive(os.getpid()) is True  # still very much alive
+    assert runner.active(env) is None               # …yet the runner is free
+    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(777)), \
+         patch("harn.runstate.os.kill"):
+        assert runner.launch(tmp_path, env, "PRJ-002")["ok"] is True

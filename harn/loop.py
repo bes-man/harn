@@ -24,7 +24,8 @@ import time
 from pathlib import Path
 
 from . import design as design_mod, events, gitutil, progress, transcript, \
-    prd as prd_mod, semble_bridge, skills, state, tasks, tools as tools_mod, workflows
+    prd as prd_mod, runstate as runstate_mod, semble_bridge, skills, state, \
+    tasks, tools as tools_mod, workflows
 from .adapters import Adapter, get_adapter
 from .config import Config
 from .feedback import run_feedback
@@ -1149,6 +1150,12 @@ def _run_turn(adapter, env_dir: Path, prompt: str, project_root: Path, *,
     def on_event(event: dict) -> None:
         if not isinstance(event, dict):
             return
+        # Proof of life from INSIDE the turn. Step boundaries alone aren't
+        # enough: a single agent turn legitimately runs for many minutes, and
+        # a run that only spoke between steps would look stalled to the
+        # staleness reaper. Throttled, so a token stream doesn't become a
+        # write storm.
+        runstate_mod.heartbeat(env_dir, step_id=stage, throttle_s=10.0)
         kind = str(event.get("kind") or "status")
         phase = str(event.get("phase") or "updated")
         text = str(event.get("text") or "")
@@ -1652,6 +1659,7 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         task.step_results[step_id] = {"status": "running", "started": started,
                                       "ended": None, "attempts": attempt}
         tasks._save(task)
+        runstate_mod.heartbeat(env_dir, step_id=step_id)
         result = _run_turn(
             step_adapter, env_dir, _build_step_prompt(
                 env_dir, cfg, task, step, tool_results=tool_results,
@@ -2444,6 +2452,7 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             _checkpoint_stage(project_root, task, sid)
             st.current_step = sid
             st.save(state_dir)
+            runstate_mod.heartbeat(env_dir, step_id=sid)
             tool_results, tool_error = _run_required_custom_tools(
                 env_dir, project_root, task, step, prior_attempts + 1)
             if tool_error:

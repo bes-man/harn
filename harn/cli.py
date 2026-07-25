@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -269,10 +270,46 @@ def cmd_update(args) -> int:
     return 0
 
 
+def _release_run_slot(env_dir: Path, rc: int) -> None:
+    """Close this process's run record the moment its work is over.
+
+    Deliberately in a `finally`, and deliberately not left to the parent's
+    reaper thread: a run that had already finished its work once hung
+    afterwards (a Telegram retry loop) and kept its process — and therefore
+    the single-runner lock — alive for over an hour, leaving the board
+    unstartable. Releasing here means anything the process does after its
+    work cannot hold the runner hostage. `runstate.finish` is a no-op unless
+    there is an active record for THIS pid, so a plain CLI `harn run` with no
+    UI launch behind it is unaffected."""
+    from . import runstate, state as state_mod
+    try:
+        st = state_mod.State.load(env_dir / "state")
+        if st.phase == state_mod.BLOCKED:
+            runstate.finish(env_dir, runstate.BLOCKED,
+                            reason=st.question or "Waiting on your answer.",
+                            exit_code=rc, pid=os.getpid())
+            return
+        runstate.finish(env_dir,
+                        runstate.DONE if rc == 0 else runstate.FAILED,
+                        exit_code=rc, pid=os.getpid())
+    except Exception:
+        # Never let bookkeeping turn a finished run into a crashed command;
+        # a missed release is reaped by the staleness backstop anyway.
+        pass
+
+
 def cmd_run(args) -> int:
-    from . import loop
     root = Path(args.path).resolve()
     env_dir = _env_dir(root)
+    try:
+        return _cmd_run(args, root, env_dir)
+    finally:
+        if env_dir.exists():
+            _release_run_slot(env_dir, 0)
+
+
+def _cmd_run(args, root: Path, env_dir: Path) -> int:
+    from . import loop
     if not env_dir.exists():
         print("[harn] no harn_env here. Run `harn setup` first.", file=sys.stderr)
         return 1

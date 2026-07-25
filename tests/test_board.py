@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
-from harn import runner, state, studio, tasks, workflows, ENV_DIRNAME
+from harn import runner, runstate, state, studio, tasks, workflows, ENV_DIRNAME
 
 
 def _env(tmp_path):
@@ -43,6 +43,38 @@ def test_board_payload_keeps_last_run_failure_visible_after_process_exits(tmp_pa
     assert payload["last_run"] == {
         "task_id": "PRJ-001", "exit_code": 1, "reason": "Failed to authenticate"
     }
+
+
+def test_board_payload_surfaces_a_run_that_died_without_reporting(tmp_path):
+    """A SIGKILLed / wedged run leaves NO `ui_last_run.json`: that file is
+    written by the parent's reaper thread, which is exactly what doesn't
+    survive. Without this the board showed every step still `pending` and no
+    hint that anything had gone wrong — the dead end the run-lifecycle FSM
+    exists to remove. The reconciled CRASHED record speaks for it instead."""
+    env = _env(tmp_path)
+    (env / "state").mkdir()
+    runstate.save(env, runstate.Run(status=runstate.RUNNING, task_id="PRJ-001",
+                                    pid=999999999, started_at=1.0, updated_at=1.0))
+
+    payload = studio.board_payload(env)
+
+    assert payload["run"] is None                     # lock released
+    assert payload["run_state"]["status"] == runstate.CRASHED
+    last = payload["last_run"]
+    assert last["task_id"] == "PRJ-001" and last["crashed"] is True
+    assert "exited without reporting" in last["reason"]
+
+
+def test_a_crash_record_never_overwrites_a_newer_archived_outcome(tmp_path):
+    env = _env(tmp_path)
+    (env / "state").mkdir()
+    runstate.save(env, runstate.Run(status=runstate.CRASHED, task_id="PRJ-001",
+                                    finished_at=10.0, reason="old crash"))
+    runner._last_run_path(env).write_text(
+        '{"task_id":"PRJ-002","finished_at":99.0,"reason":"newer"}',
+        encoding="utf-8")
+
+    assert studio.board_payload(env)["last_run"]["task_id"] == "PRJ-002"
 
 
 def test_board_payload_includes_step_usage_when_present(tmp_path):

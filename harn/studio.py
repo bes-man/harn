@@ -35,6 +35,7 @@ from . import intake as intake_mod
 from . import mcp_server
 from . import roles as roles_mod
 from . import runner as runner_mod
+from . import runstate as runstate_mod
 from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
@@ -761,16 +762,44 @@ def board_payload(env_dir: Path) -> dict:
         d["context_reads"] = reads.get(t.id, [])
         d["attachments"] = attachments_mod.list_files(env_dir, t.id)
         ts.append(d)
-    run = runner_mod.active(env_dir)
+    run = runner_mod.active(env_dir)          # reconciles the record first
+    record = runstate_mod.load(env_dir)        # …so this is the reconciled truth
     statuses = [
         {"name": s, "label": tasks_mod._STATUS_LABEL.get(s, s)}
         for s in tasks_mod.lifecycle(env_dir)
     ]
     payload = {"tasks": ts, "run": run, "statuses": statuses,
-               "last_run": runner_mod.last_run(env_dir)}
+               "run_state": record.to_dict(),
+               "last_run": _last_run_with_crashes(env_dir, record)}
     if run or payload["last_run"]:
         payload["run_log"] = runner_mod.log_tail(env_dir, 40)
     return payload
+
+
+def _last_run_with_crashes(env_dir: Path, record) -> dict | None:
+    """The last run's outcome, including the ones that never got to report it.
+
+    `ui_last_run.json` is written by the parent's reaper thread — which is
+    exactly what does NOT survive a SIGKILL, a power cut, or a run whose
+    process wedged. Those runs would otherwise leave no trace at all in the
+    UI: the panel would show every step still `pending` with no explanation
+    and no "something went wrong" anywhere, which is precisely the dead end
+    this lifecycle rework is about. A reconciled CRASHED record is
+    authoritative for that case, so surface it in the shape the existing
+    notice card already renders (title, reason, Resume).
+    """
+    archived = runner_mod.last_run(env_dir)
+    if record.status != runstate_mod.CRASHED:
+        return archived
+    # Only speak for the crash if it's the newer story — an archived outcome
+    # from a LATER run must not be overwritten by an older crash record.
+    if archived and (archived.get("finished_at") or 0) >= (record.finished_at or 0):
+        return archived
+    return {"task_id": record.task_id, "auto": record.auto,
+            "step": record.only_step, "rerun": record.rerun,
+            "started_at": record.started_at, "finished_at": record.finished_at,
+            "exit_code": record.exit_code, "reason": record.reason,
+            "crashed": True}
 
 
 _STATUS_NAME_RE = re.compile(r"[^a-z0-9_]+")
@@ -822,6 +851,54 @@ def reorder_board_status_payload(env_dir: Path, payload: dict) -> dict:
         return {"ok": False, "error": "order must contain exactly the current statuses "
                                         "(add/remove via add_status, not reorder)"}
     return _write_board_statuses(env_dir, order)
+
+
+def rename_board_status_payload(env_dir: Path, payload: dict) -> dict:
+    """Rename a board column, carrying every task on it across.
+
+    A status name is not just a label — it's the value stored on each task, so
+    renaming the column without migrating the tasks would strand them on a
+    column that no longer exists. Both halves happen here, tasks first: a
+    half-applied rename that left tasks behind would be invisible until
+    someone opened the board and found them gone.
+
+    The five built-in statuses are refused. harn's own engine keys off them by
+    name (`_NEEDS_AGENT` decides what an agent may pick up, `_PICK_RANK`
+    decides in what order, `_DONE_ALIASES` decides what counts as finished),
+    so renaming one wouldn't rename a label — it would quietly detach those
+    tasks from the loop that's supposed to run them. Add a custom status and
+    move tasks onto it instead.
+    """
+    old = (payload.get("from") or "").strip()
+    new = _STATUS_NAME_RE.sub("_", (payload.get("to") or "").strip().lower()).strip("_")
+    if not old or not new:
+        return {"ok": False, "error": "both 'from' and 'to' are required"}
+    if old == new:
+        return {"ok": True, "statuses": tasks_mod.lifecycle(env_dir)}
+    blocked = _board_status_tables_error(env_dir)
+    if blocked:
+        return blocked
+    current = tasks_mod.lifecycle(env_dir)
+    if old not in current:
+        return {"ok": False, "error": f"no status {old!r} on this board"}
+    if new in current:
+        return {"ok": False, "error": f"status {new!r} already exists"}
+    if old in tasks_mod.LIFECYCLE:
+        return {"ok": False, "error": (
+            f"{old!r} is one of harn's built-in statuses — the engine keys off "
+            "it by name (which tasks agents may pick up, in what order, and "
+            "what counts as done), so renaming it would detach those tasks "
+            "from the loop. Add a new status and move tasks onto it instead.")}
+    moved = []
+    for t in tasks_mod.load_tasks(env_dir):
+        if t.status == old:
+            t.status = new
+            tasks_mod._save(t)
+            moved.append(t.id)
+    result = _write_board_statuses(env_dir, [new if s == old else s for s in current])
+    result["renamed"] = {"from": old, "to": new}
+    result["moved_tasks"] = moved
+    return result
 
 
 def _board_status_tables_error(env_dir: Path) -> dict | None:
@@ -1217,6 +1294,12 @@ def _clean_restart(env_dir: Path, task_id: str):
     tasks_mod._save(task)
     transcript_mod.clear_task(env_dir, task_id)
     events_mod.clear_task(env_dir, task_id)
+    # A clean restart means a clean slate for the lifecycle record too —
+    # otherwise the previous attempt's crash/stop notice keeps being reported
+    # as this task's latest outcome after it has been explicitly wiped.
+    runstate_mod.clear(env_dir)
+    _last_run_path = env_dir / "state" / "ui_last_run.json"
+    _last_run_path.unlink(missing_ok=True)
     state_dir = env_dir / "state"
     state_mod.State().save(state_dir)
     state_mod.clear_block_marker(state_dir)
@@ -1649,6 +1732,8 @@ def _make_handler(default_env: Path):
                 self._json(add_board_status_payload(env, body))
             elif route == "/api/board/reorder_statuses":
                 self._json(reorder_board_status_payload(env, body))
+            elif route == "/api/board/rename_status":
+                self._json(rename_board_status_payload(env, body))
             elif route == "/api/tasks/workflow":
                 self._json(set_task_workflow(env, body))
             elif route == "/api/tasks/update":
@@ -2803,6 +2888,7 @@ function renderBoard(){
     html+=`<div class="kanban-col" data-status="${esc(s)}" ondragover="onColDragOver(event)" ondrop="onColDrop(event,'${esc(s)}')">`+
       `<div class="kanban-col-head"><span>${BOARD_LABEL[s]||s} · ${list.length}</span>`+
       `<span class="kanban-col-move">`+
+      `<button onclick="renameBoardColumn('${esc(s)}')" title="Rename this status (tasks on it move with it)">✎</button>`+
       `<button ${i===0?'disabled':''} onclick="moveBoardColumn(${i},-1)" title="Move left">◀</button>`+
       `<button ${i===BOARD_ORDER.length-1?'disabled':''} onclick="moveBoardColumn(${i},1)" title="Move right">▶</button>`+
       `</span></div>`+
@@ -2841,6 +2927,17 @@ async function addBoardColumn(){
   if(!name)return;
   const r=await post_('/api/board/add_status',{name});
   if(r.error||r.ok===false){ alert(r.error||'could not add status'); return; }
+  await pollBoard();
+}
+async function renameBoardColumn(from){
+  const to=prompt('Rename "'+from+'" to (a-z, 0-9, _):', from);
+  if(!to||to===from)return;
+  const r=await post_('/api/board/rename_status',{from,to});
+  if(r.error||r.ok===false){ alert(r.error||'could not rename status'); return; }
+  // Say so when tasks moved with it — a silent rename leaves the human
+  // guessing whether the cards on that column came along.
+  const moved=(r.moved_tasks||[]).length;
+  if(moved) setStatus('renamed '+from+' → '+to+' ('+moved+' task'+(moved>1?'s':'')+' moved)');
   await pollBoard();
 }
 let COLUMN_REORDER_BUSY=false;
@@ -3696,6 +3793,14 @@ function renderRunHistory(){
   // The task modal is a global overlay, so this works straight from the Flow
   // tab — the reverse of Board's "Open flow ▶" button.
   const openTask=task?`<button class="ghost" onclick="openTaskModal('${esc(taskId)}')" title="Open this task's card (description, comments, pending questions)">☰ Open task</button>`:'';
+  // The last run's outcome normally rides along on the step that ended it.
+  // When NO step is failed/blocked there is nothing to attach it to — a run
+  // killed before its first step finished, or one whose steps were reset —
+  // and the panel would show nothing but `pending` rows with no hint that
+  // anything had happened. That silence is the whole complaint this rework
+  // is about, so in that case the notice goes at the END of the rail (still
+  // "at the end", never hoisted back up to the header).
+  const tailNotice=failed?'':lastRunNoticeHtml(taskId);
   panel.innerHTML=`<div class="run-progress"><div class="run-progress-head">`+
     `<div class="run-progress-title"><strong>Run progress</strong>`+
     `<button class="icon-btn" onclick="closeRunHistory()" title="Close">✕</button></div>`+
@@ -3706,7 +3811,7 @@ function renderRunHistory(){
     `</div>`+
     `<div class="progress-rail">${rows||(loadingPlan
       ?'<div class="empty">Loading this task\'s workflow…</div>'
-      :'<div class="empty">Waiting for the first step…</div>')}</div></div>`;
+      :'<div class="empty">Waiting for the first step…</div>')}${tailNotice}</div></div>`;
   // openRunHistory() renders once immediately (a "Loading…" placeholder,
   // before its task_plan fetch resolves) and again once the real plan
   // arrives — consuming the flag on that first render would scroll to a
@@ -3744,13 +3849,17 @@ function lastRunNoticeHtml(filterTaskId, opts){
   const finishedAt=fmtDateTime(lastRun.finished_at);
   // "blocked" (the agent asked a genuine question and is waiting on you) is
   // NOT a failure — distinct styling/copy from an actual failed run.
+  // "crashed" is its own story, not a generic stop: the run never got to
+  // report anything (killed, machine died, or wedged until the heartbeat
+  // reaper called it). Saying "stopped" there would imply it decided to.
   const title=lastRun.blocked?'⏳ Waiting for your answer'
+    :lastRun.crashed?'⚠ Run interrupted'
     :lastRun.reason?'⚠ Run stopped':'✓ Last run finished';
   // opts.compact: called right after the step's own transcript, whose last
   // entry already prints this exact reason text — repeating it in a <pre>
   // right below reads as a copy-paste duplicate (observed live). Keep the
   // title/button, drop the redundant body.
-  return `<div class="run-result ${lastRun.blocked?'blocked':lastRun.reason?'failed':''}">`+
+  return `<div class="run-result ${lastRun.blocked?'blocked':(lastRun.reason||lastRun.crashed)?'failed':''}">`+
     `<b>${title} · ${esc(lastRun.task_id||'task')}`+
     `${finishedAt?' · '+esc(finishedAt):''}</b>`+
     `${(lastRun.reason&&!opts.compact)?`<pre>${esc(lastRun.reason)}</pre>`:''}`+

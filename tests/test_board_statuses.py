@@ -201,3 +201,72 @@ def test_studio_html_renders_board_order_as_javascript_var():
     assert "let BOARD_ORDER" in studio._HTML
     assert "function applyBoardStatuses" in studio._HTML
     assert "applyBoardStatuses(BOARD.statuses)" in studio._HTML
+
+
+# --- renaming a column ------------------------------------------------ #
+
+def test_rename_moves_the_column_and_every_task_on_it(tmp_path):
+    """A status name IS the value stored on each task, so renaming the column
+    without migrating the tasks would strand them on a column that no longer
+    exists."""
+    env = _env(tmp_path)
+    _write_toml(env, '[board]\nstatuses = ["todo", "analyzing", "done"]\n')
+    staying = tasks.create_task(env, "Untouched")
+    moving = tasks.create_task(env, "On the renamed column")
+    moving.status = "analyzing"
+    tasks._save(moving)
+
+    r = studio.rename_board_status_payload(env, {"from": "analyzing", "to": "in_analysis"})
+
+    assert r["ok"] is True
+    assert r["moved_tasks"] == [moving.id]
+    assert tasks.lifecycle(env) == ["todo", "in_analysis", "done"]
+    assert tasks.find(env, moving.id).status == "in_analysis"
+    assert tasks.find(env, staying.id).status == "todo"
+
+
+def test_rename_refuses_a_builtin_status(tmp_path):
+    """harn's engine keys off the built-in names (which tasks an agent may
+    pick up, in what order, what counts as done) — renaming one would quietly
+    detach those tasks from the loop rather than relabel them."""
+    env = _env(tmp_path)
+    _write_toml(env, '[board]\nstatuses = ["todo", "in_progress", "done"]\n')
+    t = tasks.create_task(env, "Keeps its status")
+
+    r = studio.rename_board_status_payload(env, {"from": "todo", "to": "backlog"})
+
+    assert r["ok"] is False and "built-in" in r["error"]
+    assert tasks.lifecycle(env) == ["todo", "in_progress", "done"]
+    assert tasks.find(env, t.id).status == "todo"
+
+
+def test_rename_refuses_an_unknown_or_colliding_name(tmp_path):
+    env = _env(tmp_path)
+    _write_toml(env, '[board]\nstatuses = ["todo", "analyzing", "done"]\n')
+    assert studio.rename_board_status_payload(
+        env, {"from": "nope", "to": "x"})["ok"] is False
+    assert studio.rename_board_status_payload(
+        env, {"from": "analyzing", "to": "done"})["ok"] is False
+    assert tasks.lifecycle(env) == ["todo", "analyzing", "done"]
+
+
+def test_rename_normalizes_the_new_name(tmp_path):
+    env = _env(tmp_path)
+    _write_toml(env, '[board]\nstatuses = ["todo", "analyzing", "done"]\n')
+    r = studio.rename_board_status_payload(env, {"from": "analyzing", "to": "In Analysis"})
+    assert r["ok"] is True
+    assert tasks.lifecycle(env) == ["todo", "in_analysis", "done"]
+
+
+def test_rename_leaves_hand_authored_status_tables_alone(tmp_path):
+    """The `[[board.status]]` table form carries per-status external labels and
+    takes priority over `statuses = [...]`; writing the flat form under it
+    would appear to work while the app kept using the old table."""
+    env = _env(tmp_path)
+    _write_toml(env, (
+        '[board]\n'
+        '[[board.status]]\nname = "todo"\n'
+        '[[board.status]]\nname = "analyzing"\n'
+    ))
+    r = studio.rename_board_status_payload(env, {"from": "analyzing", "to": "x"})
+    assert r["ok"] is False and "harn.toml" in r["error"]

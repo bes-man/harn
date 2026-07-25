@@ -501,7 +501,11 @@ def test_studio_run_result_distinguishes_blocked_from_failed_with_resume_button(
     html = studio._HTML
     assert "function lastRunNoticeHtml(filterTaskId, opts)" in html
     assert "lastRun.blocked?'⏳ Waiting for your answer'" in html
-    assert "lastRun.blocked?'blocked':lastRun.reason?'failed':''" in html
+    assert "lastRun.blocked?'blocked':(lastRun.reason||lastRun.crashed)?'failed':''" in html
+    # A run that never got to report anything (killed / wedged until the
+    # heartbeat reaper called it) reads as interrupted, not as a decision to
+    # stop — and must still be visible, since its reaper never ran.
+    assert "lastRun.crashed?'⚠ Run interrupted'" in html
     assert "onclick=\"launchTask('${esc(lastRun.task_id)}',false)\">▶ Resume</button>" in html
     assert ".run-result.blocked{" in html
     assert ".run-result.failed{" in html
@@ -946,3 +950,16 @@ def test_sidebar_runtime_status_uses_same_progress_ids_as_canvas():
     html = studio._HTML
     assert "function runtimeStepStatus(stepId,ledgerStatus)" in html
     assert "(PROG.stages||{})[stepId]" in html
+
+
+def test_an_interrupted_run_is_visible_even_when_no_step_failed(tmp_path):
+    """A run killed before any step finished (or one whose steps were reset)
+    leaves nothing for the outcome notice to attach to — every row reads
+    `pending` and the panel would say nothing at all about why work stopped.
+    That silence is the exact complaint the run-lifecycle FSM addresses, so
+    the notice falls back to the END of the rail (still at the end, never
+    hoisted back into the header)."""
+    html = studio._HTML
+    assert "const tailNotice=failed?'':lastRunNoticeHtml(taskId);" in html
+    # …and it renders inside the rail, after the step rows.
+    assert "'<div class=\"empty\">Waiting for the first step…</div>')}${tailNotice}</div>" in html
