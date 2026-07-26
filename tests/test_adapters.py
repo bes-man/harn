@@ -540,3 +540,66 @@ def test_the_base_adapter_admits_it_does_not_know_a_login():
         def run_turn(self, prompt, cwd, timeout=1800, **kw):
             raise NotImplementedError
     assert Bare().login_command() is None
+
+
+# --- logout + per-agent auth, verified against the real CLIs --------------- #
+# Every command below was confirmed by running the CLI's own --help on a
+# machine that has them installed — not guessed from convention.
+
+def _stub(monkeypatch, cls, stdout="", stderr=""):
+    from harn.adapters import base as base_mod
+    monkeypatch.setattr(base_mod, "resolve_binary", lambda b: f"/fake/{b}")
+    monkeypatch.setattr(cls, "_exec",
+                        lambda self, argv, cwd, timeout=10:
+                            base_mod._Exec(ok=True, stdout=stdout, stderr=stderr))
+    return cls()
+
+
+def test_claude_logout_command():
+    from harn.adapters.claude import ClaudeAdapter
+    from harn.adapters import base as base_mod
+    import unittest.mock as mock
+    with mock.patch.object(base_mod, "resolve_binary", lambda b: "/fake/claude"):
+        assert ClaudeAdapter().logout_command() == ["/fake/claude", "auth", "logout"]
+
+
+def test_codex_reads_its_status_from_stderr(monkeypatch):
+    """Verified live: `codex login status` writes its verdict to STDERR and
+    leaves stdout empty. Reading only stdout reported a signed-in CLI as
+    "unknown"."""
+    from harn.adapters.codex import CodexAdapter
+    a = _stub(monkeypatch, CodexAdapter, stdout="", stderr="Logged in using ChatGPT\n")
+    assert a.auth_status() == ("ok", "Logged in using ChatGPT")
+
+
+def test_codex_reports_a_signed_out_cli(monkeypatch):
+    from harn.adapters.codex import CodexAdapter
+    a = _stub(monkeypatch, CodexAdapter, stderr="Not logged in\n")
+    state, _ = a.auth_status()
+    assert state == "expired"
+
+
+def test_cursor_reports_the_signed_in_account(monkeypatch):
+    """This CLI names the account, which is worth surfacing when several are
+    in play."""
+    from harn.adapters.cursor import CursorAdapter
+    a = _stub(monkeypatch, CursorAdapter,
+              stdout=json.dumps({"isAuthenticated": True,
+                                 "userInfo": {"email": "me@example.com"}}))
+    assert a.auth_status() == ("ok", "me@example.com")
+
+
+def test_cursor_reports_a_signed_out_cli(monkeypatch):
+    from harn.adapters.cursor import CursorAdapter
+    a = _stub(monkeypatch, CursorAdapter, stdout=json.dumps({"isAuthenticated": False}))
+    assert a.auth_status()[0] == "expired"
+
+
+def test_an_agent_with_no_known_auth_commands_says_so():
+    """qwen's CLI reports its auth subcommand as removed, so harn must not
+    invent one — Settings shows "no login command known" rather than a button
+    that can't work."""
+    from harn.adapters.qwen import QwenAdapter
+    a = QwenAdapter()
+    assert a.login_command() is None and a.logout_command() is None
+    assert a.auth_status() == ("unknown", "")

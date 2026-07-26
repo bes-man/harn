@@ -27,6 +27,34 @@ class CodexAdapter(Adapter):
     EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
     TEMPERATURE_FLAG = None
 
+    def login_command(self) -> list[str] | None:
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "login"] if binary else None
+
+    def logout_command(self) -> list[str] | None:
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "logout"] if binary else None
+
+    def auth_status(self) -> tuple[str, str]:
+        """`codex login status` — text only (no --json on this CLI), so this
+        reads its one-line verdict, e.g. "Logged in using ChatGPT"."""
+        binary = base_mod.resolve_binary(self.binary)
+        if not binary:
+            return ("unknown", "")
+        result = self._exec([binary, "login", "status"], Path.cwd(), timeout=15)
+        # This CLI prints its verdict on STDERR, not stdout (verified live:
+        # stdout came back empty while stderr held "Logged in using ChatGPT").
+        # Read both so a future build that switches streams still works.
+        blob = ((result.stdout or "") + (result.stderr or "")).strip()
+        lines = [ln for ln in blob.splitlines() if ln.strip()]
+        first = lines[0].strip() if lines else ""
+        low = first.lower()
+        if low.startswith("logged in"):
+            return ("ok", first)
+        if "not logged in" in low or "logged out" in low:
+            return ("expired", f"the {self.name} CLI is not signed in")
+        return ("unknown", "")
+
     def discover_models(self) -> tuple[str, ...]:
         """Read the catalog authorized for the CLI's current account."""
         result = self._exec([self.binary, "debug", "models"], Path.cwd(), timeout=10)

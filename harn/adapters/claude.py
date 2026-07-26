@@ -66,6 +66,10 @@ class ClaudeAdapter(Adapter):
         binary = base_mod.resolve_binary(self.binary)
         return [binary, "setup-token"] if binary else None
 
+    def logout_command(self) -> list[str] | None:
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "auth", "logout"] if binary else None
+
     def auth_status(self) -> tuple[str, str]:
         """Ask the CLI itself whether it is signed in — free and definitive.
 

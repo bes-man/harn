@@ -279,6 +279,48 @@ def cmd_login(args) -> int:
     return 1
 
 
+def cmd_logout(args) -> int:
+    """Sign the coding agent's CLI out.
+
+    Unlike login this runs unattended, but harn only ever does it on an
+    explicit request: signing a CLI out affects everything on the machine
+    using it, not just harn.
+    """
+    import subprocess
+    from .adapters import get_adapter
+    from .config import Config
+
+    name = (getattr(args, "agent", "") or "").strip()
+    if not name:
+        env_dir = _env_dir(Path(args.path).resolve())
+        name = Config.load(env_dir).agent if env_dir.exists() else "claude"
+    try:
+        adapter = get_adapter(name)
+    except Exception as exc:
+        print(f"[harn] unknown agent {name!r}: {exc}", file=sys.stderr)
+        return 2
+
+    argv = adapter.logout_command()
+    if not argv:
+        print(f"[harn] harn doesn't know how to sign '{name}' out — "
+              "check that agent's own docs.", file=sys.stderr)
+        return 1
+    print(f"[harn] signing out '{name}': {' '.join(argv)}")
+    try:
+        rc = subprocess.run(argv).returncode
+    except OSError as exc:
+        print(f"[harn] could not run the logout: {exc}", file=sys.stderr)
+        return 1
+    state, detail = adapter.auth_status()
+    if state == "ok":
+        # Don't report a logout the CLI itself contradicts.
+        print(f"[harn] '{name}' still reports being signed in"
+              + (f" ({detail})" if detail else ""), file=sys.stderr)
+        return 1
+    print(f"[harn] '{name}' is signed out.")
+    return rc
+
+
 def cmd_update(args) -> int:
     """Update the harn package from GitHub. Never touches any harn_env/.
 
@@ -715,6 +757,11 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--agent", default="", help="which agent CLI (default: this project's)")
     lg.add_argument("--force", action="store_true", help="re-run even if already signed in")
     lg.set_defaults(func=cmd_login)
+
+    lo = sub.add_parser("logout", help="sign the coding agent's CLI out")
+    lo.add_argument("path", nargs="?", default=".")
+    lo.add_argument("--agent", default="", help="which agent CLI (default: this project's)")
+    lo.set_defaults(func=cmd_logout)
 
     up = sub.add_parser("update", help="update harn from GitHub (keeps harn_env)")
     up.add_argument("--ref", default="", help="branch/tag to install (default: main)")

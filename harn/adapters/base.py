@@ -168,6 +168,16 @@ class Adapter:
         """
         return None
 
+    def logout_command(self) -> list[str] | None:
+        """The argv that signs this CLI out, or None if harn doesn't know one.
+
+        Unlike login this one CAN run unattended — but harn still only ever
+        runs it on an explicit human action, never as cleanup: signing a CLI
+        out is destructive to every other thing on the machine using it, not
+        just harn.
+        """
+        return None
+
     def auth_status(self) -> tuple[str, str]:
         """Whether this CLI is signed in, WITHOUT spending a turn.
 

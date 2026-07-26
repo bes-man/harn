@@ -1092,3 +1092,64 @@ def test_studio_offers_sign_in_instead_of_restart_on_an_auth_block():
     assert "AGENT_AUTH&&AGENT_AUTH.state==='expired'&&AGENT_AUTH.can_login" in html
     assert 'onclick="agentLogin()"' in html
     assert "async function pollAgentAuth()" in html
+
+
+def test_agents_auth_payload_lists_every_agent_with_install_and_sign_in_state(tmp_path, monkeypatch):
+    """Settings needs to sign in to ANY locally installed agent, not just the
+    project's current one. "not installed" and "installed but signed out" are
+    kept distinct: collapsing them would send someone hunting for a login
+    that can't exist."""
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _Installed:
+        def available(self): return True
+        def auth_status(self): return ("ok", "me@example.com")
+        def login_command(self): return ["x", "login"]
+        def logout_command(self): return ["x", "logout"]
+
+    class _Missing:
+        def available(self): return False
+        def auth_status(self): return ("unknown", "")
+        def login_command(self): return None
+        def logout_command(self): return None
+
+    monkeypatch.setattr("harn.adapters._REGISTRY", {"here": _Installed, "gone": _Missing})
+    monkeypatch.setattr("harn.adapters.get_adapter",
+                        lambda n: (_Installed if n == "here" else _Missing)())
+
+    rows = {r["agent"]: r for r in studio.agents_auth_payload(env)["agents"]}
+    assert rows["here"]["installed"] is True and rows["here"]["state"] == "ok"
+    assert rows["here"]["can_logout"] is True
+    assert rows["gone"]["installed"] is False
+    assert rows["gone"]["can_login"] is False
+
+
+def test_logout_refuses_to_claim_a_logout_the_cli_denies(tmp_path, monkeypatch):
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _A:
+        def auth_status(self): return ("ok", "still here")   # logout didn't take
+        def logout_command(self): return ["/fake/x", "logout"]
+    monkeypatch.setattr("harn.adapters.get_adapter", lambda n: _A())
+    monkeypatch.setattr(studio.subprocess, "run", lambda *a, **k: None)
+
+    r = studio.agent_logout_payload(env, {"agent": "x"})
+    assert r["ok"] is False and "still reports being signed in" in r["error"]
+
+
+def test_login_can_target_any_agent_not_just_the_projects_own(tmp_path, monkeypatch):
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _A:
+        name = "codex"
+        def auth_status(self): return ("expired", "")
+        def login_command(self): return ["/fake/codex", "login"]
+    monkeypatch.setattr("harn.adapters.get_adapter", lambda n: _A())
+    monkeypatch.setattr(studio, "_terminal_launcher", lambda cmd: ["echo", cmd])
+    monkeypatch.setattr(studio.subprocess, "Popen", lambda argv, **kw: None)
+
+    r = studio.agent_login_payload(env, {"agent": "codex"})
+    assert "--agent codex" in r["command"]

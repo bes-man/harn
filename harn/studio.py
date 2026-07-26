@@ -58,7 +58,7 @@ _PROTECTED_ROUTES = {
     "/api/agents/save", "/api/agents/delete",
     "/api/tasks/launch", "/api/tasks/launch_workflow", "/api/tasks/run_stage",
     "/api/tasks/run_step", "/api/tasks/rerun_workflow", "/api/tasks/status",
-    "/api/tools/chat", "/api/agent/login",
+    "/api/tools/chat", "/api/agent/login", "/api/agent/logout",
 }
 # "localhost" never actually appears in client_address[0] (BaseHTTPServer hands
 # back the numeric peer IP, not a resolved hostname) — kept here as
@@ -1681,6 +1681,8 @@ def _make_handler(default_env: Path):
                 self._json(mcp_health_payload(env))
             elif route == "/api/agent/auth":
                 self._json(agent_auth_payload(env))
+            elif route == "/api/agents/auth":
+                self._json(agents_auth_payload(env))
             elif route == "/api/task_plan":
                 self._json(task_plan_payload(env, self._query("task") or ""))
             elif route == "/api/task_plan/step_prompt":
@@ -1832,7 +1834,9 @@ def _make_handler(default_env: Path):
             elif route == "/api/mcp/restart":
                 self._json(restart_mcp_payload(env))
             elif route == "/api/agent/login":
-                self._json(agent_login_payload(env))
+                self._json(agent_login_payload(env, body))
+            elif route == "/api/agent/logout":
+                self._json(agent_logout_payload(env, body))
             elif route == "/api/task_plan/step_prompt/export":
                 self._json(step_prompt_export_payload(
                     env, body.get("task", ""), body.get("step", ""),
@@ -1877,6 +1881,65 @@ def agent_auth_payload(env_dir: Path) -> dict:
     return {"agent": name, "state": state, "detail": detail, "can_login": can_login}
 
 
+def agents_auth_payload(env_dir: Path) -> dict:
+    """Every agent harn knows, with whether it's installed here and signed in
+    (`GET /api/agents/auth`) — what Settings needs to sign in to any locally
+    installed agent, not just the project's current one.
+
+    Not-installed agents are reported too, but flagged: "you don't have this"
+    and "you have it but aren't signed in" are different problems, and
+    collapsing them would send someone hunting for a login that can't exist.
+    """
+    from .adapters import _REGISTRY, get_adapter
+    current = Config.load(env_dir).agent
+    out = []
+    for name in sorted(_REGISTRY):
+        row = {"agent": name, "current": name == current, "installed": False,
+               "state": "unknown", "detail": "", "can_login": False,
+               "can_logout": False}
+        try:
+            adapter = get_adapter(name)
+            row["installed"] = bool(adapter.available())
+            if row["installed"]:
+                row["state"], row["detail"] = adapter.auth_status()
+                row["can_login"] = bool(adapter.login_command())
+                row["can_logout"] = bool(adapter.logout_command())
+        except Exception:
+            pass          # a badly-behaved adapter must not blank the list
+        out.append(row)
+    return {"agents": out, "current": current}
+
+
+def agent_logout_payload(env_dir: Path, body: dict) -> dict:
+    """Sign an agent CLI out (`POST /api/agent/logout`).
+
+    Runs unattended (unlike login, which needs a browser), but only ever on
+    an explicit click: signing a CLI out affects everything on the machine
+    using it, not just harn.
+    """
+    from .adapters import get_adapter
+    name = (body.get("agent") or "").strip() or Config.load(env_dir).agent
+    try:
+        adapter = get_adapter(name)
+    except Exception as exc:
+        return {"ok": False, "error": f"unknown agent {name!r}: {exc}"}
+    argv = adapter.logout_command()
+    if not argv:
+        return {"ok": False,
+                "error": f"harn doesn't know how to sign '{name}' out"}
+    try:
+        subprocess.run(argv, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": f"logout failed: {exc}"}
+    state, detail = adapter.auth_status()
+    if state == "ok":
+        # Never claim a logout the CLI itself contradicts.
+        return {"ok": False,
+                "error": f"'{name}' still reports being signed in"
+                         + (f" ({detail})" if detail else "")}
+    return {"ok": True, "agent": name, "state": state}
+
+
 def _terminal_launcher(command: str) -> list[str] | None:
     """A terminal emulator that will run `command` in its own window.
 
@@ -1898,15 +1961,18 @@ def _terminal_launcher(command: str) -> list[str] | None:
     return None
 
 
-def agent_login_payload(env_dir: Path) -> dict:
-    """Start the agent CLI's login in a terminal (`POST /api/agent/login`).
+def agent_login_payload(env_dir: Path, body: dict | None = None) -> dict:
+    """Start an agent CLI's login in a terminal (`POST /api/agent/login`).
+
+    `agent` in the body picks which one, so Settings can sign in to any
+    locally installed agent, not just the project's current one.
 
     harn deliberately does NOT try to complete the login: it's an OAuth flow
     needing the account holder's approval in a browser, and harn never sees
     or stores a token — the CLI writes to its own credential store. This just
     removes the "open a terminal, remember the command" step.
     """
-    name = Config.load(env_dir).agent
+    name = ((body or {}).get("agent") or "").strip() or Config.load(env_dir).agent
     from .adapters import get_adapter
     try:
         adapter = get_adapter(name)
@@ -1916,7 +1982,8 @@ def agent_login_payload(env_dir: Path) -> dict:
         return {"ok": False,
                 "error": f"harn doesn't know how to sign '{name}' in — "
                          "check that agent's own docs for its login command"}
-    command = f"cd {shlex.quote(str(env_dir.parent))} && harn login"
+    command = (f"cd {shlex.quote(str(env_dir.parent))} && "
+               f"harn login --agent {shlex.quote(name)}")
     launcher = _terminal_launcher(command)
     if launcher is None:
         # Still useful: tell the human exactly what to run rather than
@@ -2789,8 +2856,9 @@ async function pollAgentAuth(){
   // button disappears the moment the CLI reports being signed in again.
   if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
 }
-async function agentLogin(){
-  let r; try{ r=await post_('/api/agent/login',{}); }catch(e){ r={ok:false,error:String(e)}; }
+async function agentLogin(agent){
+  let r; try{ r=await post_('/api/agent/login',agent?{agent}:{}); }
+  catch(e){ r={ok:false,error:String(e)}; }
   if(!r.ok){ alert(r.error||'could not start the login'); await pollAgentAuth(); return; }
   // The login is an interactive OAuth flow in a real terminal — Studio can't
   // host it, and must not pretend it finished. Say what happens next.
@@ -2804,6 +2872,7 @@ async function agentLogin(){
       'Terminal — approve it, then click Sign in again.'
     : (r.hint||'run this yourself')+':\n\n'+r.command);
   await pollAgentAuth();
+  if($('#agentAuthRows')) await renderAgentAuthRows();
 }
 async function restartMcp(){
   const b=$('#mcpBadge'); if(b) b.textContent='MCP … restarting';
@@ -4894,6 +4963,41 @@ function showTab(t){
 }
 
 /* ---------- settings tab: default agent + model for harn run ---------- */
+// Sign-in state for EVERY agent harn knows, not just the project's current
+// one — you may want to sign a second CLI in before switching to it. Shells
+// out per agent, so it's fetched on demand (opening Settings), never polled.
+async function renderAgentAuthRows(){
+  const box=$('#agentAuthRows'); if(!box) return;
+  let data; try{ data=await (await fetch(api('/api/agents/auth'))).json(); }
+  catch(e){ box.textContent='could not read agent sign-in state'; return; }
+  box.innerHTML=(data.agents||[]).map(a=>{
+    // "not installed" and "installed but signed out" are different problems;
+    // collapsing them would send someone hunting for a login that can't exist.
+    const badge=!a.installed ? `<span class="mut">not installed</span>`
+      : a.state==='ok' ? `<span style="color:var(--accent2)">● signed in</span>`
+      : a.state==='expired' ? `<span style="color:var(--danger)">○ signed out</span>`
+      : `<span class="mut">— unknown</span>`;
+    const detail=a.detail?` <span class="mut">${esc(a.detail)}</span>`:'';
+    const actions=!a.installed ? ''
+      : (a.state==='ok'
+          ? (a.can_logout?`<button class="ghost" onclick="agentLogout('${esc(a.agent)}')">Sign out</button>`:'')
+          : (a.can_login?`<button class="primary" onclick="agentLogin('${esc(a.agent)}')">Sign in</button>`:
+             `<span class="mut">no login command known</span>`));
+    return `<div class="row" style="justify-content:space-between;align-items:center;`+
+      `padding:7px 0;border-bottom:1px solid var(--line)">`+
+      `<div><b>${esc(a.agent)}</b>${a.current?' <span class="mut">(this project)</span>':''}`+
+      `<div style="margin-top:2px">${badge}${detail}</div></div>`+
+      `<div class="row" style="gap:6px">${actions}</div></div>`;
+  }).join('')||'<div class="mut">no agents registered</div>';
+}
+async function agentLogout(agent){
+  if(!confirm(`Sign ${agent} out?\n\nThis affects everything on this machine `+
+              `using that CLI, not just harn.`)) return;
+  const r=await post_('/api/agent/logout',{agent});
+  if(!r.ok) alert(r.error||'logout failed');
+  await renderAgentAuthRows();
+  await pollAgentAuth();
+}
 async function renderSettings(){
   await ensureModelsLoaded();
   let LM_SETTINGS={}; try{ LM_SETTINGS=await (await fetch(api('/api/settings'))).json(); }catch(e){}
@@ -4928,6 +5032,13 @@ async function renderSettings(){
       agent and model are whatever your IDE session uses — harn can't switch
       them. These defaults govern <b>harn run</b> only.
     </p>
+    <h2 style="margin-top:26px">SETTINGS — agent sign-in</h2>
+    <p class="mut" style="font-size:11px;line-height:1.6;margin:2px 0 8px">
+      harn runs each agent as a subprocess, so the <b>CLI itself</b> must be
+      signed in — a signed-in desktop app doesn't cover it. Sign in opens a
+      terminal (the flow is interactive and needs one); harn never sees the
+      token.</p>
+    <div id="agentAuthRows" class="mut" style="font-size:12px">loading…</div>
     <h2 style="margin-top:26px">SETTINGS — loop &amp; safety</h2>
     <div id="loopSafetyFields"></div>
     <h2 style="margin-top:26px">SETTINGS — decisions &amp; Telegram</h2>
@@ -4942,6 +5053,7 @@ async function renderSettings(){
     <div id="mcpFields"></div>
   </div>`;
   $('#insp').innerHTML='<div class="empty">harn run defaults. Per-stage overrides live on each Flow step.</div>';
+  renderAgentAuthRows();
   const numField=(id,label,val,hint)=>`<div class="field"><label>${label} <span class="mut">${hint}</span></label>`+
     `<input type="number" id="${id}" value="${(val===undefined||val===null)?'':val}" min="0" step="any"/></div>`;
   $('#loopSafetyFields').innerHTML=

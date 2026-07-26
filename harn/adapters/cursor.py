@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+from . import base as base_mod
 from .base import Adapter, AgentResult, EventCallback
 
 
@@ -22,6 +23,34 @@ class CursorAdapter(Adapter):
     # syntax (e.g. a short `-m` form).
     MODELS = ("auto", "gpt-5.3-codex", "composer-2.5", "claude-sonnet-5-medium",
               "gemini-3.1-pro")
+
+    def login_command(self) -> list[str] | None:
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "login"] if binary else None
+
+    def logout_command(self) -> list[str] | None:
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "logout"] if binary else None
+
+    def auth_status(self) -> tuple[str, str]:
+        """`cursor-agent status --format json` — this CLI reports the signed-in
+        account, so the detail names it (useful when several are in play)."""
+        import json as _json
+        binary = base_mod.resolve_binary(self.binary)
+        if not binary:
+            return ("unknown", "")
+        result = self._exec([binary, "status", "--format", "json"],
+                            Path.cwd(), timeout=15)
+        try:
+            data = _json.loads((result.stdout or "").strip())
+        except (ValueError, AttributeError):
+            return ("unknown", "")
+        if not isinstance(data, dict) or "isAuthenticated" not in data:
+            return ("unknown", "")
+        if data.get("isAuthenticated"):
+            email = (data.get("userInfo") or {}).get("email") or ""
+            return ("ok", email)
+        return ("expired", f"the {self.name} CLI is not signed in")
 
     def discover_models(self) -> tuple[str, ...]:
         """Ask the authenticated Cursor CLI for this account's live catalog."""
