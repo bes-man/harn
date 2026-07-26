@@ -422,61 +422,65 @@ def test_non_assistant_non_user_record_yields_no_events():
 # --- cheap auth preflight -------------------------------------------------- #
 # Diagnosed live: a machine where the Claude DESKTOP app worked fine (it
 # refreshes its token in-process and never writes it out) while every
-# `claude -p` subprocess failed, because the on-disk credential store had
-# been expired for days. "Claude works in my console" and "harn can run
-# Claude" are genuinely different questions; only the CLI's own store
+# `claude -p` subprocess failed, because the CLI itself was logged out.
+# "Claude works in my console" and "harn can run Claude" are genuinely
+# different questions; harn always shells out, so only the CLI's own state
 # answers the second, and asking it costs nothing.
 
-def _creds(tmp_path, expires_at_ms):
-    import json
-    (tmp_path / ".credentials.json").write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "x", "refreshToken": "y",
-                                      "expiresAt": expires_at_ms}}),
-        encoding="utf-8")
-    return tmp_path
-
-
-def test_claude_auth_status_reports_a_live_session(tmp_path, monkeypatch):
-    import time
+def _auth_json(monkeypatch, payload, *, stdout=None):
+    """Stub the CLI's own `auth status --json` answer."""
     from harn.adapters.claude import ClaudeAdapter
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
-                       str(_creds(tmp_path, (time.time() + 3600) * 1000)))
-    assert ClaudeAdapter().auth_status() == ("ok", "")
+    from harn.adapters import base as base_mod
+    monkeypatch.setattr(base_mod, "resolve_binary", lambda b: "/fake/claude")
+    text = stdout if stdout is not None else json.dumps(payload)
+    monkeypatch.setattr(ClaudeAdapter, "_exec",
+                        lambda self, argv, cwd, timeout=10:
+                            base_mod._Exec(ok=True, stdout=text, stderr=""))
+    return ClaudeAdapter()
 
 
-def test_claude_auth_status_reports_an_expired_session_with_its_age(tmp_path, monkeypatch):
-    import time
-    from harn.adapters.claude import ClaudeAdapter
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
-                       str(_creds(tmp_path, (time.time() - 3 * 86400) * 1000)))
-    state, detail = ClaudeAdapter().auth_status()
+def test_claude_auth_status_reports_a_live_session(monkeypatch):
+    a = _auth_json(monkeypatch, {"loggedIn": True, "authMethod": "subscription"})
+    assert a.auth_status() == ("ok", "subscription")
+
+
+def test_claude_auth_status_reports_a_logged_out_cli(monkeypatch):
+    a = _auth_json(monkeypatch, {"loggedIn": False, "authMethod": "none"})
+    state, detail = a.auth_status()
     assert state == "expired"
-    assert "3d ago" in detail
+    assert "not signed in" in detail
 
 
-def test_a_missing_credential_store_is_unknown_not_expired(tmp_path, monkeypatch):
-    """No store is NOT proof of trouble — the CLI may keep credentials
-    elsewhere on this platform. Crying wolf on a working setup would make
-    the check worse than useless."""
+def test_an_older_cli_without_the_subcommand_is_unknown_not_expired(monkeypatch):
+    """Unparseable output is NOT proof of trouble — an older CLI simply may
+    not have `auth status`. Crying wolf on a working setup would make the
+    check worse than useless."""
+    a = _auth_json(monkeypatch, None, stdout="error: unknown command 'auth'")
+    assert a.auth_status() == ("unknown", "")
+
+
+def test_a_missing_binary_is_unknown(monkeypatch):
     from harn.adapters.claude import ClaudeAdapter
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nope"))
+    from harn.adapters import base as base_mod
+    monkeypatch.setattr(base_mod, "resolve_binary", lambda b: None)
     assert ClaudeAdapter().auth_status() == ("unknown", "")
 
 
-def test_auth_status_never_reads_the_tokens_themselves(tmp_path, monkeypatch):
-    """The check exists to read ONE timestamp. It must never surface token
-    material in the detail string it hands to logs and the UI."""
-    import time
+def test_auth_status_asks_the_cli_rather_than_parsing_its_credential_file(monkeypatch):
+    """`claude setup-token` stores a long-lived subscription token in a
+    different shape than an interactive login, so hand-parsing
+    ~/.claude/.credentials.json would report a perfectly good setup-token
+    login as broken. Ask the CLI instead."""
+    seen = {}
     from harn.adapters.claude import ClaudeAdapter
-    import json
-    (tmp_path / ".credentials.json").write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "SECRET-ACCESS",
-                                      "refreshToken": "SECRET-REFRESH",
-                                      "expiresAt": (time.time() - 60) * 1000}}),
-        encoding="utf-8")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    _, detail = ClaudeAdapter().auth_status()
-    assert "SECRET" not in detail
+    from harn.adapters import base as base_mod
+    monkeypatch.setattr(base_mod, "resolve_binary", lambda b: "/fake/claude")
+    def fake_exec(self, argv, cwd, timeout=10):
+        seen["argv"] = argv
+        return base_mod._Exec(ok=True, stdout=json.dumps({"loggedIn": True}), stderr="")
+    monkeypatch.setattr(ClaudeAdapter, "_exec", fake_exec)
+    ClaudeAdapter().auth_status()
+    assert seen["argv"][1:] == ["auth", "status", "--json"]
 
 
 def test_the_base_adapter_answers_unknown_rather_than_guessing():

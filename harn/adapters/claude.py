@@ -53,44 +53,43 @@ class ClaudeAdapter(Adapter):
     TEMPERATURES = ()     # no sampling temperature exposed (see above)
 
     def auth_status(self) -> tuple[str, str]:
-        """Read the CLI's own credential store to answer "is it signed in?"
-        for free — no turn, no tokens.
+        """Ask the CLI itself whether it is signed in — free and definitive.
 
-        Worth the coupling to a Claude-specific file: without it the only way
-        to find out is to launch a run and watch it die, which is exactly the
-        failure this exists to pre-empt. Diagnosed live — a machine where the
-        Claude DESKTOP app worked fine (it refreshes its token in-process and
-        never writes it out) while every `claude -p` subprocess failed,
-        because the on-disk store had been expired for days. "Claude works in
-        my console" and "harn can run Claude" are genuinely different
-        questions, and only this file answers the second one.
+        `claude auth status --json` is the CLI's own answer (~0.3s, no turn,
+        no tokens), so it stays correct across every auth method the CLI
+        supports. That matters concretely: `claude setup-token` stores a
+        long-lived subscription token in a different shape than an
+        interactive login, and an earlier version of this check that parsed
+        ~/.claude/.credentials.json by hand would have reported a perfectly
+        good setup-token login as "unknown".
 
-        Never reads the tokens themselves — only the expiry timestamp.
+        Why check at all: diagnosed live on a machine where the Claude
+        DESKTOP app worked fine — it refreshes its token in-process and never
+        writes it out — while every `claude -p` subprocess failed, because
+        the CLI itself was logged out. "Claude works in my console" and
+        "harn can run Claude" are genuinely different questions; harn always
+        shells out, so only the CLI's own state answers the second. Without
+        this the only way to find out is to launch a run and watch it die.
         """
         import json as _json
-        import os as _os
-        import time as _time
-        cfg = _os.environ.get("CLAUDE_CONFIG_DIR") or _os.path.expanduser("~/.claude")
-        path = Path(cfg) / ".credentials.json"
+        binary = base_mod.resolve_binary(self.binary)
+        if not binary:
+            return ("unknown", "")
+        result = self._exec([binary, "auth", "status", "--json"],
+                            Path.cwd(), timeout=15)
         try:
-            data = _json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # No store (or unreadable) is NOT proof of trouble: the CLI may
-            # keep credentials elsewhere on this platform. Say "unknown"
-            # rather than crying wolf on a working setup.
+            data = _json.loads(result.stdout.strip())
+        except (ValueError, AttributeError):
+            # An older CLI without the subcommand, or unparseable output.
+            # "unknown" rather than crying wolf on a working setup.
             return ("unknown", "")
-        oauth = data.get("claudeAiOauth")
-        if not isinstance(oauth, dict) or not oauth.get("expiresAt"):
+        if not isinstance(data, dict) or "loggedIn" not in data:
             return ("unknown", "")
-        try:
-            expires_at = float(oauth["expiresAt"]) / 1000.0    # ms since epoch
-        except (TypeError, ValueError):
-            return ("unknown", "")
-        if expires_at > _time.time():
-            return ("ok", "")
-        stale_days = int((_time.time() - expires_at) // 86400)
-        ago = f"{stale_days}d ago" if stale_days >= 1 else "recently"
-        return ("expired", f"the {self.name} CLI's saved session expired {ago}")
+        if data.get("loggedIn"):
+            return ("ok", str(data.get("authMethod") or ""))
+        return ("expired",
+                f"the {self.name} CLI is not signed in "
+                f"(auth status: {data.get('authMethod') or 'none'})")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,
