@@ -19,6 +19,8 @@ import math
 import mimetypes
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -56,7 +58,7 @@ _PROTECTED_ROUTES = {
     "/api/agents/save", "/api/agents/delete",
     "/api/tasks/launch", "/api/tasks/launch_workflow", "/api/tasks/run_stage",
     "/api/tasks/run_step", "/api/tasks/rerun_workflow", "/api/tasks/status",
-    "/api/tools/chat",
+    "/api/tools/chat", "/api/agent/login",
 }
 # "localhost" never actually appears in client_address[0] (BaseHTTPServer hands
 # back the numeric peer IP, not a resolved hostname) — kept here as
@@ -1677,6 +1679,8 @@ def _make_handler(default_env: Path):
                 self._json(models_payload(env))
             elif route == "/api/mcp/health":
                 self._json(mcp_health_payload(env))
+            elif route == "/api/agent/auth":
+                self._json(agent_auth_payload(env))
             elif route == "/api/task_plan":
                 self._json(task_plan_payload(env, self._query("task") or ""))
             elif route == "/api/task_plan/step_prompt":
@@ -1827,6 +1831,8 @@ def _make_handler(default_env: Path):
                 self._json(save_loop_mcp_settings(env, body))
             elif route == "/api/mcp/restart":
                 self._json(restart_mcp_payload(env))
+            elif route == "/api/agent/login":
+                self._json(agent_login_payload(env))
             elif route == "/api/task_plan/step_prompt/export":
                 self._json(step_prompt_export_payload(
                     env, body.get("task", ""), body.get("step", ""),
@@ -1847,6 +1853,84 @@ def _make_handler(default_env: Path):
 # polls in between return the last result instantly.
 _mcp_health_cache: dict = {}          # env-path -> (monotonic_ts, payload)
 _MCP_HEALTH_TTL = 8.0
+
+
+def agent_auth_payload(env_dir: Path) -> dict:
+    """Is the coding agent's CLI signed in? (`GET /api/agent/auth`)
+
+    Surfaced in Studio because the failure is otherwise invisible until a run
+    dies: harn shells out to the CLI for every turn, so the CLI needs its OWN
+    login — a signed-in desktop app doesn't cover it. Cheap enough to poll
+    (the adapter answers by asking the CLI, no turn and no tokens).
+    """
+    name = Config.load(env_dir).agent
+    from .adapters import get_adapter
+    try:
+        adapter = get_adapter(name)
+    except Exception:
+        return {"agent": name, "state": "unknown", "detail": "", "can_login": False}
+    try:
+        state, detail = adapter.auth_status()
+        can_login = bool(adapter.login_command())
+    except Exception:
+        return {"agent": name, "state": "unknown", "detail": "", "can_login": False}
+    return {"agent": name, "state": state, "detail": detail, "can_login": can_login}
+
+
+def _terminal_launcher(command: str) -> list[str] | None:
+    """A terminal emulator that will run `command` in its own window.
+
+    The agent CLI's login is a full-screen interactive TUI (verified: under a
+    PTY it renders nothing a web page could usefully proxy, and with stdin
+    closed it just blocks). So Studio can't host the flow itself — it hands
+    it to a real terminal, which is what the flow needs, and the human
+    finishes in the browser as usual.
+    """
+    if sys.platform == "darwin":
+        return ["osascript", "-e",
+                f'tell application "Terminal" to do script "{command}"',
+                "-e", 'tell application "Terminal" to activate']
+    for term, args in (("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]),
+                       ("konsole", ["-e"]), ("xfce4-terminal", ["-e"]),
+                       ("xterm", ["-e"])):
+        if shutil.which(term):
+            return [term, *args, "bash", "-lc", f"{command}; exec bash"]
+    return None
+
+
+def agent_login_payload(env_dir: Path) -> dict:
+    """Start the agent CLI's login in a terminal (`POST /api/agent/login`).
+
+    harn deliberately does NOT try to complete the login: it's an OAuth flow
+    needing the account holder's approval in a browser, and harn never sees
+    or stores a token — the CLI writes to its own credential store. This just
+    removes the "open a terminal, remember the command" step.
+    """
+    name = Config.load(env_dir).agent
+    from .adapters import get_adapter
+    try:
+        adapter = get_adapter(name)
+    except Exception as exc:
+        return {"ok": False, "error": f"unknown agent {name!r}: {exc}"}
+    if not adapter.login_command():
+        return {"ok": False,
+                "error": f"harn doesn't know how to sign '{name}' in — "
+                         "check that agent's own docs for its login command"}
+    command = f"cd {shlex.quote(str(env_dir.parent))} && harn login"
+    launcher = _terminal_launcher(command)
+    if launcher is None:
+        # Still useful: tell the human exactly what to run rather than
+        # pretending a headless box has a terminal to pop.
+        return {"ok": True, "launched": False, "command": command,
+                "hint": "no terminal emulator found — run this yourself"}
+    try:
+        subprocess.Popen(launcher, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        return {"ok": True, "launched": False, "command": command,
+                "hint": f"could not open a terminal ({exc}) — run this yourself"}
+    return {"ok": True, "launched": True, "command": command,
+            "hint": "complete the login in the terminal that just opened"}
 
 
 def mcp_health_payload(env_dir: Path, *, force: bool = False) -> dict:
@@ -2242,6 +2326,14 @@ _HTML = r"""<!DOCTYPE html>
   .mcpbadge.live{color:var(--accent2);border-color:#3ad6a055}
   .mcpbadge.stale{color:var(--warn);border-color:#e8b93a66}
   .mcpbadge.down{color:var(--danger);border-color:#ff6b6b66}
+  .auth-banner{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:60;
+    display:flex;align-items:center;gap:12px;max-width:min(720px,94vw);
+    padding:10px 14px;border-radius:10px;font-size:12.5px;line-height:1.45;
+    background:#3a1a1a;border:1px solid var(--danger);
+    box-shadow:0 8px 24px rgba(0,0,0,.45)}
+  .auth-banner b{display:block;font-size:12px;margin-bottom:2px}
+  .auth-banner .mut{font-size:11.5px}
+  .auth-banner button{white-space:nowrap}
   main{display:grid;grid-template-columns:1fr 6px var(--insp-w);height:calc(100vh - 53px)}
   main.full-width{grid-template-columns:1fr}
   main.full-width>.grip,main.full-width>.insp{display:none}
@@ -2483,6 +2575,12 @@ _HTML = r"""<!DOCTYPE html>
     <div id="insp"><div class="empty">Select a node to edit it.</div></div>
   </div>
 </main>
+<!-- Signed-out warning. A fixed banner rather than a header badge: the
+     header already overflows on a normal window (verified — the badge
+     rendered at x=1242 in a 1280px viewport, i.e. off-screen), and a
+     warning you can't see is worse than none. Fixed position also means it
+     shows on every tab without touching the grid layout. -->
+<div id="authBanner" class="auth-banner" style="display:none"></div>
 <div id="taskModal" class="modal-backdrop" style="display:none" onclick="if(event.target===this) closeTaskModal()">
   <div class="modal-panel" id="taskDetailPanel"></div>
 </div>
@@ -2643,7 +2741,11 @@ async function load(){
   // (see mcp_health_payload) is expensive, so it must NOT ride the 1.5s
   // progress/board tick that keeps the UI feeling live.
   setInterval(pollMcpHealth, 9000);
-  pollMcpHealth(); loadRunCaps();
+  // Same slow cadence: it shells out to the agent CLI, so it has no business
+  // on the 1.5s tick — but it must keep polling, since the whole point is
+  // noticing the moment a sign-in lands (or lapses) without a page reload.
+  setInterval(pollAgentAuth, 9000);
+  pollMcpHealth(); pollAgentAuth(); loadRunCaps();
 }
 // Loop/safety caps (max_cost_usd / max_tokens) — fetched for the run-banner
 // budget row. Refreshed on load and whenever Settings are saved; not polled
@@ -2662,6 +2764,46 @@ async function pollMcpHealth(){
   else if(h.stale){ b.className='mcpbadge stale'; b.textContent='MCP ▲ stale — Reload'; }
   else { b.className='mcpbadge live'; b.textContent=`MCP ● live · ${h.tools_count} tools`; }
   b.onclick=restartMcp;
+}
+// Whether the agent CLI is signed in. Shown in the header because the
+// failure is otherwise invisible until a run dies: harn shells out to the
+// CLI for every turn, so the CLI needs its OWN login — a signed-in desktop
+// app doesn't cover it. Only rendered when there's something to say; a
+// healthy setup stays quiet.
+let AGENT_AUTH=null;
+async function pollAgentAuth(){
+  let a; try{ a=await (await fetch(api('/api/agent/auth'))).json(); }catch(e){ return; }
+  AGENT_AUTH=a;
+  const b=$('#authBanner'); if(!b) return;
+  if(a.state==='expired'){
+    b.style.display='';
+    b.innerHTML=`<div><b>⚠ ${esc(a.agent)} is signed out — runs will fail</b>`+
+      `<div class="mut">harn runs ${esc(a.agent)} as a subprocess, so it needs its own `+
+      `login; a signed-in desktop app doesn't cover it.</div></div>`+
+      (a.can_login?`<button class="primary" onclick="agentLogin()">🔑 Sign in</button>`:'');
+  }else{
+    b.style.display='none';
+    b.innerHTML='';
+  }
+  // A step blocked on auth shows its own Sign in button; repaint it so the
+  // button disappears the moment the CLI reports being signed in again.
+  if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
+}
+async function agentLogin(){
+  let r; try{ r=await post_('/api/agent/login',{}); }catch(e){ r={ok:false,error:String(e)}; }
+  if(!r.ok){ alert(r.error||'could not start the login'); await pollAgentAuth(); return; }
+  // The login is an interactive OAuth flow in a real terminal — Studio can't
+  // host it, and must not pretend it finished. Say what happens next.
+  alert(r.launched
+    ? 'Complete the sign-in in the terminal that just opened.\n\n'+
+      'harn never sees the token. Blocked tasks resume on their own once '+
+      'the CLI reports being signed in.\n\n'+
+      // First use on macOS pops a TCC prompt; without warning it looks like
+      // the button silently did nothing.
+      'First time on macOS, the system may ask to allow controlling '+
+      'Terminal — approve it, then click Sign in again.'
+    : (r.hint||'run this yourself')+':\n\n'+r.command);
+  await pollAgentAuth();
 }
 async function restartMcp(){
   const b=$('#mcpBadge'); if(b) b.textContent='MCP … restarting';
@@ -3811,6 +3953,13 @@ function renderRunHistory(){
       `${isNext?' <span class="next-badge">next up</span>':''}</span>`+
       `<span class="run-step-state">${stamp?esc(stamp)+' · ':''}${esc(status)}${metric?' · '+esc(metric):''}</span></div>`+
       (pills?`<div class="run-step-usage">${pills}</div>`:'')+
+      // A step blocked because the CLI is signed out needs a sign-in, not a
+      // restart — restarting would just fail the same way. Offer the fix
+      // that actually applies, and only while the CLI still reports being
+      // signed out.
+      (status==='blocked'&&AGENT_AUTH&&AGENT_AUTH.state==='expired'&&AGENT_AUTH.can_login
+        ?`<div class="step-output"><button class="primary" onclick="agentLogin()">`+
+         `🔑 Sign ${esc(AGENT_AUTH.agent)} in</button></div>`:'')+
       (status==='blocked'?`<div class="step-output"><button class="ghost" onclick="rerunSidebarWorkflow()">↻ Restart flow from scratch</button></div>`:'')+
       `<details class="step-transcript" data-step-transcript="${esc(n.id)}" `+
         `ontoggle="rememberTranscriptOpen('${esc(n.id)}',this)" ${transcriptOpen?'open':''}>`+

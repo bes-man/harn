@@ -1013,3 +1013,82 @@ def test_closing_a_running_or_blocked_steps_transcript_stays_closed():
     fn = html[html.index("const status=runtimeStepStatus(n.id,normalized(r.status));"):
               html.index("const stamp=fmtEntryStamp(r.started);")]
     assert "const transcriptOpen=TRANSCRIPT_CLOSED_STEPS.has(n.id)?false:(" in fn
+
+
+# --- signing the agent CLI in from the UI ---------------------------------- #
+
+def test_agent_auth_payload_reports_a_signed_out_cli(tmp_path, monkeypatch):
+    """Surfaced in Studio because the failure is otherwise invisible until a
+    run dies: harn shells out to the CLI for every turn, so the CLI needs its
+    OWN login — a signed-in desktop app doesn't cover it."""
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _A:
+        name = "claude"
+        def auth_status(self): return ("expired", "not signed in")
+        def login_command(self): return ["/fake/claude", "setup-token"]
+    monkeypatch.setattr("harn.adapters.get_adapter", lambda n: _A())
+
+    p = studio.agent_auth_payload(env)
+    assert p["state"] == "expired" and p["can_login"] is True
+
+
+def test_agent_auth_payload_never_raises_on_an_unknown_agent(tmp_path, monkeypatch):
+    """A header badge must not be able to take the page down."""
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+    monkeypatch.setattr("harn.adapters.get_adapter",
+                        lambda n: (_ for _ in ()).throw(ValueError("nope")))
+    assert studio.agent_auth_payload(env)["state"] == "unknown"
+
+
+def test_login_opens_a_real_terminal_because_the_flow_needs_one(tmp_path, monkeypatch):
+    """The CLI's login is a full-screen interactive TUI — verified: under a
+    PTY it renders nothing a web page could usefully proxy, and with stdin
+    closed it just blocks. So Studio hands it to a terminal instead of
+    pretending it can host it."""
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _A:
+        name = "claude"
+        def auth_status(self): return ("expired", "")
+        def login_command(self): return ["/fake/claude", "setup-token"]
+    monkeypatch.setattr("harn.adapters.get_adapter", lambda n: _A())
+    monkeypatch.setattr(studio, "_terminal_launcher", lambda cmd: ["echo", cmd])
+
+    spawned = {}
+    monkeypatch.setattr(studio.subprocess, "Popen",
+                        lambda argv, **kw: spawned.setdefault("argv", argv))
+
+    r = studio.agent_login_payload(env)
+    assert r["ok"] is True and r["launched"] is True
+    assert "harn login" in r["command"]
+    assert spawned["argv"] == ["echo", r["command"]]
+
+
+def test_login_falls_back_to_telling_you_the_command_on_a_headless_box(tmp_path, monkeypatch):
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+
+    class _A:
+        name = "claude"
+        def auth_status(self): return ("expired", "")
+        def login_command(self): return ["/fake/claude", "setup-token"]
+    monkeypatch.setattr("harn.adapters.get_adapter", lambda n: _A())
+    monkeypatch.setattr(studio, "_terminal_launcher", lambda cmd: None)
+
+    r = studio.agent_login_payload(env)
+    assert r["ok"] is True and r["launched"] is False
+    assert "harn login" in r["command"]
+
+
+def test_studio_offers_sign_in_instead_of_restart_on_an_auth_block():
+    """Restarting a flow blocked because the CLI is signed out would just
+    fail the same way — offer the fix that actually applies, and only while
+    the CLI still reports being signed out."""
+    html = studio._HTML
+    assert "AGENT_AUTH&&AGENT_AUTH.state==='expired'&&AGENT_AUTH.can_login" in html
+    assert 'onclick="agentLogin()"' in html
+    assert "async function pollAgentAuth()" in html
