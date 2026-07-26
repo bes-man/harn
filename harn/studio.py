@@ -2239,8 +2239,27 @@ _HTML = r"""<!DOCTYPE html>
   .runbanner button{margin-left:auto}
   .blockedq{background:#3a2a10;border:1px solid var(--danger);padding:10px;
     border-radius:6px;margin-bottom:12px}
+  .blockedq>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:7px}
+  .blockedq>summary::-webkit-details-marker{display:none}
+  .blockedq>summary::before{content:'▾';color:var(--muted);font-size:11px}
+  .blockedq:not([open])>summary::before{content:'▸'}
   .blockedq pre{white-space:pre-wrap;
     font:12.5px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:8px 0}
+  /* A question is prose for a person: proportional type, real paragraphs and
+     a real option list — not the monospace tool-output treatment that left
+     its markdown asterisks on screen. */
+  .q-body{font:12.5px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    color:#cbd2df;margin:8px 0}
+  .q-body p{margin:0 0 6px}
+  .q-body p:last-child{margin-bottom:0}
+  .q-gap{height:5px}
+  .q-body code{font:11.5px ui-monospace,Menlo,monospace;background:#0f131b;
+    border:1px solid var(--line);border-radius:4px;padding:0 4px}
+  ul.q-opts{margin:4px 0 8px;padding-left:16px}
+  ul.q-opts li{margin:0 0 4px}
+  /* Capped + scrollable so a long question can't push the answer box and
+     everything below it off the panel. */
+  .q-scroll{max-height:240px;overflow:auto}
   .blockedq textarea{width:100%;margin-top:6px;background:var(--panel);color:var(--text);
     border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit}
   .qopt{display:flex;align-items:flex-start;gap:8px;padding:7px 9px;border:1px solid var(--line);
@@ -3077,6 +3096,11 @@ async function pollBoard(){
   }
 }
 let BLOCKED_Q_TASK=null, BLOCKED_Q_TEXT=null, BLOCKED_OPTIONS=[];
+// Whether the human folded the blocked-question block away. Held outside the
+// element because the panel is re-rendered on every board poll (~1.5s), so
+// the DOM's own open state is destroyed constantly — without this it would
+// spring back open a second after being closed.
+let BLOCKED_Q_FOLDED=false;
 function questionOptions(question){
   // Agents write options as `A) ...`, `- A) ...`, or markdown-bold
   // `- **A) sendGift** — ...` (observed live) — accept all three.
@@ -3119,11 +3143,18 @@ async function pollBlockedQuestion(){
       `<button class="ghost" onclick="submitOption(BLOCKED_OPTIONS[${i}])">${esc(option.value)}`+
       `${option.recommended?' <span class="live">Recommended</span>':''}</button>`).join('');
     el.style.display='block';
-    el.innerHTML=`<div class="blockedq"><b>Blocked — needs your answer:</b>`+
-      `<pre>${esc(r.question)}</pre>`+
+    // Collapsible, and it REMEMBERS the choice: a long question used to
+    // fill the sidebar so everything below it needed scrolling past on
+    // every repaint. Open by default (it's blocking work, so it has to be
+    // noticeable), one click to fold it away, and the body scrolls inside
+    // its own cap rather than growing the panel without limit.
+    el.innerHTML=`<details class="blockedq" ${BLOCKED_Q_FOLDED?'':'open'} `+
+      `ontoggle="BLOCKED_Q_FOLDED=!this.open">`+
+      `<summary><b>Blocked — needs your answer</b></summary>`+
+      `<div class="q-body q-scroll">${formatQuestionHtml(r.question)}</div>`+
       `${optionButtons?`<div class="row" style="display:grid;gap:7px;margin-bottom:9px">${optionButtons}</div>`:''}`+
       `<textarea id="answerBox" rows="3" placeholder="Your answer..."></textarea>`+
-      `<button onclick="submitAnswer()">Submit answer</button></div>`;
+      `<button onclick="submitAnswer()">Submit answer</button></details>`;
   } else {
     BLOCKED_Q_TASK=null; BLOCKED_Q_TEXT=null;
     el.style.display='none'; el.innerHTML='';
@@ -3876,6 +3907,32 @@ function rememberTranscriptOpen(stepId,details){
     TRANSCRIPT_OPEN_STEPS.delete(stepId); TRANSCRIPT_CLOSED_STEPS.add(stepId);
   }
 }
+// A question is written FOR a human — it arrives as prose with markdown
+// option lines like "- **A) do the thing**", which a raw monospace <pre>
+// showed with the asterisks still in it. Escape first, then apply a
+// deliberately tiny subset (bold, bullets) to the ALREADY-ESCAPED text, so
+// no agent-authored markup can become live HTML.
+function formatQuestionHtml(text){
+  const lines=String(text||'').split('\n');
+  let out='', list=false;
+  const inline=s=>esc(s)
+    .replace(/\*\*(.+?)\*\*/g,'<b>$1</b>')
+    .replace(/`([^`]+?)`/g,'<code>$1</code>');
+  for(const raw of lines){
+    const line=raw.trimEnd();
+    const bullet=line.match(/^\s*[-*]\s+(.*)$/);
+    if(bullet){
+      if(!list){ out+='<ul class="q-opts">'; list=true; }
+      out+=`<li>${inline(bullet[1])}</li>`;
+      continue;
+    }
+    if(list){ out+='</ul>'; list=false; }
+    if(!line.trim()){ out+='<div class="q-gap"></div>'; continue; }
+    out+=`<p>${inline(line)}</p>`;
+  }
+  if(list) out+='</ul>';
+  return out||'<p class="mut">(empty question)</p>';
+}
 function transcriptEntryHtml(e,settled){
   // question/answer are the human-in-the-loop pair. They used to exist only
   // in the Run progress header and the comments list, so someone reading a
@@ -3888,7 +3945,12 @@ function transcriptEntryHtml(e,settled){
     `<div class="transcript-entry-head">`+(stamp?`<span class="mut">${esc(stamp)}</span>`:'')+
     `<span>${icon}</span><b>${esc(e.title||e.kind)}</b>`+
     `<span>${esc(e.phase||'')}</span></div>`+
-    (e.text?`<pre data-run-scroll="${esc(e.seq)}">${esc(e.text)}</pre>`:'')+`</div>`;
+    // A question/answer is prose meant for a person, not tool output —
+    // rendering it through the monospace <pre> path left the markdown
+    // asterisks of its option list showing.
+    ((e.kind==='question'||e.kind==='answer')&&e.text
+      ?`<div class="q-body" data-run-scroll="${esc(e.seq)}">${formatQuestionHtml(e.text)}</div>`
+      :(e.text?`<pre data-run-scroll="${esc(e.seq)}">${esc(e.text)}</pre>`:''))+`</div>`;
 }
 function transcriptEntriesHtml(entries){
   // Title casing isn't a stable identity signal across an entry's own

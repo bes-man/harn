@@ -1168,3 +1168,33 @@ def test_the_page_keeps_asking_after_a_sign_in_was_launched():
     assert "AGENT_AUTH.state==='ok'" in html
     # Settings rows repaint on the same poll, not just on tab open.
     assert "if(tab==='settings' && $('#agentAuthRows')) renderAgentAuthRows();" in html
+
+
+def test_a_question_is_formatted_as_prose_not_raw_monospace():
+    """A question is written FOR a human — it arrives as prose with markdown
+    option lines like "- **A) do the thing**", which the monospace <pre>
+    path showed with the asterisks still in it."""
+    html = studio._HTML
+    assert "function formatQuestionHtml(text)" in html
+    # Escape FIRST, then apply the tiny markdown subset to already-escaped
+    # text, so agent-authored markup can never become live HTML.
+    assert "const inline=s=>esc(s)" in html
+    assert ".replace(/\\*\\*(.+?)\\*\\*/g,'<b>$1</b>')" in html
+    # …and the feed routes question/answer through it instead of <pre>.
+    assert "(e.kind==='question'||e.kind==='answer')&&e.text" in html
+    assert "class=\"q-body\"" in html
+
+
+def test_the_blocked_question_block_is_collapsible_and_remembers_the_choice():
+    """A long question filled the sidebar, so everything under it had to be
+    scrolled past. It folds now — and the folded state lives OUTSIDE the
+    element, because the panel is re-rendered on every board poll (~1.5s):
+    the DOM's own open state is destroyed constantly, so without this it
+    would spring back open a second after being closed."""
+    html = studio._HTML
+    assert "let BLOCKED_Q_FOLDED=false;" in html
+    assert '<details class="blockedq" ${BLOCKED_Q_FOLDED?\'\':\'open\'} ' in html
+    assert 'ontoggle="BLOCKED_Q_FOLDED=!this.open"' in html
+    # Capped + scrollable so a long question can't push the answer box off.
+    assert ".q-scroll{max-height:240px;overflow:auto}" in html
+    assert 'class="q-body q-scroll"' in html
