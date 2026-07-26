@@ -214,6 +214,71 @@ def cmd_teardown(args) -> int:
 _REPO_URL = "https://github.com/bes-man/harn.git"
 
 
+def cmd_login(args) -> int:
+    """Sign the coding agent's CLI in, so background runs can actually work.
+
+    harn shells out to the agent CLI for every turn, so the CLI needs its OWN
+    login — a signed-in desktop app doesn't cover it (that session lives
+    inside the app, refreshed in-process, never written out). This command
+    exists because that distinction is genuinely confusing in the moment:
+    "it works in my console" and "harn can run it" are different questions.
+
+    harn runs the login FOR you but cannot complete it: it's an interactive
+    OAuth flow needing a real browser and your approval. So the child process
+    inherits this terminal — you approve in the browser, the CLI writes to
+    its own credential store, and harn never sees a token.
+    """
+    import subprocess
+    from .adapters import get_adapter
+    from .config import Config
+
+    name = (getattr(args, "agent", "") or "").strip()
+    if not name:
+        env_dir = _env_dir(Path(args.path).resolve())
+        name = Config.load(env_dir).agent if env_dir.exists() else "claude"
+    try:
+        adapter = get_adapter(name)
+    except Exception as exc:
+        print(f"[harn] unknown agent {name!r}: {exc}", file=sys.stderr)
+        return 2
+
+    state, detail = adapter.auth_status()
+    if state == "ok" and not getattr(args, "force", False):
+        print(f"[harn] '{name}' is already signed in"
+              + (f" ({detail})" if detail else "") + ". Use --force to redo it.")
+        return 0
+
+    argv = adapter.login_command()
+    if not argv:
+        print(f"[harn] harn doesn't know how to sign '{name}' in — "
+              "check that agent's own docs for its login command.",
+              file=sys.stderr)
+        return 1
+
+    print(f"[harn] signing in '{name}': {' '.join(argv)}")
+    print("[harn] complete the login in your browser; harn never sees the token.")
+    try:
+        # No capture_output: the flow is interactive and MUST own the tty.
+        rc = subprocess.run(argv).returncode
+    except OSError as exc:
+        print(f"[harn] could not start the login: {exc}", file=sys.stderr)
+        return 1
+    if rc != 0:
+        print(f"[harn] login exited with status {rc}", file=sys.stderr)
+        return rc
+
+    state, detail = adapter.auth_status()
+    if state == "ok":
+        print(f"[harn] '{name}' is signed in"
+              + (f" ({detail})" if detail else "")
+              + ". Blocked tasks resume on their own within the next check.")
+        return 0
+    # Don't claim success the CLI itself doesn't confirm.
+    print(f"[harn] login finished but '{name}' still reports: {detail or state}",
+          file=sys.stderr)
+    return 1
+
+
 def cmd_update(args) -> int:
     """Update the harn package from GitHub. Never touches any harn_env/.
 
@@ -643,6 +708,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("text", help="your answer")
     ap.add_argument("path", nargs="?", default=".")
     ap.set_defaults(func=cmd_answer)
+
+    lg = sub.add_parser("login", help="sign the coding agent's CLI in "
+                                      "(harn shells out to it, so it needs its own login)")
+    lg.add_argument("path", nargs="?", default=".")
+    lg.add_argument("--agent", default="", help="which agent CLI (default: this project's)")
+    lg.add_argument("--force", action="store_true", help="re-run even if already signed in")
+    lg.set_defaults(func=cmd_login)
 
     up = sub.add_parser("update", help="update harn from GitHub (keeps harn_env)")
     up.add_argument("--ref", default="", help="branch/tag to install (default: main)")

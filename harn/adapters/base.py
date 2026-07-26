@@ -152,6 +152,22 @@ class Adapter:
         searching PATH plus common install dirs (see resolve_binary)."""
         return resolve_binary(self.binary) is not None
 
+    def login_command(self) -> list[str] | None:
+        """The argv that signs this CLI in, or None if harn doesn't know one.
+
+        harn runs this FOR the human but can never complete it: every agent
+        CLI's login is an interactive OAuth flow that needs a real browser
+        and the account holder's approval (verified: `claude setup-token`
+        blocks on interactive input with stdin closed). So this exists to
+        remove the "which command was it again?" step, not to automate a
+        login away — harn execs it against the terminal and the human
+        approves in their browser.
+
+        Deliberately NOT something harn stores the result of: the CLI writes
+        to its own credential store, and harn never sees or holds a token.
+        """
+        return None
+
     def auth_status(self) -> tuple[str, str]:
         """Whether this CLI is signed in, WITHOUT spending a turn.
 

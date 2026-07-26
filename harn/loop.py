@@ -823,15 +823,19 @@ def _auth_block_detail(agent_name: str, raw: str, *, binary: str = "") -> str:
     broken". Only the subprocess's own binary is the one that has to be
     signed in.
     """
-    where = f" ({binary})" if binary else ""
+    where = f"\n(that's {binary})" if binary else ""
     return (
         f"The '{agent_name}' CLI could not authenticate — its saved session "
         "has expired. harn runs it as a subprocess, so it needs its OWN login: "
         "a desktop app being signed in doesn't cover it (that session lives "
-        "inside the app and isn't shared). harn cannot renew it for you.\n\n"
-        f"Fix: run `{agent_name}`{where} in a terminal, complete the login, "
-        "then press Resume — or just wait, harn retries on its own and will "
-        "pick this up once you're signed in.\n\n"
+        "inside the app and isn't shared).\n\n"
+        "Fix — run this in a terminal:\n\n"
+        "    harn login\n\n"
+        f"It signs '{agent_name}' in for you, picking the long-lived login so "
+        f"this stops recurring.{where}\n\n"
+        "You only approve in the browser; harn never sees the token. Then "
+        "press Resume — or just wait, harn retries on its own and picks this "
+        "up once you're signed in.\n\n"
         "No attempts were spent on this: the step starts with a full budget.\n\n"
         f"Reported by {agent_name}: {raw}"
     )

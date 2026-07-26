@@ -506,3 +506,37 @@ def test_claude_model_catalog_is_current():
     # Superseded pins must not linger — they'd be offered in Studio's picker
     # long after they stopped being the right default.
     assert "claude-opus-4-8" not in models
+
+
+# --- harn login: harn runs the flow, the human approves -------------------- #
+
+def test_claude_login_uses_the_long_lived_token_not_a_session_login():
+    """Both work on a subscription, but `auth login` mints the same
+    short-lived session that expires in days and strands the next background
+    run. `setup-token` is the documented long-lived one — picking it here is
+    the difference between signing in once and signing in every few days."""
+    from harn.adapters.claude import ClaudeAdapter
+    from harn.adapters import base as base_mod
+    import unittest.mock as mock
+    with mock.patch.object(base_mod, "resolve_binary", lambda b: "/fake/claude"):
+        assert ClaudeAdapter().login_command() == ["/fake/claude", "setup-token"]
+
+
+def test_login_command_is_none_when_the_binary_is_missing():
+    from harn.adapters.claude import ClaudeAdapter
+    from harn.adapters import base as base_mod
+    import unittest.mock as mock
+    with mock.patch.object(base_mod, "resolve_binary", lambda b: None):
+        assert ClaudeAdapter().login_command() is None
+
+
+def test_the_base_adapter_admits_it_does_not_know_a_login():
+    """Agent-agnostic: harn must not invent a login command for a CLI it
+    doesn't know, it must say so."""
+    from harn.adapters.base import Adapter
+    class Bare(Adapter):
+        name = "bare"
+        binary = "bare"
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            raise NotImplementedError
+    assert Bare().login_command() is None

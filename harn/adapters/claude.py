@@ -52,6 +52,20 @@ class ClaudeAdapter(Adapter):
     EFFORTS = ()          # no confirmed --effort flag for `claude -p` (see above)
     TEMPERATURES = ()     # no sampling temperature exposed (see above)
 
+    def login_command(self) -> list[str] | None:
+        """`claude setup-token` — deliberately NOT `claude auth login`.
+
+        Both work on a subscription, but `auth login` mints the same
+        short-lived session that expires every few days and strands the next
+        background run; `setup-token` is documented as "Set up a long-lived
+        authentication token (requires Claude subscription)", which is
+        exactly what an unattended `harn watch` needs. Choosing the
+        longer-lived one here is the difference between signing in once and
+        signing in every few days.
+        """
+        binary = base_mod.resolve_binary(self.binary)
+        return [binary, "setup-token"] if binary else None
+
     def auth_status(self) -> tuple[str, str]:
         """Ask the CLI itself whether it is signed in — free and definitive.
 
