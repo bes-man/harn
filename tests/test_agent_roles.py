@@ -444,3 +444,74 @@ def test_auto_scan_picks_one_owner_deterministically_when_files_collide(tmp_path
         triggers.dispatch_command = original
 
     assert seen["command"] == "aaa"
+
+
+# --- a turn's own writes must survive the loop's ledger write -------------- #
+
+def test_decisions_recorded_during_a_turn_survive_the_step_ledger(tmp_path):
+    """Proven live before the fix: an agent recorded two decisions and ZERO
+    were on disk afterwards. The loop loads `task` BEFORE a step, the agent
+    records decisions during the turn (its own correct locked write straight
+    to disk), and the loop then saved its pre-turn copy — silently discarding
+    every one of them. Only `step_results` may come from the caller now."""
+    import subprocess
+    from harn import loop, scaffold, workflows
+    for a in (["init", "-q"], ["config", "user.email", "t@t"],
+              ["config", "user.name", "t"]):
+        subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    (env / "harn.toml").write_text(
+        '[harn]\nagent="fake"\n[feedback]\ntest_cmd=""\nrequire_tests=false\n'
+        '[notify]\nwait_for_reply=false\n[loop]\noracle=false\nauto_reconcile=false\n')
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path,
+                   check=True, capture_output=True)
+
+    t = tasks.create_task(env, "Do work", task_id="PRJ-001")
+    workflows.save_task_plan(env, t.id, {"preamble": "", "nodes": [
+        {"kind": "step", "id": "s1", "title": "One", "enabled": True},
+        {"kind": "step", "id": "s2", "title": "Two", "enabled": True},
+    ]})
+
+    class DecidingAdapter:
+        """Records a decision mid-turn, exactly as an agent calling the MCP
+        tool does — a locked write to the same task file the loop holds."""
+        name = "fake"
+        def __init__(self): self.n = 0
+        def available(self): return True
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            self.n += 1
+            tasks.record_decision(tasks.find(env, "PRJ-001"),
+                                  f"decision {self.n}", "because")
+            return AgentResult(ok=True, text="done")
+
+    import unittest.mock as mock
+    with mock.patch.object(loop, "get_adapter", lambda n: DecidingAdapter()), \
+         mock.patch.object(loop, "notify", lambda *a, **k: []):
+        loop.run(tmp_path, env)
+
+    final = tasks.find(env, "PRJ-001")
+    assert [d.decision for d in final.decisions] == ["decision 1", "decision 2"]
+    # …and the step ledger the loop was writing still landed.
+    assert final.step_results["s1"]["status"] == "ok"
+    assert final.step_results["s2"]["status"] == "ok"
+
+
+def test_record_step_result_takes_only_step_results_from_the_caller(tmp_path):
+    env = tmp_path / ENV_DIRNAME
+    (env / "tasks").mkdir(parents=True)
+    t = tasks.create_task(env, "Do it", task_id="PRJ-001")
+
+    stale = tasks.find(env, "PRJ-001")          # a pre-turn copy
+    tasks.record_decision(tasks.find(env, "PRJ-001"), "made during the turn", "x")
+
+    tasks.record_step_result(stale, "s1", {"status": "ok"})
+
+    fresh = tasks.find(env, "PRJ-001")
+    assert fresh.step_results["s1"]["status"] == "ok"
+    assert [d.decision for d in fresh.decisions] == ["made during the turn"]
+    # the caller's object is synced too, so code reading it next sees truth
+    assert [d.decision for d in stale.decisions] == ["made during the turn"]

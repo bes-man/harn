@@ -78,3 +78,40 @@ def test_clear_task_removes_only_that_tasks_transcript(tmp_path):
     remaining = transcript.read(env, task_id="PRJ-2")["entries"]
     assert [entry["text"] for entry in remaining] == ["keep me"]
     assert remaining[0]["seq"] == kept["seq"]
+
+
+# --- the human-in-the-loop pair belongs in the step's own feed ------------- #
+# Reported live: the question showed only in the Run progress header and the
+# comments list, so someone reading a step's activity scrolled the whole feed
+# and never found it — and after answering, saw no trace of their own answer
+# either.
+
+def test_an_answer_is_written_into_the_steps_feed(tmp_path):
+    from harn import loop, state, transcript, ENV_DIRNAME
+    env = tmp_path / ENV_DIRNAME
+    (env / "state").mkdir(parents=True)
+    (env / "tasks").mkdir(parents=True)
+    from harn import tasks
+    t = tasks.create_task(env, "Do it", task_id="PRJ-001")
+
+    state.blocked_marker(env / "state").write_text("Which one?", encoding="utf-8")
+    st = state.State.load(env / "state")
+    st.current_task = t.id
+    st.current_step = "step-1"
+    st.block("Which one?")
+    st.save(env / "state")
+
+    loop.answer(env, "the second one", source="studio")
+
+    entries = transcript.read(env, task_id=t.id)["entries"]
+    answers = [e for e in entries if e.get("kind") == "answer"]
+    assert len(answers) == 1
+    assert answers[0]["text"] == "the second one"
+    assert answers[0]["step_id"] == "step-1"
+    assert "studio" in answers[0]["title"]
+
+
+def test_studio_renders_the_question_and_answer_kinds():
+    from harn import studio
+    html = studio._HTML
+    assert "question:'？',answer:'✎'" in html

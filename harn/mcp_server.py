@@ -10,6 +10,7 @@ The server acts on a single harn_env, resolved from $HARN_ENV_DIR or ./harn_env.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from . import guidance as guidance_mod
 from . import pidlock
 from . import prd as prd_mod
 from . import progress as progress_mod
+from . import transcript as transcript_mod
 from . import skills as skills_mod
 from . import state as state_mod
 from . import tasks as tasks_mod
@@ -666,6 +668,18 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             if task is not None:
                 tasks_mod.add_comment(_env_dir(), task, question,
                                       author="agent", kind="question")
+            # Put the question in the step's own feed too. It used to live
+            # only in the Run progress header and the comments list, so
+            # someone reading the activity had to scroll the whole feed and
+            # still never found it there.
+            try:
+                transcript_mod.append(
+                    _env_dir(), task_id=task_id, step_id=st.current_step or "",
+                    run_id=events_mod.current_run(_env_dir()), attempt=1,
+                    kind="question", phase="completed",
+                    title="waiting for you", text=question)
+            except Exception:
+                pass       # the feed is a view; never fail the question over it
         _log(f"asked the user: {question.splitlines()[0][:120]}"
              + (f" [→ skill: {skill}]" if skill else ""))
         # `harn watch` (or the run loop) turns this into an interactive Telegram
@@ -708,10 +722,22 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
         state_dir = env_dir / "state"
         pending_file = state_dir / "PENDING_TELEGRAM_ANSWER.txt"
         if pending_file.exists():
-            ans = pending_file.read_text(encoding="utf-8").strip()
+            raw = pending_file.read_text(encoding="utf-8").strip()
             pending_file.unlink(missing_ok=True)
-            _log(f"chat agent consumed Telegram answer: {ans[:80]}")
-            return f"Answer received (via Telegram/auto): {ans}"
+            # JSON since 0.23; plain text is what older harn wrote, and a file
+            # left over from before an upgrade must still be readable.
+            try:
+                payload = json.loads(raw)
+                ans = str(payload.get("text") or "").strip()
+                src = str(payload.get("source") or "").strip()
+            except (ValueError, AttributeError):
+                ans, src = raw, ""
+            _log(f"chat agent consumed {src or 'pending'} answer: {ans[:80]}")
+            # Name the channel it ACTUALLY came from. Hardcoding
+            # "via Telegram/auto" mislabelled every Studio answer, which is
+            # how a human who typed a real answer in the UI got told the
+            # agent had received "You pressed 'Decide for me'".
+            return f"Answer received (via {src or 'Telegram/auto'}): {ans}"
         q = state_mod.read_block_question(state_dir)
         if q:
             return f"still_waiting — question still pending: {q[:200]}"

@@ -7,6 +7,14 @@ from harn import loop, state, skills, ENV_DIRNAME
 from harn.config import Config
 
 
+def _mcp_tool_fn(env, name, monkeypatch):
+    monkeypatch.setenv("HARN_ENV_DIR", str(env))
+    monkeypatch.setattr("harn.mcp_server._ensure_watch_running", lambda e: None)
+    from harn import mcp_server as ms
+    server = ms.build_server()
+    return next(t.fn for t in server._tool_manager._tools.values() if t.name == name)
+
+
 def _make_env(tmp_path: Path) -> Path:
     env = tmp_path / ENV_DIRNAME
     (env / "state").mkdir(parents=True)
@@ -139,3 +147,61 @@ def test_check_pending_answer_no_pending(tmp_path, monkeypatch):
     fn = _tool_fn(env, "check_pending_answer", monkeypatch)
     result = fn()
     assert result == "no_pending_answer"
+
+
+def test_studio_source_writes_pending_file(tmp_path):
+    """An answer typed in Studio reaches a stopped agent exactly the way a
+    Telegram one does — the agent process can't see the web UI either."""
+    env = _make_env(tmp_path)
+    _block(env, "Use Redis or Memcached?")
+    loop.answer(env, "Redis", source="studio")
+    pending = env / "state" / "PENDING_TELEGRAM_ANSWER.txt"
+    assert pending.exists() and "Redis" in pending.read_text(encoding="utf-8")
+
+
+def test_a_newer_answer_supersedes_a_stale_pending_one(tmp_path):
+    """Observed live: the file is consumed once but was only ever WRITTEN by
+    two sources, so a leftover "You pressed 'Decide for me'" sat on disk and
+    was served as the reply to a LATER answer typed in the UI."""
+    env = _make_env(tmp_path)
+    _block(env, "Which mechanism?")
+    loop.answer(env, "You pressed 'Decide for me'.", source="auto")
+    _block(env, "Which mechanism?")
+    loop.answer(env, "Use in-app credit", source="studio")
+
+    pending = (env / "state" / "PENDING_TELEGRAM_ANSWER.txt").read_text(encoding="utf-8")
+    assert "in-app credit" in pending
+    assert "Decide for me" not in pending
+
+
+def test_a_chat_answer_clears_a_stale_pending_file(tmp_path):
+    """Same hazard from the other direction: answering in-session must not
+    leave an older out-of-session answer queued up to be served next."""
+    env = _make_env(tmp_path)
+    _block(env, "Which mechanism?")
+    loop.answer(env, "You pressed 'Decide for me'.", source="auto")
+    _block(env, "Which mechanism?")
+    loop.answer(env, "answered in chat")          # default source="cli"
+    assert not (env / "state" / "PENDING_TELEGRAM_ANSWER.txt").exists()
+
+
+def test_the_pending_answer_names_the_channel_it_came_from(tmp_path, monkeypatch):
+    """Hardcoding "via Telegram/auto" is how a human who typed a real answer
+    in the UI got told the agent had received "You pressed 'Decide for me'"."""
+    env = _make_env(tmp_path)
+    _block(env, "Which mechanism?")
+    loop.answer(env, "Use in-app credit", source="studio")
+
+    fn = _mcp_tool_fn(env, "check_pending_answer", monkeypatch)
+    out = fn()
+    assert "via studio" in out and "in-app credit" in out
+
+
+def test_an_older_plain_text_pending_file_is_still_readable(tmp_path, monkeypatch):
+    """A file written by a pre-JSON harn must survive an upgrade."""
+    env = _make_env(tmp_path)
+    (env / "state").mkdir(parents=True, exist_ok=True)
+    (env / "state" / "PENDING_TELEGRAM_ANSWER.txt").write_text(
+        "plain old answer", encoding="utf-8")
+    fn = _mcp_tool_fn(env, "check_pending_answer", monkeypatch)
+    assert "plain old answer" in fn()

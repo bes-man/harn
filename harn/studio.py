@@ -3877,7 +3877,11 @@ function rememberTranscriptOpen(stepId,details){
   }
 }
 function transcriptEntryHtml(e,settled){
-  const icon={message:'●',status:'◌',command:'›_',tool:'⚙',skill:'◆',file_change:'±',error:'!'}[e.kind]||'·';
+  // question/answer are the human-in-the-loop pair. They used to exist only
+  // in the Run progress header and the comments list, so someone reading a
+  // step's activity scrolled the whole feed and never found either.
+  const icon={message:'●',status:'◌',command:'›_',tool:'⚙',skill:'◆',file_change:'±',
+              error:'!',question:'？',answer:'✎'}[e.kind]||'·';
   const live=!!BOARD.run&&!settled&&(e.phase==='started'||e.phase==='updated');
   const stamp=fmtEntryStamp(e.ts);
   return `<div class="transcript-entry ${esc(e.kind)} ${live?'live':''}" data-seq="${esc(e.seq)}">`+

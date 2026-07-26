@@ -782,13 +782,12 @@ def _run_required_custom_tools(env_dir: Path, project_root: Path,
 def _block_tool_failure(env_dir: Path, task: "tasks.Task", step: dict,
                         detail: str, attempts: int) -> None:
     sid = step.get("id") or ""
-    task.step_results[sid] = {
+    tasks.record_step_result(task, sid, {
         "status": "blocked", "started": tasks._now_iso(),
         "ended": tasks._now_iso(), "attempts": attempts,
         "tokens": 0, "output": detail,
         "usage": _audit_step_usage(env_dir, task, step),
-    }
-    tasks._save(task)
+    })
     state_dir = env_dir / "state"
     state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
     blocked_state = state.State.load(state_dir)
@@ -857,13 +856,12 @@ def _block_on_auth_failure(env_dir: Path, task: "tasks.Task", sid: str,
     no tokens), which is what lets the task self-heal after a re-login.
     """
     detail = _auth_block_detail(agent_name, (raw or "").strip(), binary=binary)
-    task.step_results[sid] = {
+    tasks.record_step_result(task, sid, {
         **task.step_results.get(sid, {}),
         "status": "blocked", "started": started, "ended": tasks._now_iso(),
         "attempts": prior_attempts, "tokens": 0, "output": detail,
         **({"usage": usage} if usage is not None else {}),
-    }
-    tasks._save(task)
+    })
     state_dir = env_dir / "state"
     state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
     st = state.State.load(state_dir)
@@ -1053,16 +1051,14 @@ def _run_command_step(env_dir: Path, project_root: Path, task: "tasks.Task",
         text=(result.output or ("Command completed successfully" if result.ok
                                 else "Command failed")))
     if result.ok:
-        task.step_results[sid] = {"status": "ok", "started": started,
-                                  "ended": ended, "output": result.tail(40),
-                                  "attempts": attempt}
-        tasks._save(task)
+        tasks.record_step_result(task, sid, {
+            "status": "ok", "started": started, "ended": ended,
+            "output": result.tail(40), "attempts": attempt})
         progress.log(env_dir, f"{task.id}: {title} (command) — ok")
         return "advance"
-    task.step_results[sid] = {"status": "failed", "started": started,
-                              "ended": ended, "output": result.tail(40),
-                              "attempts": attempt}
-    tasks._save(task)
+    tasks.record_step_result(task, sid, {
+        "status": "failed", "started": started, "ended": ended,
+        "output": result.tail(40), "attempts": attempt})
     progress.log(env_dir, f"{task.id}: {title} (command) — failed")
     on_fail_id = str(step.get("on_fail") or "").strip()
     handler = next((s for s in steps if s.get("id") == on_fail_id), None) \
@@ -1188,9 +1184,8 @@ def _block_on_budget(env_dir: Path, cfg: Config, st: "state.State", state_dir: P
     events.emit(env_dir, "block", task_id=task.id, stage=sid, detail=over[:300])
     if not auto:
         if sid:
-            task.step_results[sid] = {**task.step_results.get(sid, {}),
-                                      "status": "blocked"}
-            tasks._save(task)
+            tasks.record_step_result(task, sid, {
+                **task.step_results.get(sid, {}), "status": "blocked"})
         progress.log(env_dir, f"{task.id}: {over}", agent=agent_name)
     print(f"[harn] {task.id}: {over}")
 
@@ -1769,13 +1764,11 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
 
     missing = _missing_required_usage(usage)
     status = "blocked" if missing else ("ok" if result and result.ok else "failed")
-    task.step_results[step_id] = {"status": status, "started": started,
-                                  "ended": tasks._now_iso(),
-                                  "tokens": result.total_tokens if result else 0,
-                                  "attempts": attempt,
-                                  "output": (result.text or "")[-4000:] if result else "",
-                                  "usage": usage}
-    tasks._save(task)
+    tasks.record_step_result(task, step_id, {
+        "status": status, "started": started, "ended": tasks._now_iso(),
+        "tokens": result.total_tokens if result else 0, "attempts": attempt,
+        "output": (result.text or "")[-4000:] if result else "",
+        "usage": usage})
     if missing:
         detail = (f"Step '{title}' ({step_id}) did not use required skill/tool(s): "
                   f"{', '.join(missing)} after two attempts.")
@@ -2121,14 +2114,16 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
             merged_so_far.append(step)
             continue
         # Conflict: one agent-merge turn, scoped to just this step's collision
-        # with whatever's already been merged into the tree.
-        tasks._save(task)
+        # with whatever's already been merged into the tree. Ledger what the
+        # wave has produced so far WITHOUT saving the whole task — the wave's
+        # members just ran agent turns that recorded decisions of their own.
+        tasks.record_step_results(task, task.step_results)
         outcome_turn = _run_merge_agent_turn(env_dir, project_root, task,
                                              merged_so_far, step, cfg, spend=spend)
         if outcome_turn == "blocked":
-            task.step_results[sid] = {"status": "blocked", "started": started,
-                                      "ended": tasks._now_iso()}
-            tasks._save(task)
+            tasks.record_step_result(task, sid, {
+                "status": "blocked", "started": started,
+                "ended": tasks._now_iso()})
             return "blocked"
         gitutil.save_patch_ref(project_root, task.id, sid, patch)
         _append_task_patch(project_root, task, sid, patch)
@@ -2136,7 +2131,7 @@ def _merge_wave_patches(env_dir: Path, project_root: Path, task: "tasks.Task",
                                   "ended": tasks._now_iso(),
                                   "output": "merged via agent-resolved conflict"}
         merged_so_far.append(step)
-    tasks._save(task)
+    tasks.record_step_results(task, task.step_results)
     progress.log(env_dir, f"{task.id}: wave {wave[0].get('parallel')} merged "
                           f"({len(wave)} step(s))")
     return "blocked" if wave_blocked else "advance"
@@ -2499,9 +2494,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 st.save(state_dir)
                 events.emit(env_dir, "block", task_id=task.id, stage=sid,
                             detail=detail[:300])
-                task.step_results[sid] = {**task.step_results.get(sid, {}),
-                                          "status": "blocked"}
-                tasks._save(task)
+                tasks.record_step_result(task, sid, {
+                    **task.step_results.get(sid, {}), "status": "blocked"})
                 print(f"[harn] {task.id} · {title}: BLOCKED — {detail}")
                 return _run_end(env_dir, st)
 
@@ -2602,11 +2596,10 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                         binary=_adapter_binary(step_adapter))
                     return _run_end(env_dir, state.State.load(state_dir))
                 if not auto:
-                    task.step_results[sid] = {**task.step_results.get(sid, {}),
-                                              "status": "failed",
-                                              "ended": tasks._now_iso(),
-                                              "output": detail[-2000:]}
-                    tasks._save(task)
+                    tasks.record_step_result(task, sid, {
+                        **task.step_results.get(sid, {}),
+                        "status": "failed", "ended": tasks._now_iso(),
+                        "output": detail[-2000:]})
                     print(f"[harn] {task.id} · {title}: agent turn failed — "
                           f"{detail[:300]}")
                     # Re-selects this same step next iteration (still not
@@ -2635,9 +2628,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 continue  # reload state, re-run the same step next iteration
             if b == "blocked":
                 if not auto:
-                    task.step_results[sid] = {**task.step_results.get(sid, {}),
-                                              "status": "blocked"}
-                    tasks._save(task)
+                    tasks.record_step_result(task, sid, {
+                        **task.step_results.get(sid, {}), "status": "blocked"})
                 return _run_end(env_dir, st)
             if b == "auto":
                 feedback_tail = _AUTO_DECIDE_NOTE
@@ -2698,23 +2690,20 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 usage = _audit_step_usage(env_dir, task, step)
                 missing_required = _missing_required_usage(usage)
                 if missing_required:
-                    task.step_results[sid] = {"status": "running", "started": started,
-                                              "ended": None,
-                                              "attempts": prior_attempts + 1,
-                                              "tokens": result.total_tokens,
-                                              "output": (result.text or "")[-4000:],
-                                              "usage": usage}
-                    tasks._save(task)
+                    tasks.record_step_result(task, sid, {
+                        "status": "running", "started": started, "ended": None,
+                        "attempts": prior_attempts + 1,
+                        "tokens": result.total_tokens,
+                        "output": (result.text or "")[-4000:], "usage": usage})
                     print(f"[harn] {task.id} · {title}: missing required usage "
                           f"({', '.join(missing_required)}); step remains pending.")
                     continue
-                task.step_results[sid] = {"status": "ok", "started": started,
-                                          "ended": tasks._now_iso(),
-                                          "attempts": prior_attempts + 1,
-                                          "tokens": result.total_tokens,
-                                          "output": (result.text or "")[-4000:],
-                                          "usage": usage}
-                tasks._save(task)
+                tasks.record_step_result(task, sid, {
+                    "status": "ok", "started": started,
+                    "ended": tasks._now_iso(),
+                    "attempts": prior_attempts + 1,
+                    "tokens": result.total_tokens,
+                    "output": (result.text or "")[-4000:], "usage": usage})
                 task = tasks.find(env_dir, task.id) or task
             # More steps remain? loop to run the next one.
             if any(not _step_done(s.get("id")) for s in steps):
@@ -2887,9 +2876,38 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
     progress.log(env_dir, f"human answered: {text[:120]}")
     events.emit(env_dir, "answer", task_id=st.current_task, source=source,
                 summary=text[:200])
-    # Signal to chat agent that a Telegram/auto answer arrived while it was stopped.
-    if source in ("telegram", "auto"):
-        (state_dir / "PENDING_TELEGRAM_ANSWER.txt").write_text(text, encoding="utf-8")
+    # Signal a stopped agent that an answer arrived through a channel OUTSIDE
+    # its own session. `studio` belongs with telegram/auto for exactly the
+    # same reason they do — the human typed it into a web UI the agent process
+    # can't see — while cli/chat stay excluded: there the agent is already the
+    # one being told.
+    #
+    # The `else` branch matters as much as the write. This file is consumed
+    # once and was only ever WRITTEN by two sources, so a leftover from an old
+    # Telegram/"Decide for me" answer sat on disk indefinitely and got served
+    # as the reply to a LATER answer — observed live: an agent reported
+    # "You pressed 'Decide for me'" to someone who had just typed a real
+    # answer in the UI. Any newer answer, by any channel, now supersedes it.
+    pending_file = state_dir / "PENDING_TELEGRAM_ANSWER.txt"
+    if source in ("telegram", "auto", "studio"):
+        # JSON so the reader can name the real channel instead of guessing.
+        pending_file.write_text(
+            json.dumps({"text": text, "source": source, "ts": tasks._now_iso()}),
+            encoding="utf-8")
+    else:
+        pending_file.unlink(missing_ok=True)
+    # Put the answer in the step's own feed. It used to land only in comments,
+    # ANSWERS.md and events — so the human who just answered saw no trace of
+    # it in the activity they were watching.
+    if st.current_task:
+        try:
+            transcript.append(
+                env_dir, task_id=st.current_task,
+                step_id=st.current_step or "", run_id=events.current_run(env_dir),
+                attempt=1, kind="answer", phase="completed",
+                title=f"you ({source})", text=text)
+        except Exception:
+            pass       # the feed is a view; never fail an answer over it
     if skill:
         q1 = question.splitlines()[0][:160]
         skills.append_learning(env_dir, skill, f"{q1} → {text.strip()}")

@@ -1126,6 +1126,59 @@ def set_scratchpad(task: Task, notes: str) -> None:
         task.scratchpad = text
 
 
+def record_step_result(task: Task, step_id: str, entry: dict) -> None:
+    """Write one step's ledger entry, preserving everything the TURN wrote.
+
+    Locked read-modify-write, for a reason proven live rather than guessed at:
+    the loop loads `task` BEFORE running a step, the agent then records
+    decisions/scratchpad/changelog during that turn (each a correct locked
+    write of its own, straight to disk), and the loop afterwards saved its
+    own pre-turn copy — silently discarding every one of them. A run whose
+    agent recorded two decisions ended with zero on disk.
+
+    Re-loading inside the lock is what actually fixes it; locking only the
+    write would still persist a stale snapshot. `step_results` is the only
+    field taken from the caller — everything else comes from disk, because
+    the caller's copy is by definition older than the turn that just ran.
+    """
+    if not step_id:
+        return
+    env_dir = task.path.parent.parent
+    with _claim_lock(env_dir):
+        fresh = _load_full(task.path)
+        fresh.step_results[step_id] = entry
+        _save(fresh)
+        # Sync the caller so code reading `task` right after sees the true
+        # post-write state (same contract as set_scratchpad/record_decision).
+        task.step_results = fresh.step_results
+        task.decisions = fresh.decisions
+        task.scratchpad = fresh.scratchpad
+        task.changelog = fresh.changelog
+        task.comments = fresh.comments
+
+
+def record_step_results(task: Task, entries: dict) -> None:
+    """`record_step_result` for several steps at once — one locked write.
+
+    A parallel wave finishes many steps and ledgers them together; doing it
+    entry-by-entry would take the claim lock once per member for no benefit.
+    Same guarantee: only `step_results` comes from the caller, so decisions
+    and notes the wave's agents wrote during their turns survive.
+    """
+    if not entries:
+        return
+    env_dir = task.path.parent.parent
+    with _claim_lock(env_dir):
+        fresh = _load_full(task.path)
+        fresh.step_results.update(entries)
+        _save(fresh)
+        task.step_results = fresh.step_results
+        task.decisions = fresh.decisions
+        task.scratchpad = fresh.scratchpad
+        task.changelog = fresh.changelog
+        task.comments = fresh.comments
+
+
 def record_decision(task: Task, decision: str, rationale: str = "",
                     agent: str | None = None) -> None:
     """Append a decision the agent made. Oracle will VERIFY it, not assume it.
