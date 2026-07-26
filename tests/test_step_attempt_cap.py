@@ -216,3 +216,23 @@ def test_studio_retry_resets_only_the_requested_step_attempts(tmp_path, monkeypa
     assert fresh.step_results["step-001"]["attempts"] == 0
     assert fresh.step_results["step-001"]["status"] == "pending"
     assert state.State.load(env / "state").phase != state.BLOCKED
+
+
+def test_a_targeted_run_says_why_it_could_not_start(tmp_path, capsys, monkeypatch):
+    """`harn run --task X` picking up nothing is almost never "all done" —
+    the human asked for THIS task by name. Reporting "No pending tasks.
+    DONE." there is how a Resume that could never work reported success."""
+    from harn import loop
+    env, t = _project(tmp_path)
+    monkeypatch.setattr(loop, "get_adapter", lambda n: AlwaysFailsAdapter())
+    task = tasks.find(env, t.id)
+    task.status = tasks.IN_PROGRESS
+    task.claimed_by = "someone-else"
+    tasks._save(task)
+
+    loop.run(tmp_path, env, only_task=t.id)
+
+    out = capsys.readouterr().out
+    assert "did not start" in out
+    assert "claimed by worker 'someone-else'" in out
+    assert "No pending tasks" not in out

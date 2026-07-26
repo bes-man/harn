@@ -447,7 +447,8 @@ def _cmd_run(args, root: Path, env_dir: Path) -> int:
             print(r["text"][-1500:])
         return 0
     loop.run(root, env_dir, max_iterations=args.max_iterations, auto=args.auto,
-              only_task=args.task_id or None)
+              only_task=args.task_id or None,
+              worker=getattr(args, "worker", "") or None)
     return 0
 
 
@@ -740,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with --step: first restore the working tree to "
                          "that step's git checkpoint, discarding its last "
                          "attempt, before running it again")
+    rp.add_argument("--worker", default="",
+                    help="resume a task claimed by this worker id (see the "
+                         "task's claimed_by); without it a claimed in-progress "
+                         "task is not picked up")
     rp.add_argument("--as", dest="as_role", metavar="ROLE", default=None,
                     help="run --task as this agent role (harn_env/agents/"
                          "ROLE.md) instead of the default loop — see the "

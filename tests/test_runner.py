@@ -291,3 +291,45 @@ def test_a_finished_run_frees_the_runner_even_if_its_process_lingers(tmp_path):
     with patch("harn.runner.subprocess.Popen", return_value=_fake_popen(777)), \
          patch("harn.runstate.os.kill"):
         assert runner.launch(tmp_path, env, "PRJ-002")["ok"] is True
+
+
+def test_a_task_claimed_by_a_non_role_worker_is_resumed_as_that_worker(tmp_path):
+    """Observed live: an agent claimed PRJ-001 via get_next_task(worker="claude"),
+    which is an ADAPTER name, not a registered role. Resume then built a plain
+    `harn run --task`, which runs as an unclaimed worker — and `_eligible`
+    rejects an in_progress task owned by someone else — so the run exited
+    "No pending tasks. DONE." having done nothing, with the board still
+    looking fine. Resuming as the owner is exactly the "resuming its own
+    task" case `_eligible` already allows."""
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write the spec", task_id="PRJ-001")
+    task.status = tasks.IN_PROGRESS
+    task.claimed_by = "claude"          # an adapter name, no such role exists
+    tasks._save(task)
+
+    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
+         patch("harn.runstate.os.kill"):
+        runner.launch(tmp_path, env, task.id)
+
+    cmd = m.call_args[0][0]
+    assert cmd[cmd.index("--worker") + 1] == "claude"
+    assert "--as" not in cmd            # there is no role to run as
+
+
+def test_a_role_claim_still_resumes_through_the_role(tmp_path):
+    """The role path must keep winning when the claim IS a role — it carries
+    the role's own workflow and next_status, which --worker alone would not."""
+    env = _env(tmp_path)
+    task = tasks.create_task(env, "Write the spec", task_id="PRJ-002")
+    task.status = tasks.IN_PROGRESS
+    task.claimed_by = "spec-writer"
+    tasks._save(task)
+    roles.save(env, {"name": "spec-writer", "status": tasks.IN_PROGRESS})
+
+    with patch("harn.runner.subprocess.Popen", return_value=_fake_popen()) as m, \
+         patch("harn.runstate.os.kill"):
+        runner.launch(tmp_path, env, task.id)
+
+    cmd = m.call_args[0][0]
+    assert cmd[cmd.index("--as") + 1] == "spec-writer"
+    assert "--worker" not in cmd

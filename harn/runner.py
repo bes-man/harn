@@ -179,6 +179,17 @@ def launch(project_root: Path, env_dir: Path, task_id: str, *,
             role = roles_mod.find(env_dir, task.claimed_by)
             if role is not None:
                 cmd += ["--as", role.name]
+            else:
+                # Claimed by something that ISN'T a registered role — an agent
+                # calling get_next_task(worker=...) picks its own id, and
+                # "claude" is a common one. Without this the claim made the
+                # task invisible to its own Resume: a plain `harn run --task`
+                # runs as an unclaimed worker, `_eligible` rejects an
+                # in_progress task owned by someone else, and the run reported
+                # "No pending tasks. DONE." having done nothing (observed
+                # live). Resume as the owner instead — which is exactly the
+                # "resuming its own task" case `_eligible` already allows.
+                cmd += ["--worker", task.claimed_by]
     cmd.append(str(project_root))
     # PYTHONUNBUFFERED matters: stdout redirected to a real file (not a tty)
     # makes CPython fully block-buffer it, so every print() in the child sits

@@ -2262,8 +2262,34 @@ def _run_parallel_wave(env_dir: Path, project_root: Path, task: "tasks.Task",
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+def _why_not_runnable(env_dir: Path, task_id: str, worker: str | None) -> str:
+    """Why `next_task(only=task_id)` returned nothing — in words a human can
+    act on. Empty string when the task simply isn't there to explain."""
+    task = tasks.find(env_dir, task_id)
+    if task is None:
+        return f"no task {task_id!r} in this project"
+    if task.status in (tasks.DONE, tasks.REVIEW):
+        return f"it is already {task.status} — nothing left to run"
+    if task.claimed_by and task.claimed_by != worker and task.status == tasks.IN_PROGRESS:
+        return (f"it is claimed by worker {task.claimed_by!r} and still "
+                f"in_progress, so a run as {worker or 'an unclaimed worker'} "
+                "cannot pick it up. Resume it as that worker, or clear the "
+                "claim from the task card.")
+    unmet = []
+    for dep_id in (task.depends_on or []):
+        dep = tasks.find(env_dir, dep_id)
+        if dep is None or dep.status != tasks.DONE:
+            unmet.append(dep_id)
+    if unmet:
+        return f"it depends on {', '.join(unmet)}, which are not done yet"
+    if not task.needs_agent:
+        return f"its status {task.status!r} is not one an agent picks up"
+    return ""
+
+
 def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
-        auto: bool = False, only_task: str | None = None) -> str:
+        auto: bool = False, only_task: str | None = None,
+        worker: str | None = None) -> str:
     """Run the loop until DONE, BLOCKED, REVIEW (CLI), or max_iterations.
 
     In `auto` mode there is no human: the agent decides ambiguities itself,
@@ -2332,8 +2358,23 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
     # resubmission gets a fresh debounce, however many rework rounds happen.
     reworked: set[str] = set()
     for _ in (itertools.count() if not limit else range(limit)):
-        task = tasks.next_task(env_dir, exclude=handled, only=only_task)
+        task = tasks.next_task(env_dir, exclude=handled, only=only_task,
+                               worker=worker)
         if task is None:
+            # `harn run --task X` that picks up nothing is almost never "all
+            # done" — the human just asked for THIS task by name. Saying "No
+            # pending tasks. DONE." there is actively misleading: it's how a
+            # Resume that could never work reported success and left the
+            # board looking fine (observed live — a task claimed by a worker
+            # id that isn't a registered role is invisible to a plain run,
+            # and nothing said so).
+            if only_task and not handled:
+                blocked_reason = _why_not_runnable(env_dir, only_task, worker)
+                if blocked_reason:
+                    print(f"[harn] '{only_task}' did not start: {blocked_reason}")
+                    events.emit(env_dir, "error", task_id=only_task,
+                                detail=blocked_reason[:300])
+                    return _run_end(env_dir, st)
             if auto:
                 st.transition(state.DONE)
                 st.save(state_dir)
