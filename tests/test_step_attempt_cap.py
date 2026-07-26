@@ -177,7 +177,11 @@ def test_the_auth_block_says_how_to_actually_fix_it(tmp_path, monkeypatch):
 
     question = state.State.load(env / "state").question
     assert "could not authenticate" in question
-    assert "sign in again" in question
+    # Names the command to run, and says the subprocess needs its OWN login —
+    # the exact confusion seen live, where a signed-in desktop app made the
+    # human conclude harn was broken rather than that the CLI was logged out.
+    assert "run `fake`" in question
+    assert "OWN login" in question
     assert "review the step prompt" not in question.lower()
 
 

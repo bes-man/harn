@@ -417,3 +417,88 @@ def test_assistant_text_and_tool_use_full_turn_sequence():
 def test_non_assistant_non_user_record_yields_no_events():
     assert ClaudeAdapter._normalize_event({"type": "result"}, {}) == []
     assert ClaudeAdapter._normalize_event({"type": "system"}, {}) == []
+
+
+# --- cheap auth preflight -------------------------------------------------- #
+# Diagnosed live: a machine where the Claude DESKTOP app worked fine (it
+# refreshes its token in-process and never writes it out) while every
+# `claude -p` subprocess failed, because the on-disk credential store had
+# been expired for days. "Claude works in my console" and "harn can run
+# Claude" are genuinely different questions; only the CLI's own store
+# answers the second, and asking it costs nothing.
+
+def _creds(tmp_path, expires_at_ms):
+    import json
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "x", "refreshToken": "y",
+                                      "expiresAt": expires_at_ms}}),
+        encoding="utf-8")
+    return tmp_path
+
+
+def test_claude_auth_status_reports_a_live_session(tmp_path, monkeypatch):
+    import time
+    from harn.adapters.claude import ClaudeAdapter
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
+                       str(_creds(tmp_path, (time.time() + 3600) * 1000)))
+    assert ClaudeAdapter().auth_status() == ("ok", "")
+
+
+def test_claude_auth_status_reports_an_expired_session_with_its_age(tmp_path, monkeypatch):
+    import time
+    from harn.adapters.claude import ClaudeAdapter
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
+                       str(_creds(tmp_path, (time.time() - 3 * 86400) * 1000)))
+    state, detail = ClaudeAdapter().auth_status()
+    assert state == "expired"
+    assert "3d ago" in detail
+
+
+def test_a_missing_credential_store_is_unknown_not_expired(tmp_path, monkeypatch):
+    """No store is NOT proof of trouble — the CLI may keep credentials
+    elsewhere on this platform. Crying wolf on a working setup would make
+    the check worse than useless."""
+    from harn.adapters.claude import ClaudeAdapter
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nope"))
+    assert ClaudeAdapter().auth_status() == ("unknown", "")
+
+
+def test_auth_status_never_reads_the_tokens_themselves(tmp_path, monkeypatch):
+    """The check exists to read ONE timestamp. It must never surface token
+    material in the detail string it hands to logs and the UI."""
+    import time
+    from harn.adapters.claude import ClaudeAdapter
+    import json
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "SECRET-ACCESS",
+                                      "refreshToken": "SECRET-REFRESH",
+                                      "expiresAt": (time.time() - 60) * 1000}}),
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _, detail = ClaudeAdapter().auth_status()
+    assert "SECRET" not in detail
+
+
+def test_the_base_adapter_answers_unknown_rather_than_guessing():
+    """Agent-agnostic default: most CLIs expose no cheap way to ask, and
+    probing with a real turn would burn quota on every page load."""
+    from harn.adapters.base import Adapter
+    class Bare(Adapter):
+        name = "bare"
+        binary = "bare"
+        def run_turn(self, prompt, cwd, timeout=1800, **kw):
+            raise NotImplementedError
+    assert Bare().auth_status() == ("unknown", "")
+
+
+def test_claude_model_catalog_is_current():
+    from harn.adapters.claude import ClaudeAdapter
+    models = ClaudeAdapter.MODELS
+    assert "claude-opus-5" in models
+    assert "claude-sonnet-5" in models
+    assert "claude-fable-5" in models
+    # Aliases track whatever is current for the account, so they must stay.
+    assert {"opus", "sonnet", "haiku"} <= set(models)
+    # Superseded pins must not linger — they'd be offered in Studio's picker
+    # long after they stopped being the right default.
+    assert "claude-opus-4-8" not in models

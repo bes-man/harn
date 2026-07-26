@@ -152,6 +152,18 @@ class Adapter:
         searching PATH plus common install dirs (see resolve_binary)."""
         return resolve_binary(self.binary) is not None
 
+    def auth_status(self) -> tuple[str, str]:
+        """Whether this CLI is signed in, WITHOUT spending a turn.
+
+        Returns `(state, detail)` where state is "ok", "expired", or
+        "unknown". "unknown" is the honest default and what the base class
+        returns: most agent CLIs expose no cheap way to ask, and probing by
+        running a real turn would burn subscription quota on every page load.
+        Adapters that can answer for free (by reading the credential store
+        their own CLI writes) override this.
+        """
+        return ("unknown", "")
+
     def discover_models(self) -> tuple[str, ...]:
         """Return the current CLI model catalog when discoverable.
 

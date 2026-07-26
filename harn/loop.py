@@ -797,27 +797,51 @@ def _block_tool_failure(env_dir: Path, task: "tasks.Task", step: dict,
     events.emit(env_dir, "block", task_id=task.id, stage=sid, detail=detail[:300])
 
 
-def _auth_block_detail(agent_name: str, raw: str) -> str:
+def _adapter_binary(adapter) -> str:
+    """Where this adapter's CLI actually resolves to, for the auth message.
+    Best-effort: a name-only fallback is fine, an exception here is not."""
+    try:
+        from .adapters import base as _base
+        return _base.resolve_binary(getattr(adapter, "binary", "")) or ""
+    except Exception:
+        return ""
+
+
+def _auth_block_detail(agent_name: str, raw: str, *, binary: str = "") -> str:
     """The human-facing text for "the agent CLI isn't signed in".
 
     Deliberately NOT the generic attempt-cap wording ("review the step prompt
     and required skills/tools"): that advice is actively misleading here — the
     step is fine, the machine just isn't logged in, and no amount of editing
     the prompt will change that.
+
+    Names the exact binary, because "just log in" is ambiguous on a machine
+    with more than one install of the same agent. Diagnosed live: a desktop
+    app that worked (it refreshes its token in-process and never writes it
+    out) alongside a CLI whose saved session had been expired for days — the
+    human reasonably concluded "it works in my console, so harn must be
+    broken". Only the subprocess's own binary is the one that has to be
+    signed in.
     """
+    where = f" ({binary})" if binary else ""
     return (
-        f"The '{agent_name}' CLI could not authenticate — its session has "
-        "expired. harn cannot renew it for you: sign in again on this machine "
-        f"(run `{agent_name}` in a terminal and complete the login), then press "
-        "Resume. No attempts were spent on this — the step starts with a full "
-        f"budget once you're back in.\n\nReported by {agent_name}: {raw}"
+        f"The '{agent_name}' CLI could not authenticate — its saved session "
+        "has expired. harn runs it as a subprocess, so it needs its OWN login: "
+        "a desktop app being signed in doesn't cover it (that session lives "
+        "inside the app and isn't shared). harn cannot renew it for you.\n\n"
+        f"Fix: run `{agent_name}`{where} in a terminal, complete the login, "
+        "then press Resume — or just wait, harn retries on its own and will "
+        "pick this up once you're signed in.\n\n"
+        "No attempts were spent on this: the step starts with a full budget.\n\n"
+        f"Reported by {agent_name}: {raw}"
     )
 
 
 def _block_on_auth_failure(env_dir: Path, task: "tasks.Task", sid: str,
                            agent_name: str, raw: str, *,
                            prior_attempts: int, started: str,
-                           usage: dict | None = None) -> str:
+                           usage: dict | None = None,
+                           binary: str = "") -> str:
     """Stop the run on an auth fault WITHOUT charging the step for it.
 
     `attempts` is written back to `prior_attempts` — the turn never got a
@@ -828,7 +852,7 @@ def _block_on_auth_failure(env_dir: Path, task: "tasks.Task", sid: str,
     environment" (retry freely — the CLI refuses in milliseconds and spends
     no tokens), which is what lets the task self-heal after a re-login.
     """
-    detail = _auth_block_detail(agent_name, (raw or "").strip())
+    detail = _auth_block_detail(agent_name, (raw or "").strip(), binary=binary)
     task.step_results[sid] = {
         **task.step_results.get(sid, {}),
         "status": "blocked", "started": started, "ended": tasks._now_iso(),
@@ -1730,7 +1754,8 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         if result.auth_failed:
             detail = _block_on_auth_failure(
                 env_dir, task, step_id, step_adapter.name, result.text,
-                prior_attempts=prior_attempts, started=started, usage=usage)
+                prior_attempts=prior_attempts, started=started, usage=usage,
+                binary=_adapter_binary(step_adapter))
             return {"ok": False, "step_id": step_id, "title": title,
                     "text": result.text or "", "error": detail, "auth": True}
         if result.ok and not missing:
@@ -2569,7 +2594,8 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
                 if result.auth_failed:
                     _block_on_auth_failure(
                         env_dir, task, sid, step_adapter.name, detail,
-                        prior_attempts=prior_attempts, started=started)
+                        prior_attempts=prior_attempts, started=started,
+                        binary=_adapter_binary(step_adapter))
                     return _run_end(env_dir, state.State.load(state_dir))
                 if not auto:
                     task.step_results[sid] = {**task.step_results.get(sid, {}),

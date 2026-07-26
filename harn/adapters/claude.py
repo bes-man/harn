@@ -41,10 +41,56 @@ class ClaudeAdapter(Adapter):
     # thinking is a model/API concept, not exposed this way headless) — both
     # unconfirmed, so left as the base class's best-effort default. `--model`
     # is real and documented for the Claude Code CLI.
+    # Aliases first: they resolve to whatever is current for the account, so
+    # they don't go stale the way a pinned id does. The pinned ids follow for
+    # steps that must not drift between runs. The Claude CLI exposes no
+    # "list models" command, so unlike codex/cursor this list can't be
+    # discovered at runtime — it needs updating by hand when the family moves.
     MODELS = ("opus", "sonnet", "haiku", "opusplan",
-              "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001")
+              "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+              "claude-haiku-4-5-20251001")
     EFFORTS = ()          # no confirmed --effort flag for `claude -p` (see above)
     TEMPERATURES = ()     # no sampling temperature exposed (see above)
+
+    def auth_status(self) -> tuple[str, str]:
+        """Read the CLI's own credential store to answer "is it signed in?"
+        for free — no turn, no tokens.
+
+        Worth the coupling to a Claude-specific file: without it the only way
+        to find out is to launch a run and watch it die, which is exactly the
+        failure this exists to pre-empt. Diagnosed live — a machine where the
+        Claude DESKTOP app worked fine (it refreshes its token in-process and
+        never writes it out) while every `claude -p` subprocess failed,
+        because the on-disk store had been expired for days. "Claude works in
+        my console" and "harn can run Claude" are genuinely different
+        questions, and only this file answers the second one.
+
+        Never reads the tokens themselves — only the expiry timestamp.
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+        cfg = _os.environ.get("CLAUDE_CONFIG_DIR") or _os.path.expanduser("~/.claude")
+        path = Path(cfg) / ".credentials.json"
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # No store (or unreadable) is NOT proof of trouble: the CLI may
+            # keep credentials elsewhere on this platform. Say "unknown"
+            # rather than crying wolf on a working setup.
+            return ("unknown", "")
+        oauth = data.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or not oauth.get("expiresAt"):
+            return ("unknown", "")
+        try:
+            expires_at = float(oauth["expiresAt"]) / 1000.0    # ms since epoch
+        except (TypeError, ValueError):
+            return ("unknown", "")
+        if expires_at > _time.time():
+            return ("ok", "")
+        stale_days = int((_time.time() - expires_at) // 86400)
+        ago = f"{stale_days}d ago" if stale_days >= 1 else "recently"
+        return ("expired", f"the {self.name} CLI's saved session expired {ago}")
 
     def run_turn(self, prompt: str, cwd: Path, timeout: int = 1800, *,
                 model: str | None = None, effort: str | None = None,
