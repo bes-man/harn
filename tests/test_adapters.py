@@ -510,16 +510,22 @@ def test_claude_model_catalog_is_current():
 
 # --- harn login: harn runs the flow, the human approves -------------------- #
 
-def test_claude_login_uses_the_long_lived_token_not_a_session_login():
-    """Both work on a subscription, but `auth login` mints the same
-    short-lived session that expires in days and strands the next background
-    run. `setup-token` is the documented long-lived one — picking it here is
-    the difference between signing in once and signing in every few days."""
+def test_claude_login_uses_the_command_that_actually_persists_a_session():
+    """NOT `setup-token`, which an earlier version used by reasoning from its
+    help text ("Set up a long-lived authentication token"). Observed live:
+    a human completed setup-token's browser approval and
+    ~/.claude/.credentials.json was still the same expired file from days
+    earlier, with `auth status` still reporting loggedIn:false — it EMITS a
+    token to export yourself, it doesn't sign the CLI in.
+
+    `auth login` is the one that pairs with `auth status` / `auth logout`:
+    the same stored session all three operate on, which is what harn must be
+    able to observe and what a background run actually uses."""
     from harn.adapters.claude import ClaudeAdapter
     from harn.adapters import base as base_mod
     import unittest.mock as mock
     with mock.patch.object(base_mod, "resolve_binary", lambda b: "/fake/claude"):
-        assert ClaudeAdapter().login_command() == ["/fake/claude", "setup-token"]
+        assert ClaudeAdapter().login_command() == ["/fake/claude", "auth", "login"]
 
 
 def test_login_command_is_none_when_the_binary_is_missing():

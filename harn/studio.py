@@ -2855,6 +2855,11 @@ async function pollAgentAuth(){
   // A step blocked on auth shows its own Sign in button; repaint it so the
   // button disappears the moment the CLI reports being signed in again.
   if(RUN_HISTORY_OPEN) renderRunHistoryIfChanged();
+  // Same for the Settings rows — a sign-in completes in a SEPARATE terminal
+  // window, so nothing in this page can know it happened except by asking
+  // again. Without this the human comes back from the browser to a page
+  // still saying "signed out" and has to reload to see the truth.
+  if(tab==='settings' && $('#agentAuthRows')) renderAgentAuthRows();
 }
 async function agentLogin(agent){
   let r; try{ r=await post_('/api/agent/login',agent?{agent}:{}); }
@@ -2873,6 +2878,24 @@ async function agentLogin(agent){
     : (r.hint||'run this yourself')+':\n\n'+r.command);
   await pollAgentAuth();
   if($('#agentAuthRows')) await renderAgentAuthRows();
+  watchForSignIn();
+}
+// The sign-in finishes in a different window entirely, so this page has no
+// event to react to — it can only keep asking. The steady 9s cadence is too
+// slow for the moment you switch back from the browser expecting to see it
+// land, so poll briskly for a couple of minutes after a login was launched,
+// then fall back to the normal beat. Stops early the moment it succeeds.
+let SIGNIN_WATCH=null;
+function watchForSignIn(){
+  if(SIGNIN_WATCH) clearInterval(SIGNIN_WATCH);
+  const until=Date.now()+150000;
+  SIGNIN_WATCH=setInterval(async()=>{
+    if(Date.now()>until){ clearInterval(SIGNIN_WATCH); SIGNIN_WATCH=null; return; }
+    await pollAgentAuth();
+    if(AGENT_AUTH&&AGENT_AUTH.state==='ok'){
+      clearInterval(SIGNIN_WATCH); SIGNIN_WATCH=null;
+    }
+  },2000);
 }
 async function restartMcp(){
   const b=$('#mcpBadge'); if(b) b.textContent='MCP … restarting';

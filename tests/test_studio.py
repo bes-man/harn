@@ -1153,3 +1153,18 @@ def test_login_can_target_any_agent_not_just_the_projects_own(tmp_path, monkeypa
 
     r = studio.agent_login_payload(env, {"agent": "codex"})
     assert "--agent codex" in r["command"]
+
+
+def test_the_page_keeps_asking_after_a_sign_in_was_launched():
+    """The sign-in completes in a SEPARATE terminal window, so the page has
+    no event to react to — it can only keep asking. Reported live: after
+    approving in the browser you came back to a page still saying "signed
+    out" and had to reload. The steady 9s cadence is too slow for that
+    moment, so a login kicks off a brisk short-lived watch that stops as
+    soon as it succeeds."""
+    html = studio._HTML
+    assert "function watchForSignIn()" in html
+    assert "watchForSignIn();" in html
+    assert "AGENT_AUTH.state==='ok'" in html
+    # Settings rows repaint on the same poll, not just on tab open.
+    assert "if(tab==='settings' && $('#agentAuthRows')) renderAgentAuthRows();" in html

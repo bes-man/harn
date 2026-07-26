@@ -53,18 +53,24 @@ class ClaudeAdapter(Adapter):
     TEMPERATURES = ()     # no sampling temperature exposed (see above)
 
     def login_command(self) -> list[str] | None:
-        """`claude setup-token` — deliberately NOT `claude auth login`.
+        """`claude auth login` — the command that actually PERSISTS a session.
 
-        Both work on a subscription, but `auth login` mints the same
-        short-lived session that expires every few days and strands the next
-        background run; `setup-token` is documented as "Set up a long-lived
-        authentication token (requires Claude subscription)", which is
-        exactly what an unattended `harn watch` needs. Choosing the
-        longer-lived one here is the difference between signing in once and
-        signing in every few days.
+        An earlier version used `setup-token` here, reasoning from its help
+        text ("Set up a long-lived authentication token") that it was the
+        better fit for an unattended runner. That was wrong, and the evidence
+        was unambiguous: a human completed the browser approval for
+        setup-token and `~/.claude/.credentials.json` was still byte-for-byte
+        the same expired file from days earlier, with `auth status` still
+        reporting loggedIn:false. setup-token EMITS a token for you to export
+        yourself; it doesn't sign the CLI in.
+
+        `auth login` is the one that pairs with `auth status` and
+        `auth logout` — the same stored session all three operate on, which
+        is precisely what harn needs to observe and what a background run
+        needs to use.
         """
         binary = base_mod.resolve_binary(self.binary)
-        return [binary, "setup-token"] if binary else None
+        return [binary, "auth", "login"] if binary else None
 
     def logout_command(self) -> list[str] | None:
         binary = base_mod.resolve_binary(self.binary)
