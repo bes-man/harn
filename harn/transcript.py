@@ -39,6 +39,27 @@ def _rows(env_dir: Path) -> list[dict]:
     return rows
 
 
+def latest_attempt(env_dir: Path, task_id: str, step_id: str) -> int:
+    """The highest attempt already recorded for this step's feed, or 0.
+
+    Studio groups a step's feed by attempt and collapses every group except
+    the highest, so an entry written with a LOWER number lands inside a
+    collapsed block instead of at the end where it just happened. Callers
+    that append out-of-band (a question, a human's answer) use this to stay
+    in the current group — they can't rely on the step ledger's `attempts`,
+    which `loop.answer` deliberately resets to 0 to hand the step a fresh
+    budget, and which would otherwise send the entry backwards.
+    """
+    best = 0
+    for row in _rows(env_dir):
+        if row.get("task_id") == task_id and row.get("step_id") == step_id:
+            try:
+                best = max(best, int(row.get("attempt") or 0))
+            except (TypeError, ValueError):
+                continue
+    return best
+
+
 def append(env_dir: Path, *, task_id: str, step_id: str, run_id: str,
            attempt: int, kind: str, phase: str, title: str = "",
            text: str = "", item_id: str = "") -> dict:

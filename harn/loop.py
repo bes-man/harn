@@ -2901,10 +2901,23 @@ def answer(env_dir: Path, text: str, *, source: str = "cli") -> None:
     # it in the activity they were watching.
     if st.current_task:
         try:
+            step_id = st.current_step or ""
+            # Same as the question above: use the step's real attempt, or the
+            # answer lands in a collapsed earlier-attempt block instead of at
+            # the end of the feed the human is looking at.
+            # Max, not the ledger value: `answer` above just reset attempts
+            # to 0 on purpose (fresh budget), so trusting it alone would file
+            # the answer under attempt 1 — a collapsed group, and separated
+            # from the very question it answers.
+            answered = tasks.find(env_dir, st.current_task)
+            attempt = max(
+                int(((answered.step_results.get(step_id) or {})
+                     if (answered and step_id) else {}).get("attempts") or 1),
+                transcript.latest_attempt(env_dir, st.current_task, step_id))
             transcript.append(
                 env_dir, task_id=st.current_task,
-                step_id=st.current_step or "", run_id=events.current_run(env_dir),
-                attempt=1, kind="answer", phase="completed",
+                step_id=step_id, run_id=events.current_run(env_dir),
+                attempt=attempt, kind="answer", phase="completed",
                 title=f"you ({source})", text=text)
         except Exception:
             pass       # the feed is a view; never fail an answer over it

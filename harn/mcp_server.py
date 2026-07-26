@@ -673,9 +673,19 @@ def build_server(start_watch: bool = True, register_custom: bool = True):
             # someone reading the activity had to scroll the whole feed and
             # still never found it there.
             try:
+                step_id = st.current_step or ""
+                # The step's REAL attempt, the same way loop._run_turn
+                # resolves it. Hardcoding 1 filed the question under
+                # "Attempt 1" — a COLLAPSED prior-attempt block once the step
+                # was on its second try — so it wasn't at the end of the feed
+                # where it just happened, it was buried in history.
+                attempt = max(
+                    int(((task.step_results.get(step_id) or {}) if step_id else {})
+                        .get("attempts") or 1),
+                    transcript_mod.latest_attempt(_env_dir(), task_id, step_id))
                 transcript_mod.append(
-                    _env_dir(), task_id=task_id, step_id=st.current_step or "",
-                    run_id=events_mod.current_run(_env_dir()), attempt=1,
+                    _env_dir(), task_id=task_id, step_id=step_id,
+                    run_id=events_mod.current_run(_env_dir()), attempt=attempt,
                     kind="question", phase="completed",
                     title="waiting for you", text=question)
             except Exception:

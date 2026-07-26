@@ -115,3 +115,53 @@ def test_studio_renders_the_question_and_answer_kinds():
     from harn import studio
     html = studio._HTML
     assert "question:'？',answer:'✎'" in html
+
+
+def test_a_question_stays_in_the_current_attempt_group(tmp_path):
+    """Studio collapses every attempt group except the highest, so an entry
+    written with a LOWER number is buried in a collapsed block instead of
+    sitting at the end where it just happened — reported as "the question
+    isn't at the end of the feed"."""
+    from harn import scaffold, state, tasks, transcript, ENV_DIRNAME
+    import os
+    scaffold.setup(tmp_path)
+    env = tmp_path / ENV_DIRNAME
+    for p in (env / "tasks").glob("*"):
+        p.unlink()
+    t = tasks.create_task(env, "T", task_id="PRJ-001")
+    t.step_results["s1"] = {"status": "running", "attempts": 2}
+    tasks._save(t)
+    for a, txt in ((1, "first try"), (1, "first try failed"), (2, "second try")):
+        transcript.append(env, task_id="PRJ-001", step_id="s1", run_id="r",
+                          attempt=a, kind="message", phase="completed",
+                          title="agent", text=txt)
+
+    st = state.State.load(env / "state")
+    st.current_task = t.id
+    st.current_step = "s1"
+    st.save(env / "state")
+
+    from harn import loop
+    state.blocked_marker(env / "state").write_text("Which one?", encoding="utf-8")
+    st = state.State.load(env / "state")
+    st.block("Which one?")
+    st.save(env / "state")
+    loop.answer(env, "the second", source="studio")
+
+    entries = transcript.read(env, task_id="PRJ-001")["entries"]
+    answer = next(e for e in entries if e["kind"] == "answer")
+    # `loop.answer` resets the ledger's attempts to 0 on purpose (fresh
+    # budget), so trusting it alone would file this under attempt 1.
+    assert answer["attempt"] == 2
+    assert entries[-1]["kind"] == "answer"      # genuinely last
+
+
+def test_latest_attempt_ignores_other_steps_and_tasks(tmp_path):
+    from harn import transcript, ENV_DIRNAME
+    env = tmp_path / ENV_DIRNAME
+    transcript.append(env, task_id="A", step_id="s1", run_id="r", attempt=5,
+                      kind="message", phase="completed", text="elsewhere")
+    transcript.append(env, task_id="B", step_id="s1", run_id="r", attempt=2,
+                      kind="message", phase="completed", text="mine")
+    assert transcript.latest_attempt(env, "B", "s1") == 2
+    assert transcript.latest_attempt(env, "B", "s2") == 0
