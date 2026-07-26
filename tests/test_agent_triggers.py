@@ -5,8 +5,8 @@ caps, and Telegram command polling honoring the chat_id trust boundary."""
 from __future__ import annotations
 
 import harn.telegram as tg
-from harn import config, loop, roles, roles_runner, scaffold, studio, tasks, \
-    triggers, ENV_DIRNAME
+from harn import config, loop, roles, roles_runner, scaffold, state, studio, \
+    tasks, triggers, ENV_DIRNAME
 from harn.adapters.base import AgentResult
 from harn.telegram import TelegramHIL
 import subprocess
@@ -519,3 +519,37 @@ def test_watch_tick_ack_says_created_for_a_brand_new_task(tmp_path, monkeypatch)
     loop.watch(env, tmp_path, _once=True)
 
     assert sent[0].startswith("🚀 Created")
+
+
+def test_resume_scan_retries_an_auth_block_so_it_self_heals_after_login(tmp_path, monkeypatch):
+    """A block that needs a PERSON must never be auto-retried (re-running it
+    can't help and burns tokens on "still waiting" turns). An auth block is
+    the opposite: nothing for anyone to answer, the fix happens outside harn
+    (signing the CLI back in), and the retry is free -- the CLI refuses in
+    milliseconds without spending tokens. Retrying it is exactly how the task
+    picks itself back up after a re-login, instead of sitting there until
+    someone notices and presses Resume."""
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+    st = state.State.load(env / "state")
+    st.current_task = t.id
+    st.block("The 'claude' CLI could not authenticate…", kind="auth")
+    st.save(env / "state")
+
+    fake = RecordingAdapter()
+    monkeypatch.setattr(loop, "get_adapter", lambda n: fake)
+
+    assert triggers.resume_scan(tmp_path, env) is not None
+
+
+def test_resume_scan_still_refuses_a_block_that_needs_a_human(tmp_path, monkeypatch):
+    env = _project(tmp_path)
+    t = _claimed_unfinished(env, tmp_path)
+    st = state.State.load(env / "state")
+    st.current_task = t.id
+    st.block("Which database should we use?")     # no kind = waiting on a person
+    st.save(env / "state")
+
+    monkeypatch.setattr(loop, "get_adapter", lambda n: RecordingAdapter())
+
+    assert triggers.resume_scan(tmp_path, env) is None

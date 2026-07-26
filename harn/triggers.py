@@ -252,7 +252,16 @@ def resume_scan(project_root: Path, env_dir: Path, *,
     if runner_mod.active(env_dir) is not None:
         return None
     st = state_mod.State.load(env_dir / "state")
-    blocked_task = st.current_task if st.phase == state_mod.BLOCKED else None
+    # Only a block that needs a PERSON is off-limits: re-running it can't
+    # help and burns tokens on "still waiting" turns. An auth block is the
+    # opposite — nothing for anyone to answer, the fix happens outside harn
+    # (signing the CLI back in), and retrying costs nothing because the CLI
+    # refuses in milliseconds without spending tokens. Retrying it is exactly
+    # how the task picks itself back up once you've logged in, instead of
+    # waiting for someone to notice and press Resume.
+    blocked_task = (st.current_task
+                    if st.phase == state_mod.BLOCKED and st.block_kind != "auth"
+                    else None)
     for task in sorted(tasks_mod.load_tasks(env_dir), key=lambda t: (t.priority, t.id)):
         if task.status in (tasks_mod.DONE, tasks_mod.REVIEW) or not task.claimed_by:
             continue

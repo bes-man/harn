@@ -28,6 +28,14 @@ class State:
                                       # Phase 4 spec's enforcement Non-goal)
     question: str | None = None      # set when phase == BLOCKED
     blocked_since: float | None = None
+    # WHY this block happened. "" = waiting on a human's answer (the default,
+    # and the only kind that existed before). "auth" = the agent CLI isn't
+    # signed in — nothing for the human to answer, and retrying is free
+    # (the CLI refuses in milliseconds without spending tokens), so the
+    # scheduled resume treats the two very differently: see triggers
+    # .resume_scan, which must never re-run a question-block but SHOULD
+    # re-run an auth-block so the task self-heals once you sign back in.
+    block_kind: str = ""
     last_answer: str | None = None
     iterations: int = 0
 
@@ -38,9 +46,16 @@ class State:
     @classmethod
     def load(cls, state_dir: Path) -> "State":
         p = cls._path(state_dir)
-        if p.exists():
-            return cls(**json.loads(p.read_text()))
-        return cls()
+        if not p.exists():
+            return cls()
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            return cls()
+        # Ignore fields this version doesn't know: a state file written by a
+        # newer harn must not make an older one crash on every load.
+        known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
+        return cls(**known)
 
     def save(self, state_dir: Path) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -51,14 +66,16 @@ class State:
             raise ValueError(f"unknown phase: {new_phase}")
         self.phase = new_phase
 
-    def block(self, question: str) -> None:
+    def block(self, question: str, *, kind: str = "") -> None:
         self.transition(BLOCKED)
         self.question = question
+        self.block_kind = kind
         self.blocked_since = time.time()
 
     def answer(self, text: str) -> None:
         self.last_answer = text
         self.question = None
+        self.block_kind = ""
         self.blocked_since = None
         self.transition(READY)
 

@@ -797,6 +797,60 @@ def _block_tool_failure(env_dir: Path, task: "tasks.Task", step: dict,
     events.emit(env_dir, "block", task_id=task.id, stage=sid, detail=detail[:300])
 
 
+def _auth_block_detail(agent_name: str, raw: str) -> str:
+    """The human-facing text for "the agent CLI isn't signed in".
+
+    Deliberately NOT the generic attempt-cap wording ("review the step prompt
+    and required skills/tools"): that advice is actively misleading here — the
+    step is fine, the machine just isn't logged in, and no amount of editing
+    the prompt will change that.
+    """
+    return (
+        f"The '{agent_name}' CLI could not authenticate — its session has "
+        "expired. harn cannot renew it for you: sign in again on this machine "
+        f"(run `{agent_name}` in a terminal and complete the login), then press "
+        "Resume. No attempts were spent on this — the step starts with a full "
+        f"budget once you're back in.\n\nReported by {agent_name}: {raw}"
+    )
+
+
+def _block_on_auth_failure(env_dir: Path, task: "tasks.Task", sid: str,
+                           agent_name: str, raw: str, *,
+                           prior_attempts: int, started: str,
+                           usage: dict | None = None) -> str:
+    """Stop the run on an auth fault WITHOUT charging the step for it.
+
+    `attempts` is written back to `prior_attempts` — the turn never got a
+    fair try, so counting it would leave the step pre-blocked at its cap the
+    moment the human signs back in, needing a second manual reset to do
+    anything. Marked `block_kind="auth"` so the scheduled resume can tell
+    "waiting on a person" (never auto-retry) from "waiting on the
+    environment" (retry freely — the CLI refuses in milliseconds and spends
+    no tokens), which is what lets the task self-heal after a re-login.
+    """
+    detail = _auth_block_detail(agent_name, (raw or "").strip())
+    task.step_results[sid] = {
+        **task.step_results.get(sid, {}),
+        "status": "blocked", "started": started, "ended": tasks._now_iso(),
+        "attempts": prior_attempts, "tokens": 0, "output": detail,
+        **({"usage": usage} if usage is not None else {}),
+    }
+    tasks._save(task)
+    state_dir = env_dir / "state"
+    state.blocked_marker(state_dir).write_text(detail, encoding="utf-8")
+    st = state.State.load(state_dir)
+    st.block(detail, kind="auth")
+    st.save(state_dir)
+    events.emit(env_dir, "block", task_id=task.id, stage=sid,
+                detail=detail[:300], kind="auth")
+    progress.log(env_dir, f"{task.id}: {agent_name} is not signed in", agent=agent_name)
+    notify(f"[harn] '{task.id}' stopped: the {agent_name} CLI is not signed in. "
+           f"Run `{agent_name}` on that machine to log in again; harn resumes "
+           "on its own once you're back.")
+    print(f"[harn] {task.id} · {sid}: BLOCKED — {detail}")
+    return detail
+
+
 # Cross-relaunch attempt cap for agent-turn failures. The spend guard lives in
 # a local variable inside
 # run() — it resets the moment a NEW `harn run` process starts, which is
@@ -1670,6 +1724,15 @@ def run_step(project_root: Path, env_dir: Path, task_id: str, step_id: str,
         task = tasks.find(env_dir, task_id) or task
         usage = _audit_step_usage(env_dir, task, step)
         missing = _missing_required_usage(usage)
+        # Same reasoning as run()'s sequential path: an auth fault can only
+        # repeat, so don't spend the second attempt on it, and don't charge
+        # the step for a turn that never got to run.
+        if result.auth_failed:
+            detail = _block_on_auth_failure(
+                env_dir, task, step_id, step_adapter.name, result.text,
+                prior_attempts=prior_attempts, started=started, usage=usage)
+            return {"ok": False, "step_id": step_id, "title": title,
+                    "text": result.text or "", "error": detail, "auth": True}
         if result.ok and not missing:
             break
         if not missing:
@@ -2499,6 +2562,15 @@ def run(project_root: Path, env_dir: Path, max_iterations: int | None = None,
             # correctly; this loop was the one path that didn't.
             if not result.ok:
                 detail = (result.text or "agent turn failed").strip()
+                # An auth fault is the ENVIRONMENT being broken, not the step.
+                # Retrying can only fail identically, so stop now rather than
+                # spending the second attempt and then blocking with advice
+                # ("review the step prompt") that cannot possibly help.
+                if result.auth_failed:
+                    _block_on_auth_failure(
+                        env_dir, task, sid, step_adapter.name, detail,
+                        prior_attempts=prior_attempts, started=started)
+                    return _run_end(env_dir, state.State.load(state_dir))
                 if not auto:
                     task.step_results[sid] = {**task.step_results.get(sid, {}),
                                               "status": "failed",

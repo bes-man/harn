@@ -39,6 +39,39 @@ def resolve_binary(binary: str) -> str | None:
     return None
 
 
+#: Signatures of "the agent CLI could not authenticate" — a fault of the
+#: ENVIRONMENT, not of the task. Kept here (not in the Claude adapter) because
+#: every agent CLI has the same failure mode and harn is agent-agnostic;
+#: matching on the reported text is the one thing they all share.
+#:
+#: This distinction earns its keep: retrying an auth failure cannot succeed,
+#: so it must never burn a step's attempt budget or a turn's tokens, and the
+#: generic "review the step prompt and required skills/tools" advice is
+#: actively misleading when the real fix is "sign in again".
+_AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "oauth session expired",
+    "session expired",
+    "please run `claude` to log in",
+    "please run /login",
+    "not authenticated",
+    "authentication_error",
+    "invalid api key",
+    "invalid_api_key",
+    "credentials expired",
+)
+
+
+def is_auth_failure(text: str) -> bool:
+    """Whether this failure text is the agent CLI refusing to authenticate.
+
+    Only ever consulted for a turn that ALREADY failed, so a phrase appearing
+    incidentally in a successful agent's prose can't trip it.
+    """
+    low = (text or "").lower()
+    return any(marker in low for marker in _AUTH_FAILURE_MARKERS)
+
+
 @dataclass
 class AgentResult:
     ok: bool
@@ -57,6 +90,11 @@ class AgentResult:
     # otherwise the token cap trips on the first normal turn. Kept folded into
     # `input_tokens` for display continuity; the budget subtracts this.
     cache_read_tokens: int | None = None
+
+    @property
+    def auth_failed(self) -> bool:
+        """This turn failed because the agent CLI isn't signed in."""
+        return not self.ok and is_auth_failure(self.text)
 
     @property
     def total_tokens(self) -> int | None:
